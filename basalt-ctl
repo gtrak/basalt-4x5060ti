@@ -1,0 +1,342 @@
+#!/bin/bash
+# basalt-ctl — run Basalt (Qwen3.8-Flash-Next NVFP4) on 4x RTX 5060 Ti, no systemd.
+#
+# Follows the launch shape of ../sglang/sglang-ctl: one podman-shaped arg builder,
+# but basalt is a native binary, so there is no container (per the operator's
+# instruction). Foreground `run` for a supervisor, plus start/stop/status/logs
+# against a pidfile so it can be driven by hand meanwhile.
+#
+# Hardware: 4x RTX 5060 Ti (sm_120, 16 GB each, PCIe 4.0 x4 => 7.2 GB/s h2d),
+# Ryzen 9 5900X (12C/24T, no AVX-512), 60 GB RAM, 15 GB swap.
+# Model: Qwen3.8-FN-NVFP4.basalt — 122 GiB file; experts 64.8 GiB, gguf 55.6 GiB
+# (PLE table, streamed from SSD), dense 1.5 GiB.
+set -euo pipefail
+
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN="${BASE_DIR}/bin/basalt"
+  if [ -f "${BASE_DIR}/extra-env" ]; then
+    while IFS= read -r line; do
+      case "$line" in ''|'#'*) continue;; *) export "$line";; esac
+    done < "${BASE_DIR}/extra-env"
+  fi
+MODEL="${BASALT_MODEL:-${BASE_DIR}/models/Qwen3.8-FN-NVFP4.basalt}"
+# 8080 is filebrowser on this box, 1234 is tinyllb.
+HOST_PORT="${BASALT_PORT:-8000}"
+# The name clients send in `model`. tinyllb fronts this on :1234 and its clients ask
+# for "local" (the name the sglang deployment served as), so that is the alias.
+ALIAS="${BASALT_ALIAS:-local}"
+CONTAINER_NAME="${BASALT_NAME:-basalt}"
+PIDFILE="${BASE_DIR}/.basalt-ctl.pid"
+LOGFILE="${BASE_DIR}/basalt-server.log"
+CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+
+# ---- engine configuration -------------------------------------------------
+# Every value here is a number this machine was measured at, or the engine's
+# own default where no measurement has been made yet. Anything that is still
+# the engine default is marked (default).
+basalt_args() {
+  ARGS=()
+  # The pack ships an MTP drafter. Without --spec the bench baseline is ~52-60
+  # tok/s; with it, 77/115/82 (conv/struct/prose). Never leave this at 0.
+  ARGS+=(--gpu 0,1,2,3)
+  # ---- architecture: pipeline parallel (layer split) vs expert tier ------
+  # BASALT_FORCE_SPLIT=1 puts the layers on the cards (each stage keeps its own
+  # experts, so nothing streams on the prompt path). Measured at a 12288-token
+  # chunk: prefill 2354 vs 1611 t/s (+46%) and experts 48.9 GiB in VRAM vs 8.6,
+  # at a decode cost of 167.8 vs 181.8. Prefill is the interactive bottleneck,
+  # so the split is the default here. NOTE: it needs --prefill 8192-16384 (a
+  # 32768 chunk measures 655 t/s, the per-stage handoff dominates) and a
+  # --resident-budget-gib that leaves each stage its copy.
+  #
+  # --prefill 12288, measured on a real ~205k-token read under the performance
+  # governor (200k tokens, overall / first-30k / steady 100-200k t/s):
+  #    8192:  59.8s  3344 / 1734 / 3935
+  #   12288:  50.8s  3934 / 1970 / 4767   <- best on every axis
+  #   16384:  55.2s  3625 / 1796 / 4195
+  #    4096:  83.2s  2404 / 1642 / 2731   (plateaus; per-chunk cost x49)
+  # A 36k-prompt microbench misled once here: it favoured 4096 because a short
+  # prompt pays the per-chunk cost few times. Chunk overhead scales with prompt
+  # length, the cold-cache ramp does not. BASALT_PREFILL overrides.
+  if [ "${BASALT_SPLIT:-1}" = "1" ]; then
+    export BASALT_FORCE_SPLIT=1
+    ARGS+=(--prefill "${BASALT_PREFILL:-12288}")
+    # Pinned RAM copy of the pin's plan: the experts no GPU holds PLUS the
+    # stage cards' lent slots (the prompt path borrows 1342 slots per card at
+    # prefill 12288 = 3.46 GiB x 3). Measured plan: 36.34 GiB (26.0 unique +
+    # 10.4 lent), so 37 covers it whole -> RAM copy = the whole plan, SSD 0.0.
+    # A budget short of the plan leaves its coldest on the SSD (30 -> 6.3 GiB).
+    # The budget is a contract: a boot without room for all of it (37 + ~16
+    # GiB headroom = ~53 GiB available at the pin) REFUSES to start, naming
+    # the largest safe value. Free RAM or lower BASALT_RESIDENT_GIB then.
+    ARGS+=(--resident-budget-gib "${BASALT_RESIDENT_GIB:-37}")
+  else
+    unset BASALT_FORCE_SPLIT          # must be cleared: a stale export forces the split
+    ARGS+=(--prefill "${BASALT_PREFILL:-32768}")
+    # the tier architecture has a smaller complement (~10.5 GiB: the tiers hold 44 GiB), but the
+    # budget must STILL apply — without it the engine auto-sizes from MemAvailable and spills to
+    # the SSD (58 GB of file reads measured on an auto-sized tier boot). 37 covers the tier's
+    # whole complement trivially and keeps the zero-spill contract identical across architectures.
+    ARGS+=(--resident-budget-gib "${BASALT_RESIDENT_GIB:-37}")
+  fi
+  # ---- dormant conversations (--conversation-cache-mib) -------------------
+  # Parked conversations live in host RAM (int8: 3.09 GiB per 262144-token
+  # session, measured) and resume with their prefix intact - verified: six
+  # parked conversations all resumed with 2203 of 2349 tokens reused.
+  # It is charged against the expert copy, so parking lowers the RAM budget:
+  # the engine caps --resident-budget-gib at 26 with parking on.
+  #
+  # Retired as the default (campaign entry 16): the park pool's RAM comes out
+  # of the expert copy, and the 8-10 GiB of SSD spill it forced cost decode more
+  # than the ~2 s parked resume saved. A dormant conversation now resumes by
+  # re-reading its body at prefill speed (~13 s at 60k, zero spill). Measured
+  # shape while it was the default (split, 262144 ctx):
+  #   4 live + park, budget 24 -> SSD 20.6 GiB, decode 55.7
+  #   2 live + park, budget 26 -> SSD 10.3 GiB, decode 77.5
+  #   2 live, no park, budget 33 -> SSD  3.3 GiB, decode 85.3
+  # --prompt-cache checkpoints stay on either way: ~113 MiB each, no KV, they
+  # resume turns within a running conversation.
+  if [ "${BASALT_PARK_MIB:-0}" != "0" ]; then
+    ARGS+=(--conversation-cache-mib "${BASALT_PARK_MIB}")
+    ARGS+=(--conversation-cache-slots "${BASALT_PARK_SLOTS:-4}")
+  fi
+  ARGS+=(--prompt-cache "${BASALT_PROMPT_CACHE:-8}")
+  ARGS+=(--spec 8)
+  # PLE (the 320M-row n-gram table) must NOT be in RAM: the table alone is
+  # 320001536 rows. `direct` is the default and reads it unbuffered from the
+  # SSD so it never enters RAM or the file cache. Do not switch to `ram`.
+  ARGS+=(--ple-io direct)
+
+  # ---- KV ---------------------------------------------------------------
+  # int8 KV: 1,056 B/cell against fp16's 2,048, over 12 QSA layers.
+  # Measured at ctx=262144 on this box: fp16 7.1 GiB, int8 4.0, k8v4 3.3,
+  # q4_0 2.4 GiB of KV. Elastic, so only the used cells are backed (0.7 GiB
+  # at boot), but the CACHE CEILING is what competes with expert slots on the
+  # main card, and 256k int8 costs ~3 expert slots (3354 vs 3483 at 128k)
+  # because int8 is the smallest format the memory floors still allow.
+  # A 242,707-token request has been served end to end on this config.
+  # Lower formats, if quality allows: k8v4 (exact int8 K, rotated q4_0 V,
+  # 3.3 GiB) then q4_0 (2.4 GiB, Hadamard-rotated 4-bit).
+  ARGS+=(--kv "${BASALT_KV:-int8}")
+  ARGS+=(--max-context "${BASALT_CTX:-262144}")
+  # 4 live streams measured (6 hit the draft layer\047s logits and RAM). --parallel is a SERVER option (the engine flag is --batch); --slot-full-context gives
+  # every slot the whole context instead of max-context/N.
+  ARGS+=(--parallel "${BASALT_PARALLEL:-2}")
+  ARGS+=(--slot-full-context)
+  # ---- KV offload to host RAM (the HiCache L2 analogue) -------------------
+  # --kv-resident N keeps N cells of each QSA layer in a VRAM ring and the WHOLE K/V in
+  # pinned host RAM (per 262144-cell session: int8 3.09 GiB, fp16 6.00 GiB of host RAM).
+  # MUTUALLY EXCLUSIVE with --parallel: the batch windows refuse streamed KV
+  # ("batch windows need resident INT8 K/V without rotation"). So the two ways to serve
+  # many long streams are:
+  #   A (default here): several live slots, all KV resident in VRAM, elastic
+  #   B: KV streamed to host RAM (--parallel 1 --kv-resident N): one slot at a time,
+  #      any number of long contexts priced in host RAM rather than VRAM
+  # Set BASALT_PARALLEL=1 to get B.
+  if [ "${BASALT_RESIDENT:-0}" != "0" ]; then
+    ARGS+=(--kv-resident "${BASALT_RESIDENT:-65536}")
+  fi
+
+  # ---- expert tiers -----------------------------------------------------
+  # The pinned RAM copy holds only the experts no GPU holds (12-14 GiB, was 42:
+  # the tiers are opened before the pin and their experts are skipped).
+  # Measured 2026-10-27, interleaved A/B (cold, 180 W), tiers + peer access:
+  #   stock engine:              conv 77-81  / struct 128-155 / prose 55-85
+  #   this build, adapt OFF:     conv 114-116 / struct 117     / prose 91-94
+  #   this build, adapt ON:      conv 117-120 / struct 196     / prose 98-101
+  # Adaptation ON wins everywhere once its candidates are restricted to
+  # experts with a RAM copy: it used to pull tier-held experts through the
+  # file (-65% on struct). See OPTIMIZATION-PLAN.md campaign log.
+  ARGS+=(--adapt-swaps 96)
+  ARGS+=(--resident-experts)
+  ARGS+=(--peer-reserve-mib 600)
+
+  # extra-env is sourced at the top of the script (before MODEL resolution)
+  # Extra engine/server args for experiments, one shell-word per line.
+  # A `-drop ARGS...` line removes that exact word sequence from the base args.
+  if [ -f "${BASE_DIR}/extra-args" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        ''|'#'*) continue;;
+        '-drop '*)
+          drop="${line#-drop }"
+          read -r -a _dwords <<< "$drop"
+          _n=${#_dwords[@]}
+          newargs=(); i=0
+          while [ $i -lt ${#ARGS[@]} ]; do
+            _match=1
+            for ((j=0; j<_n; j++)); do
+              if [ "${ARGS[$((i+j))]:-}" != "${_dwords[$j]}" ]; then _match=0; break; fi
+            done
+            if [ $_match -eq 1 ]; then i=$((i+_n)); else newargs+=("${ARGS[$i]}"); i=$((i+1)); fi
+          done
+          ARGS=("${newargs[@]}");;
+        *) read -r -a _words <<< "$line"; ARGS+=("${_words[@]}");;
+      esac
+    done < "${BASE_DIR}/extra-args"
+  fi
+}
+
+# The engine allocates the pinned RAM copy at load and hard-fails when the
+# machine cannot serve it, so refuse to start into a swap-bound machine.
+guard_host_memory() {
+  local avail swapfree
+  avail=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
+  swapfree=$(awk '/SwapFree/{print int($2/1048576)}' /proc/meminfo)
+  if [ "${swapfree}" -lt 4 ] || [ "${avail}" -lt 14 ]; then
+    echo "REFUSING to start: MemAvailable=${avail} GB, SwapFree=${swapfree} GB" >&2
+    echo "  (need MemAvailable >= 14 GB and SwapFree >= 4 GB; the pinned expert" >&2
+    echo "   complement is sized from MemAvailable and hard-fails when short)." >&2
+    exit 1
+  fi
+}
+
+wait_ready() {
+  local i body
+  for i in $(seq 1 180); do
+    # Something else answering on this port is not readiness: the body must be
+    # the OpenAI model list basalt's server emits.
+    body=$(curl -sf -m 2 "http://127.0.0.1:${HOST_PORT}/v1/models" 2>/dev/null || true)
+    if printf '%s' "$body" | grep -q '"object"'; then
+      echo "Ready! http://127.0.0.1:${HOST_PORT}/v1"
+      return 0
+    fi
+    if [ -f "${PIDFILE}" ] && ! kill -0 "$(cat "${PIDFILE}")" 2>/dev/null; then
+      echo "server exited during startup; see ${LOGFILE}" >&2
+      return 1
+    fi
+    sleep 5
+  done
+  echo "Timeout waiting for server. Check: basalt-ctl logs" >&2
+  return 1
+}
+
+cmd_run() {
+  guard_host_memory
+  basalt_args
+  # --serve stays resident and takes requests on stdin; the Python server owns
+  # it and is the process to run in the foreground.
+  exec env BASALT_FORCE_SPLIT="${BASALT_FORCE_SPLIT:-}" "${BIN}" serve --model "${MODEL}" \
+    --host 0.0.0.0 --port "${HOST_PORT}" --alias "${ALIAS}" \
+    "${ARGS[@]}"
+}
+
+cmd_start() {
+  guard_host_memory
+  basalt_args
+  nohup env BASALT_FORCE_SPLIT="${BASALT_FORCE_SPLIT:-}" "${BIN}" serve --model "${MODEL}" \
+    --host 0.0.0.0 --port "${HOST_PORT}" --alias "${ALIAS}" \
+    "${ARGS[@]}" >> "${LOGFILE}" 2>&1 &
+  echo $! > "${PIDFILE}"
+  echo "started (pid $(cat "${PIDFILE}")), log ${LOGFILE}"
+  wait_ready
+}
+
+cmd_stop() {
+  if [ -f "${PIDFILE}" ] && kill -0 "$(cat "${PIDFILE}")" 2>/dev/null; then
+    kill "$(cat "${PIDFILE}")" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      kill -0 "$(cat "${PIDFILE}")" 2>/dev/null || break
+      sleep 1
+    done
+    kill -9 "$(cat "${PIDFILE}")" 2>/dev/null || true
+    rm -f "${PIDFILE}"
+    echo stopped
+  else
+    echo "not running"
+    rm -f "${PIDFILE}"
+  fi
+}
+
+cmd_restart() {
+  cmd_stop
+  # a killed loaded engine holds its cards' VRAM 10-40 s past exit; a boot
+  # before that fails at load and sizes the expert copy from what is left
+  local i
+  for i in $(seq 1 60); do
+    if [ -z "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | awk '$1>1000')" ]; then
+      break
+    fi
+    sleep 1
+  done
+  cmd_start
+}
+
+cmd_status() {
+  if [ -f "${PIDFILE}" ] && kill -0 "$(cat "${PIDFILE}")" 2>/dev/null; then
+    echo "running (pid $(cat "${PIDFILE}")) on port ${HOST_PORT}"
+    curl -sf -m 2 "http://127.0.0.1:${HOST_PORT}/v1/models" 2>/dev/null | \
+      "${BASE_DIR}/.venv/bin/python" -c "import sys,json;print('  model:',json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null || true
+  else
+    echo "stopped"
+  fi
+  nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader 2>/dev/null || true
+}
+
+cmd_logs() {
+  tail -n "${1:-100}" -f "${LOGFILE}"
+}
+
+cmd_help() {
+  cat <<EOF
+basalt-ctl — run Qwen3.8-Flash-Next NVFP4 on 4x RTX 5060 Ti (native, no systemd)
+
+Model: ${MODEL}
+Config: expert tier over 4 cards, NVFP4 experts, ${BASALT_KV:-int8} KV, ctx 256k,
+        MTP --spec 8, PLE streamed from SSD, pinned RAM copy of the cold experts.
+
+Usage: basalt-ctl <command> [args...]
+
+Commands:
+  run       Run in the foreground (for a supervisor)
+  start     Start in the background and wait for readiness
+  stop      Stop
+  restart   Restart
+  status    Show process state and GPU use
+  logs [N]  Follow the server log (last N lines first)
+  bench     Run basalt-bench on this machine's config
+  help      Show this message
+
+Environment:
+  BASALT_PORT    Host port (default: ${HOST_PORT}; 8080 is filebrowser, 1234 is tinyllb)
+  BASALT_ALIAS   Model name clients send (default: ${ALIAS})
+  BASALT_CTX     Context length (default: 262144)
+  BASALT_PARALLEL  Concurrent live streams (default: 6)
+  BASALT_RESIDENT  KV streaming ring cells/layer (default 0 = off; needs BASALT_PARALLEL=1)
+  BASALT_KV      KV format: fp16 | int8 | k8v4 | q4_0 (default: int8)
+  BASALT_MODEL   Model path (default: models/Qwen3.8-FN-NVFP4.basalt)
+EOF
+}
+
+cmd_bench() {
+  # the cards are exclusive: a running server leaves too little VRAM and the
+  # engine fails at load ("hc8: staging the hyper-connection matrices failed")
+  if [ -f "${PIDFILE}" ] && kill -0 "$(cat "${PIDFILE}")" 2>/dev/null; then
+    echo "basalt-ctl bench: stopping the server (the cards must be free)" >&2
+    cmd_stop >/dev/null
+    sleep 5
+  fi
+  basalt_args
+  # server-only flags the engine (and so the bench) does not take: --parallel becomes --batch,
+  # --slot-full-context is a server scheduling option and is dropped
+  ARGS=("${ARGS[@]/--parallel/--batch}")
+  newargs=(); _skip=0
+  for a in "${ARGS[@]}"; do
+    if [ "$_skip" = 1 ]; then _skip=0; continue; fi
+    if [ "$a" = "--slot-full-context" ]; then continue; fi
+    newargs+=("$a")
+  done
+  ARGS=("${newargs[@]}")
+  exec "${BASE_DIR}/bin/basalt-bench" --model "${MODEL}" -t conv,struct,prose "$@" -- "${ARGS[@]}"
+}
+
+case "${1:-help}" in
+  run)     cmd_run;;
+  start)   cmd_start;;
+  stop)    cmd_stop;;
+  restart) cmd_restart;;
+  status)  cmd_status;;
+  logs)    shift; cmd_logs "$@";;
+  bench)   shift; cmd_bench "$@";;
+  help|--help|-h) cmd_help;;
+  *) echo "Unknown command: $1"; cmd_help; exit 1;;
+esac
