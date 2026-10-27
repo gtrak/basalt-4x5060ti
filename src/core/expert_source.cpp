@@ -823,7 +823,8 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t budget_physical = 0;   // the RAM reading a budget was sized from (0: no budget)
     if (budget_bytes > 0) {
         // CS-T: a RAM budget.  The complement's experts in `rank` order (the expert profile, hottest first) while
-        // they fit, the rest left on the mapped files; clamped to what the RAM has room for.
+        // they fit, the rest left on the mapped files; a budget the RAM has no room for is refused, not shrunk
+        // (the soft what-fits try alone sizes itself by the room).
         uint64_t physical = 0;
         if (!available_memory_bytes(physical)) {
             err = "FileExpertSource: cannot determine available RAM for --resident-budget-gib";
@@ -837,11 +838,16 @@ bool FileExpertSource::pin_cache_complement(
                                      "minus %.0f GiB headroom and the page overhead)",
                              (double) room / 1073741824.0, (double) physical / 1073741824.0,
                              (double) headroom_bytes / 1073741824.0);
-            else
-                basalt::log::warn("basalt", "FileExpertSource: --resident-budget-gib %.2f is more than the RAM has room for "
-                                     "(%.2f GiB available minus %.0f GiB headroom and the page overhead): %.2f GiB",
-                             (double) budget_bytes / 1073741824.0, (double) physical / 1073741824.0,
-                             (double) headroom_bytes / 1073741824.0, (double) room / 1073741824.0);
+            else {
+                char message[320];
+                std::snprintf(message, sizeof message,
+                              "FileExpertSource: --resident-budget-gib %.2f is more than the RAM has room for "
+                              "(%.2f GiB available minus %.0f GiB headroom and the page overhead): %.2f GiB",
+                              (double) budget_bytes / 1073741824.0, (double) physical / 1073741824.0,
+                              (double) headroom_bytes / 1073741824.0, (double) room / 1073741824.0);
+                err = message;
+                return false;
+            }
             budget_bytes = room;
         }
         std::vector<uint64_t> ranked(offsets.size(), kNoComplement);

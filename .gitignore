@@ -18,3 +18,7 @@ __pycache__/
 # Local working notes for the Windows port: scratch planning, not project docs.
 docs/WINDOWS-ROADMAP.md
 docs/REBASE-PLAN.md
+
+# Local launcher state (basalt-ctl), not project files.
+/.basalt-ctl.pid
+/basalt-server.log
