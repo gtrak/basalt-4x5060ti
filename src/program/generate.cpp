@@ -525,8 +525,8 @@ void usage() {
                  "                       experts and 4 GiB).\n"
                  "  --resident-budget-gib N  the resident mode with at most N GiB of experts in RAM (hottest first;\n"
                  "                       auto when not set: what fits);\n"
-                 "                       a budget that would leave less than the RAM floor free is refused, naming\n"
-                 "                       the largest safe value.\n");
+                 "                       a budget the RAM cannot serve in full is refused with the largest safe\n"
+                 "                       value, never silently shrunk.\n");
 }
 
 bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) {
