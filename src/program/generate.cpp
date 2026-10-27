@@ -1270,6 +1270,25 @@ int main(int argc, char** argv) {
                 : "no GPU-to-GPU access; cards after the main idle");
         if (!o.peer_devices.empty()) o.peer_device = o.peer_devices[0];
         chosen_cards = ri.cards;
+        if (ri.peer_access && chosen_cards.size() > 1) {
+            int pairs = 0, tried = 0;
+            for (int a = 0; a < (int) chosen_cards.size(); ++a)
+                for (int b = 0; b < (int) chosen_cards.size(); ++b) {
+                    if (a == b) continue;
+                    int prev = 0;
+                    cudaGetDevice(&prev);
+                    if (cudaSetDevice(a) != cudaSuccess) { (void) cudaGetLastError(); continue; }
+                    int can = 0;
+                    if (cudaDeviceCanAccessPeer(&can, a, b) == cudaSuccess && can) {
+                        ++tried;
+                        const cudaError_t e = cudaDeviceEnablePeerAccess(b, 0);
+                        if (e == cudaSuccess || e == cudaErrorPeerAccessAlreadyEnabled) ++pairs;
+                        (void) cudaGetLastError();
+                    } else (void) cudaGetLastError();
+                    (void) cudaSetDevice(prev);
+                }
+            basalt::log::info("basalt", "peer access: %d of %d ordered pairs enabled", pairs, tried);
+        }
     }
     // ---- where every loader reads from: the sections of the .basalt file
     if (o.model.empty()) {
