@@ -1317,10 +1317,17 @@ int main(int argc, char** argv) {
         mm.peer_overhead = 5ull << 28;
         const basalt::program::MgPlan mp = basalt::program::plan_multi_gpu(chosen_cards, mm);
         basalt::log::info("basalt", "%s", mp.line.c_str());
-        if (mp.pick == basalt::program::Mechanism::LayerSplit && o.peer_device >= 1) {
+        // BASALT_FORCE_SPLIT: the price model picks the expert tier on this box, but the split keeps every expert
+        // where it is computed (pipeline parallel), which is what the prompt path needs.  Opt in to compare.
+        const char* force_split = std::getenv("BASALT_FORCE_SPLIT");
+        if ((mp.pick == basalt::program::Mechanism::LayerSplit || (force_split && *force_split == '1')) &&
+            o.peer_device >= 1) {
             o.layer_split = "auto";
             o.peer_devices.clear();
             o.peer_device = -1;
+            if (force_split && *force_split == '1' && mp.pick != basalt::program::Mechanism::LayerSplit)
+                basalt::log::info("basalt", "layer split forced on (the price model picked %s)",
+                                  basalt::program::mechanism_name(mp.pick));
         }
     }
     // the peer card takes expert rows of a long prompt chunk only when it is as fast as the main one: a slower card costs the
