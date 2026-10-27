@@ -4456,16 +4456,23 @@ int main(int argc, char** argv) {
         drive.d.pool = &pool;
     }
     auto& pool = *pool_store;
-    std::vector<std::pair<int32_t, int32_t>> peer_only;   // experts only the peer holds (--peer-exclusive)
+    // experts the tier cards hold: opened before the RAM copy is planned, so the copy skips them and holds
+    // only the experts no GPU holds. --peer-exclusive marks them held only there (swap spares); without it they
+    // are still skipped from the copy, and an expert a later swap evicts reads through the file mapping.
+    std::vector<std::pair<int32_t, int32_t>> peer_only;   // experts a tier card holds
     uint64_t peer_only_bytes = 0;
-    if (o.resident_cpu_experts && o.peer_exclusive && o.peer_device >= 1) {
-        if (!open_peer(true)) return 1;
-        for (int64_t l = 0; l < g.n_layers; ++l)
-            for (int64_t e = 0; e < g.n_expert; ++e)
-                if (peer.has(l, e)) {
-                    peer_only.emplace_back((int32_t) l, (int32_t) e);
-                    peer_only_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(l);
-                }
+    if (o.resident_cpu_experts && o.peer_device >= 1) {
+        if (!open_peer(o.peer_exclusive)) return 1;
+        const auto add_tier = [&](const basalt::core::PeerExperts& t) {
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (t.has(l, e)) {
+                        peer_only.emplace_back((int32_t) l, (int32_t) e);
+                        peer_only_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(l);
+                    }
+        };
+        add_tier(peer);
+        for (const auto& xp : xpeers) add_tier(*xp);
     }
     // ---- the resident RAM mode (--resident-experts / --resident-cpu-experts): the experts the GPU cache does not
     // hold are copied from the experts section into RAM once, so no decode or prompt step reads the file (the plain mmap
@@ -4523,10 +4530,11 @@ int main(int argc, char** argv) {
         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, gpu_only, lend_from, resident_headroom,
                                                     o.resident_budget, &rank);
         std::string whole_err;
-        if (!resident_ok && o.resident_soft) {
+        if (!resident_ok && o.resident_soft && o.resident_budget == 0) {
             // the whole complement does not fit - keep what does, the hottest by the profile, through the budget
             // path (sized by the RAM alone) instead of none: the misses outside it read the same file bytes the mmap
-            // fallback reads, so the answers are unchanged.  Nothing pinned: the fallback below.
+            // fallback reads, so the answers are unchanged.  Nothing pinned: the fallback below.  An explicit budget
+            // never takes this road: it is kept whole or the start refuses (the branch below).
             whole_err = err;
             resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, gpu_only, -1, resident_headroom,
                                                    basalt::core::FileExpertSource::kResidentWhatFits, &rank);
@@ -4564,10 +4572,11 @@ int main(int argc, char** argv) {
         } else if (o.resident_soft) {
             basalt::log::warn("basalt generate", "the resident RAM mode does not fit (%s)", err.c_str());
         } else if (o.resident_budget > 0) {
-            // a RAM budget that cannot be kept is not a reason to stop - the experts it would have held are read from
-            // the files like the ones outside it (pin_cache_complement leaves nothing half-built)
-            basalt::log::warn("basalt generate", "the RAM budget (--resident-budget-gib) cannot be kept (%s)",
+            // a RAM budget is a contract: the copy it names is kept whole or the start refuses, never a shrunken
+            // copy served silently (pin_cache_complement leaves nothing half-built)
+            basalt::log::error("basalt generate", "the RAM budget (--resident-budget-gib) cannot be kept (%s)",
                          err.c_str());
+            return 1;
         } else {
             basalt::log::error("basalt generate", "CPU expert residency: %s", err.c_str());
             return 1;
@@ -4621,8 +4630,9 @@ int main(int argc, char** argv) {
             pstages.clear();
         }
     }
-    // ---- the peer's experts: the ranked pairs the primary does not hold.  Without --peer-exclusive they are copies of
-    // experts the RAM complement holds, so with the complement built they are read from it, not from the file.
+    // ---- the peer's experts, when the tiers did not open above: the ranked pairs the primary does not hold.
+    // Without --peer-exclusive they are copies of experts the RAM complement holds, so with the complement built
+    // they are read from it, not from the file.
     if (o.peer_device >= 1 && !peer.valid() && !open_peer(false)) return 1;
     for (auto& st : pstages) st->tier = st->tier_at == 0 ? &peer : xpeers[st->tier_at - 1].get();
     // ---- the prompt-time split's price (price_prompt_split): each card's side of a part read, from what its slots hold
@@ -5127,6 +5137,15 @@ int main(int argc, char** argv) {
                 }
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
+        // an expert a tier card holds is copied from that card (d2d) instead of read from the file: a 16k prompt
+        // otherwise reads ~47 GiB from the SSD at the streamed chunk sizes
+        {
+            std::vector<std::tuple<const int32_t*, const basalt::core::ExpertCache*, int>> remotes;
+            if (peer.valid()) remotes.emplace_back(peer.residency().data(), &peer.cache(), peer.device());
+            for (const auto& xp : xpeers)
+                if (xp->valid()) remotes.emplace_back(xp->residency().data(), &xp->cache(), xp->device());
+            if (!remotes.empty()) sp.set_ring_remotes(std::move(remotes));
+        }
             if (!multi_gpu && o.batch <= 0 && !o.no_pool) { sp.set_cpu_pool(&pool); sp.set_cpu_share(o.prefill_cpu_share); }   // the pool is idle while a prompt is read
             if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
@@ -5267,7 +5286,7 @@ int main(int argc, char** argv) {
                       std::to_string(kStageFreeMin >> 20) + "; --peer-reserve-mib";
             }
             if (ok) {
-                st.sp.set_ring_remote(host_res.data(), &xcache, 0);
+                st.sp.set_ring_remotes({{host_res.data(), &xcache, 0}});
                 basalt::log::info("basalt serve", "prompt split: CUDA%d can take layers %lld-%lld of a long prompt (chunks up "
                                      "to %lld tokens, links %.1f/%.1f GB/s); %zu MiB free on it (%zu before)", st.dev,
                                   (long long) st.lo, (long long) st.hi - 1, (long long) split_chunk_max,

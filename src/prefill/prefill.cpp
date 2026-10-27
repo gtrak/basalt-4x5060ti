@@ -569,10 +569,10 @@ struct Prefill::Impl {
     std::unique_ptr<PeerPrefill> pp;         // multi-GPU: the peer GPU's expert share (set_peer)
     bool peer_share = true;                  // set_peer_share
     core::PeerExperts* ring_peer = nullptr;  // --peer-exclusive: experts held only there are copied from its memory
-    // set_ring_remote: another card's cache, read for the experts without a pinned host copy
-    const int32_t* remote_res = nullptr;
-    const core::ExpertCache* remote_cache = nullptr;
-    int remote_dev = -1;
+    // set_ring_remotes: other cards' caches, read for the experts without a pinned host copy (the main card lists
+    // every tier card)
+    struct RingRemote { const int32_t* res; const core::ExpertCache* cache; int dev; };
+    std::vector<RingRemote> ring_remotes;
     PeerStage peer_stage;                    // the asynchronous host-staged copy of those experts
     // row-cache warm-up of the prompt's later parts (set_ple_warm)
     struct PleWarm {
@@ -1247,11 +1247,11 @@ void Prefill::set_ring_peer(core::PeerExperts* peer) {
     impl_->ring_peer = peer != nullptr && peer->valid() ? peer : nullptr;
 }
 
-void Prefill::set_ring_remote(const int32_t* res, const core::ExpertCache* cache, int device) {
-    const bool on = res != nullptr && cache != nullptr && device >= 0;
-    impl_->remote_res = on ? res : nullptr;
-    impl_->remote_cache = on ? cache : nullptr;
-    impl_->remote_dev = on ? device : -1;
+void Prefill::set_ring_remotes(std::vector<std::tuple<const int32_t*, const core::ExpertCache*, int>> remotes) {
+    impl_->ring_remotes.clear();
+    for (const auto& [res, cache, device] : remotes)
+        if (res != nullptr && cache != nullptr && device >= 0)
+            impl_->ring_remotes.push_back({res, cache, device});
 }
 
 void Prefill::set_peer_share(bool on) { impl_->peer_share = on; }
@@ -1513,13 +1513,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
     // set_ring_remote: an expert with no pinned host copy that the other card's cache holds (its blob there), or null
-    auto remote_blob = [&m](int64_t l, int32_t e) -> const uint8_t* {
-        if (m.remote_res == nullptr || m.src == nullptr || m.src->pinned(l, e)) return nullptr;
-        const int32_t s = m.remote_res[(size_t) l * m.g->n_expert + e];
-        return s >= 0 ? m.remote_cache->device_slot(s) : nullptr;
+    auto remote_blob = [&m](int64_t l, int32_t e, int* dev_out) -> const uint8_t* {
+        if (m.ring_remotes.empty() || m.src == nullptr || m.src->pinned(l, e)) return nullptr;
+        for (const auto& r : m.ring_remotes) {
+            const int32_t s = r.res[(size_t) l * m.g->n_expert + e];
+            if (s >= 0) { if (dev_out) *dev_out = r.dev; return r.cache->device_slot(s); }
+        }
+        return nullptr;
     };
-    // the card the ring's other-card copies come from (--peer-exclusive's peer, or set_ring_remote's card)
-    const int remote_device = m.ring_peer ? m.ring_peer->device() : m.remote_dev;
+    const int peer_dev = m.ring_peer ? m.ring_peer->device() : -1;
     // The direct successor's future lives on the Prefill object. Intermediate
     // stages therefore do not drain the complete remaining GPU chain here.
     basalt::kernels::QsaShapes s = basalt::kernels::qsa_real_shapes();
@@ -1703,7 +1705,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         PeerPrefill* const ppc =
             m.pp && m.peer_share && (T <= m.pp->T_max || (stream_all && T <= m.pp->T_fp4)) ? m.pp.get() : nullptr;
         const bool peer_fp4 = ppc && stream_all && ppc->T_fp4 > 0;
-        struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; const uint8_t* pdev; };
+        struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; const uint8_t* pdev; int pdev_dev; };
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;
         size_t consumed = 0;
@@ -1718,12 +1720,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     int job = -1;
                     const uint8_t* b = nullptr;
                     if (m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(l, e)) {   // no host copy: from the peer
-                        seq.push_back({(int32_t) l, e, nullptr, -1, m.ring_peer->slot_ptr(l, e)});
+                        seq.push_back({(int32_t) l, e, nullptr, -1, m.ring_peer->slot_ptr(l, e), m.ring_peer->device()});
                         continue;
                     }
-                    if (const uint8_t* rp = remote_blob(l, e)) {   // no pinned host copy: from the other card's cache
-                        seq.push_back({(int32_t) l, e, nullptr, -1, rp});
-                        continue;
+                    {
+                        int rd = -1;
+                        if (const uint8_t* rp = remote_blob(l, e, &rd)) {   // no pinned host copy: from the card that holds it
+                            seq.push_back({(int32_t) l, e, nullptr, -1, rp, rd});
+                            continue;
+                        }
                     }
                     {
                         b = m.src->blob(l, e);
@@ -1759,7 +1764,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             ~IssuerJoin() { if (t->joinable()) { stop->store(true); t->join(); } }
         } issuer_join{&a_stop, &issuer};
         const bool threaded_issue = stream_all;
-        const bool peer_async = remote_device >= 0 && m.peer_stage.setup(remote_device, (size_t) MAXBLOB());
+        const bool peer_async = peer_dev >= 0 && m.peer_stage.setup(peer_dev, (size_t) MAXBLOB());
         if (threaded_issue) {
             issuer = std::thread([&] {
                 const core::OnDevice od(m.device);
@@ -1781,8 +1786,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                     if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                     if (en.pdev != nullptr) {
-                        if (peer_async) m.peer_stage.copy(m.stage_dev[sl], en.pdev, bytes, m.copy);
-                        else cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, en.pdev, remote_device, bytes, m.copy);
+                        if (peer_async && en.pdev_dev == peer_dev) m.peer_stage.copy(m.stage_dev[sl], en.pdev, bytes, m.copy);
+                        else cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, en.pdev, en.pdev_dev, bytes, m.copy);
                         ++iss_dma;
                     } else if (en.job < 0) {
                         cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
@@ -1847,7 +1852,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             int k = 0;
             for (size_t i = 0; i < want.size() && k < ahead_n; ++i) {
                 const int32_t e = want[i].second;
-                const uint8_t* bl = m.src->blob(L, e);
+                int rda = -1;
+                const uint8_t* bl = remote_blob(L, e, &rda);
+                if (bl != nullptr) {
+                    const int sl = STAGE + b * ahead_n + k++;
+                    if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
+                    cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, bl, rda, (size_t) lay0.blob_bytes(L), m.copy);
+                    cudaEventRecord(m.copied[sl], m.copy);
+                    m.stage_live[sl] = true;
+                    continue;
+                }
+                bl = m.src->blob(L, e);
                 if (bl == nullptr) continue;
                 const int sl = STAGE + b * ahead_n + k++;
                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
@@ -2551,11 +2566,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // --peer-exclusive: an expert only the peer holds has no host copy.  It is copied from the peer's
                         // memory into a staging slot; so is one set_ring_remote's card holds without a pinned host copy.
                         // The blob on the other card, or null.
-                        auto other_card = [&](int32_t e) -> const uint8_t* {
+                        auto other_card = [&](int32_t e, int* dev_out) -> const uint8_t* {
                             if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) return nullptr;
-                            if (m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(l, e))
+                            if (m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(l, e)) {
+                                if (dev_out) *dev_out = m.ring_peer->device();
                                 return m.ring_peer->slot_ptr(l, e);
-                            return remote_blob(l, e);
+                            }
+                            return remote_blob(l, e, dev_out);
                         };
                         // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
                         int stage_next = 0;
@@ -2567,7 +2584,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             for (size_t j = 0; j < order.size(); ++j) {
                                 const int32_t e = order[j];
                                 if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
-                                if (other_card(e) != nullptr) continue;
+                                int rd0 = -1;
+                                if (other_card(e, &rd0) != nullptr) continue;
                                 if (m.src->pinned(l, e)) continue;
                                 job_of[j] = (int) js.size();
                                 const uint8_t* b = m.src->blob(l, e);
@@ -2588,14 +2606,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int sl = stage_next;
                             stage_next = (stage_next + 1) % STAGE;
                             const auto th = Clock::now();
-                            const uint8_t* via = other_card(e);
+                            int via_dev = -1;
+                            const uint8_t* via = other_card(e, &via_dev);
                             const bool pinned = via == nullptr && m.src->pinned(l, e);
                             const uint8_t* b = pinned ? m.src->blob(l, e) : nullptr;
                             if (pinned && !b) { err = "prefill: expert source has no blob"; return false; }
                             if (via != nullptr) {
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-                                if (peer_async) m.peer_stage.copy(m.stage_dev[sl], via, (size_t) lay.blob_bytes(l), m.copy);
-                                else cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, via, remote_device,
+                                if (peer_async && via_dev == peer_dev) m.peer_stage.copy(m.stage_dev[sl], via, (size_t) lay.blob_bytes(l), m.copy);
+                                else cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, via, via_dev,
                                                          (size_t) lay.blob_bytes(l), m.copy);
                                 ++stats_.experts_dma;
                             } else if (pinned) {

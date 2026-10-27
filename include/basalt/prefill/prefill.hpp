@@ -144,7 +144,7 @@ public:
     /// A stage on another card than the main one: an expert with no pinned host copy that the cache on `device` holds
     /// (`res`: n_layers x n_expert slot or -1, read at every chunk) is copied from that card through host staging into
     /// the ring.  Null `res`: none.
-    void set_ring_remote(const int32_t* res, const core::ExpertCache* cache, int device);
+    void set_ring_remotes(std::vector<std::tuple<const int32_t*, const core::ExpertCache*, int>> remotes);
     /// Off: the peer card's share (set_peer) is skipped, every expert of a chunk stays on this card - while the peer
     /// card runs a stage of the same prompt.
     void set_peer_share(bool on);
