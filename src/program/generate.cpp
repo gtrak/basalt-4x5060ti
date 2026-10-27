@@ -5898,6 +5898,16 @@ int main(int argc, char** argv) {
         // a layer whose peer experts take more than this share of its 10 routed entries per token promotes them without
         // the margin (a layer's peer share, not the step's, sets how late the peer is)
         constexpr float promote_load = 0.0f;
+        // a swap-in a tier holds can copy device-to-device out of that tier's slot; the RAM copy is not needed.
+        // tier_at returns -1 when no tier holds it.  (Under --peer-exclusive this was the only servable kind; with
+        // the complement holding only the experts no GPU holds it is the general case.)
+        auto tier_at = [&](int64_t l, int32_t e) -> int {
+            if (peer.valid() && peer.has(l, e)) return 0;
+            for (size_t i = 0; i < xpeers.size(); ++i)
+                if (xpeers[i]->valid() && xpeers[i]->has(l, e)) return (int) i + 1;
+            return -1;
+        };
+        auto tier_ref = [&](size_t t) -> basalt::core::PeerExperts& { return t == 0 ? peer : *xpeers[t - 1]; };
         // the profile's rank of each pair: of equally routed experts the better-ranked one comes in and the worse-ranked
         // one leaves first
         std::vector<int32_t> prof_rank((size_t) (g.n_layers * g.n_expert), (int32_t) profile.size());
@@ -5906,8 +5916,18 @@ int main(int argc, char** argv) {
             if (pl >= 0 && pl < g.n_layers && pe >= 0 && pe < g.n_expert && prof_rank[(size_t) (pl * g.n_expert + pe)] == (int32_t) profile.size())
                 prof_rank[(size_t) (pl * g.n_expert + pe)] = (int32_t) i;
         }
+        // A swap-in the source cannot serve (no RAM copy, and p2p only under --peer-exclusive) would read the
+        // mapped file on the adapt stream: a random SSD read per swap, and its victim would lose its RAM place
+        // too (xchg needs the incoming to be resident or p2p). Tier-held experts already compute at full speed on
+        // their own tier, so they are not candidates unless the p2p path can fetch them.
         auto rank_swaps = [&](std::vector<Swap>& swaps, bool across) {
             swaps.clear();
+            // servable: the complement holds it.  A tier-held expert is NOT a candidate even though a d2d copy
+            // could fetch it: the tier computes its own experts in parallel with the main card, and promoting one
+            // concentrates that work on the main card (measured: -15% decode), so it stays where it is.
+            auto servable = [&](int64_t l, int32_t e) {
+                return src.has_resident(l, e) || (o.peer_exclusive && peer.valid() && peer.has(l, e));
+            };
             if (across) {
                 // one ranking over every layer: a layer that routes more experts than its slots hold takes the slots of
                 // the least-routed experts of any layer, so the slots follow the request's layers; with every layer's
@@ -5920,7 +5940,7 @@ int main(int argc, char** argv) {
                     for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                         const int32_t rk = prof_rank[(size_t) (l * g.n_expert + e)];
                         if (r[e] >= 0) vict.push_back({u[e], rk, (int32_t) l, e});
-                        else if (u[e] >= 1.5f) cand.push_back({u[e], rk, (int32_t) l, e});
+                        else if (u[e] >= 1.5f && servable(l, e)) cand.push_back({u[e], rk, (int32_t) l, e});
                     }
                 }
                 if (cand.empty() || vict.empty()) return;
@@ -5957,7 +5977,7 @@ int main(int argc, char** argv) {
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) {
                         const bool on_peer = peer.valid() && peer.has(l, e);
-                        if (u[e] >= 2.0f && !(remote_opt && remote_opt->owns(l, e)))
+                        if (u[e] >= 2.0f && !(remote_opt && remote_opt->owns(l, e)) && servable(l, e))
                             cand.emplace_back(on_peer ? u[e] - margin : u[e], e);
                     }
                     else vict.emplace_back(u[e], e);
@@ -6066,8 +6086,7 @@ int main(int argc, char** argv) {
         // (--adapt-decay when given, else 0.85): the routing counts stay large enough for the thresholds and the peer
         // margin.
         const float fast_decay = o.adapt_decay_set ? o.adapt_decay : 0.85f;
-        struct XSwap { int32_t layer, in, out, lout, slot; uint64_t off; bool xchg, promo, p2p; };
-        const bool peer_excl = o.peer_exclusive && peer.valid() && src.complement_ready();
+        struct XSwap { int32_t layer, in, out, lout, slot; uint64_t off; int32_t tier; bool xchg, promo, p2p; };
         // the rounds rank over all layers when no peer tier holds experts and every layer's blobs are one size (a slot
         // then takes any layer's expert)
         bool xq_across = !peer.valid() && xpeers.empty();
@@ -6122,8 +6141,10 @@ int main(int argc, char** argv) {
             std::set<size_t> taken;   // the round's victims
             for (const Swap& s : swaps) taken.insert((size_t) s.lout * g.n_expert + s.out);
             auto plan = [&](Swap s) -> bool {
-                // an expert only the peer holds is copied from its VRAM; it needs a RAM place for the one it replaces
-                const bool p2p = peer_excl && peer.has(s.layer, s.in) && !src.has_resident(s.layer, s.in);
+                // an expert a tier holds is copied from that tier's VRAM; it needs a RAM place for the one it
+                // replaces (the victim must have one, or the layer's least-routed expert with one goes instead)
+                const int t_in = tier_at(s.layer, s.in);
+                const bool p2p = t_in >= 0 && !src.has_resident(s.layer, s.in);
                 if (p2p && src.has_resident(s.layer, s.out)) {
                     // a lent slot's expert keeps its RAM place, which the incoming one would not have: the layer's
                     // least-routed expert without one goes instead, if that is still a gain
@@ -6153,8 +6174,8 @@ int main(int argc, char** argv) {
                         return false;
                     }
                 }
-                if (p2p) peer.hold(s.layer, s.in);
-                xq.push_back({s.layer, s.in, s.out, s.lout, slot, off, xchg,
+                if (p2p) tier_ref((size_t) t_in).hold(s.layer, s.in);
+                xq.push_back({s.layer, s.in, s.out, s.lout, slot, off, t_in, xchg,
                               peer.valid() && peer.has(s.layer, s.in), p2p});
                 return true;
             };
@@ -6217,7 +6238,7 @@ int main(int argc, char** argv) {
                 for (const XSwap& x : xq) {   // stream order keeps each behind its slot's eviction copy
                     std::string perr;
                     if (x.p2p) {
-                        if (!peer.copy_to(x.layer, x.in, xcache.device_slot(x.slot), adapt_stream, perr)) {
+                        if (!tier_ref((size_t) x.tier).copy_to(x.layer, x.in, xcache.device_slot(x.slot), adapt_stream, perr)) {
                             basalt::log::error("basalt serve", "%s", perr.c_str());
                             return false;
                         }
@@ -6293,10 +6314,10 @@ int main(int argc, char** argv) {
             } else {
                 res_upload();
             }
-            for (const XSwap& x : xq) {   // a promoted expert's peer slot takes the one CUDA0 gave up
-                if (!x.promo) continue;
+            for (const XSwap& x : xq) {   // a promoted expert's tier slot takes the one CUDA0 gave up
+                if (x.tier < 0) continue;
                 std::string perr;
-                if (!peer.reassign(x.layer, x.in, x.out, srcp->blob(x.layer, x.out), perr))
+                if (!tier_ref((size_t) x.tier).reassign(x.layer, x.in, x.out, srcp->blob(x.layer, x.out), perr))
                     basalt::log::warn("basalt serve", "%s", perr.c_str());
             }
             xq.clear();
@@ -6587,7 +6608,7 @@ int main(int argc, char** argv) {
             const uint64_t later = serve_growth_bytes(o, g) +
                                    (ram_floor_bytes - std::min(ram_floor_bytes, basalt::platform::ram_margin()));
             const uint64_t add = src.top_up(stages.empty() ? profile : profile_all, [&](int32_t l, int32_t e) {
-                return host_res[(size_t) l * g.n_expert + (size_t) e] >= 0 || (peer.valid() && peer.has(l, e));
+                return host_res[(size_t) l * g.n_expert + (size_t) e] >= 0 || tier_at(l, (int32_t) e) >= 0;
             }, o.resident_pin, n_top, later);
             if (add > 0) {
                 basalt::platform::watch_resident_ram(true, src.resident_bytes() + add);
