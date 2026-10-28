@@ -8555,6 +8555,12 @@ int main(int argc, char** argv) {
             // --batch: an idle slot that holds the start of this prompt (the conversation it served last) is a
             // source too - its sessions are copied back below, so only the new part is read
             int slot_source = -1;
+            // a slot's state is a prompt source only when it beats the own chain by a real margin: the copy-in is a
+            // whole-state copy (a 71k conversation measured 1.35 s) plus the eviction it forces, while reading the
+            // delta fresh on the split is ~0.26 ms per token - the break-even sits near 8% of the source's length.
+            // A few hundred tokens of edge (the common case between two conversations that take turns) is read, not
+            // copied: the request keeps its own chain and skips the restore entirely.
+            constexpr int64_t kSlotSourceMinGain = 8192;
             int64_t slot_tokens = 0;
             bool resumed_from0 = false;   // a prompt read parked in a slot (BYIELD) that had started at token 0
             int64_t resumed_chunk = 0;    // its chunk, if it was read beside decoding slots: its first part's plan
@@ -8567,14 +8573,14 @@ int main(int argc, char** argv) {
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
                     if (b == own_slot || (!sl.active && !sl.cached) || sl.cvec != want_cvec) continue;
-                    if (!in_slot && !sl.active && (int64_t) sl.ids.size() > std::max(resume, slot_tokens) &&
+                    if (!in_slot && !sl.active && (int64_t) sl.ids.size() > std::max(resume + kSlotSourceMinGain, slot_tokens) &&
                         starts_with(sl.ids, sl.imgs)) {
                         slot_source = b;
                         slot_tokens = (int64_t) sl.ids.size();
                         slot_ck = nullptr;
                     }
                     for (const ConvCheckpoint& c : sl.checks)
-                        if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) && starts_with(c.ids, c.imgs)) {
+                        if ((int64_t) c.ids.size() > std::max(resume + kSlotSourceMinGain, slot_tokens) && starts_with(c.ids, c.imgs)) {
                             slot_source = b;
                             slot_tokens = (int64_t) c.ids.size();
                             slot_ck = &c;
@@ -8583,7 +8589,7 @@ int main(int argc, char** argv) {
             // a request in another slot: the solo session's chain is slot 0's conversation, a source like the rest
             if (o.prompt_cache > 0 && in_slot && slot0_is_solo && solo_book.cvec == want_cvec)
                 for (const ConvCheckpoint& c : solo_book.checks)
-                    if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) && starts_with(c.ids, c.imgs)) {
+                    if ((int64_t) c.ids.size() > std::max(resume + kSlotSourceMinGain, slot_tokens) && starts_with(c.ids, c.imgs)) {
                         slot_source = 0;
                         slot_tokens = (int64_t) c.ids.size();
                         slot_ck = &c;
