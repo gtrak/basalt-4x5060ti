@@ -8988,7 +8988,11 @@ int main(int argc, char** argv) {
                 const auto t_ln = Clock::now();
                 // the ring depth this read's layout uses; every size computed below (and the layout) follows it, and
                 // the full depth is restored on the way out for the sizing done elsewhere
-                const bool beside = batch_on() && (tokens > kReadAlone || resumed_chunk > 0);
+                // on a layer split the read is exclusive (read_part below), so the windows cannot lose the lent
+                // slots while it runs and the loan may size as on an idle engine; beside stays for the single-GPU
+                // overlap path, where a resumed read (it gave way and continues) parks its rest in the decode-sized
+                // loan even when the rest is short
+                const bool beside = batch_on() && stages.empty() && (tokens > kReadAlone || resumed_chunk > 0);
                 basalt::prefill::Prefill::set_ring_depth(beside ? kRingDecoding : 1 << 20);
                 struct RingReset { ~RingReset() { basalt::prefill::Prefill::set_ring_depth(1 << 20); } } ring_reset;
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
@@ -9005,8 +9009,9 @@ int main(int argc, char** argv) {
                 // engine may refill lent slots from the file, so a larger chunk is worth it.  The chunk shrinks to the
                 // loan, but not below the smallest chunk the prompt path runs.
                 int64_t loan_lim = std::numeric_limits<int64_t>::max();
-                if (batch_on()) {
-                    if (beside) loan_lim = kLendCapDecoding;
+                if (beside) {   // windows decode beside this read: their hot slots are not lent, and a lent one is
+                    // refilled from RAM, never the file, before they decode again
+                    loan_lim = kLendCapDecoding;
                     // the RAM-backed slots are the cache's last ones: those still live after the KV took its share
                     if (src.complement_ready())
                         loan_lim = std::min<int64_t>(loan_lim, std::max<int64_t>(0, src.resident_lent_slots() -
@@ -9595,8 +9600,13 @@ int main(int argc, char** argv) {
                 return true;
             };
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
-                // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
-                if (o.batch <= 0 || piped || (!stages.empty() && !batch_on()) || (b0 - a0 <= kReadAlone && resumed_chunk <= 0)) {
+                // (a layer split reads its stages as a pipeline over one run's chunks, and always exclusively: a read
+                // beside decoding slots measured 163-174 tok/s against 3900 alone - the read's borrowed experts and
+                // the windows' hot sets evict each other at every boundary (1.38M pool serves, 117 GB of file
+                // re-reads for two 86k prompts) - so on a split a read owns the cards and the windows wait for it.
+                // On one GPU a read that gave way continues beside the slots even when its rest is short)
+                if (o.batch <= 0 || piped || !stages.empty() ||
+                    (b0 - a0 <= kReadAlone && resumed_chunk <= 0)) {
                     // no window runs meanwhile, so the CPU pool is free: it takes its share of the streamed experts
                     const bool lend_pool = o.batch > 0 && !multi_gpu && !o.no_pool;
                     if (lend_pool) { sp.set_cpu_pool(&pool); sp.set_cpu_share(o.prefill_cpu_share); }
