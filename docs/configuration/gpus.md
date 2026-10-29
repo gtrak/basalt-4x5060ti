@@ -69,7 +69,9 @@ there is no choice: nothing is priced and no other card is used or even visible 
   experts a partner holds stay out of the RAM copy, as a tier card's do. Needs `--serve`, `--gpu` with an even number
   of cards, at least 4, and GPU-to-GPU access; not combinable with `--split-device`, `--vram-elastic` or helper expert
   caches. The head and GDN mixer stay whole on the lead card. The start logs `tp2/pp2: stages A(layers 0-23)=[CUDA0,
-  CUDA1] B=[CUDA2,CUDA3]` and one line per partner card. Not measured yet: the price model's tensor-parallel line
+  CUDA1] B=[CUDA2,CUDA3]` and one line per partner card; the `gpus:` line names the cards by their pair (`main, stage
+  partner, stage lead, stage partner`) rather than as expert tiers, since a card filled as a tier beside its pair
+  would be filled twice. Not measured yet: the price model's tensor-parallel line
   stays aspirational until this is benchmarked against the plain split.
 
 Only cards that match (memory bandwidth and VRAM within 10%) may pick a mechanism other than the expert tier, and only
