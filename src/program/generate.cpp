@@ -3644,13 +3644,19 @@ int main(int argc, char** argv) {
             }
             // its buffers are allocated by now, so what that card has free beyond the reserve is its expert tier
             const int64_t room = stage_room(pair_dev, true, 0);
+            // The partner takes the CONTINUATION of the stage's ranking, not the cold tail: the lead admits the
+            // hottest pairs until its (small - it also carries the dense weights, session and head) room ends, and
+            // the next-hottest slice belongs on the partner's idle VRAM before anything falls to the RAM complement.
+            // Measured (06:51/07:05 boots): with the cold tail on the partner the lead thrashed the complement at
+            // 5.04 CPU-expert entries per layer-window against the plain split's 1.83 - the hot half did not fit.
+            // When the lead fits its whole hot half the continuation starts at the midpoint - the old split.
             std::vector<std::pair<int32_t, int32_t>> pick;
             int64_t used = 0;
-            for (const auto& pr : pair_ranked(ranked, 1)) {
-                const int64_t b = (int64_t) basalt::core::PeerExperts::slot_bytes(pr.first);
+            for (size_t i = (size_t) (lead_held > 0 ? lead_held : 0); i < ranked.size(); ++i) {
+                const int64_t b = (int64_t) basalt::core::PeerExperts::slot_bytes(ranked[i].first);
                 if (used + b > room) break;
                 used += b;
-                pick.push_back(pr);
+                pick.push_back(ranked[i]);
             }
             if (pick.empty()) {
                 basalt::log::error("basalt generate", "tp2, CUDA%d partner tier: no room for its half of its stage's "
