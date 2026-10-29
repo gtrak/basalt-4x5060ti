@@ -1649,3 +1649,22 @@ is measured against the predictions above; the flag-off run stays byte-identical
 Reviewer checklist: build; `ctest -L cpu` (expect 66/67, `expert_multi_test` pre-existing); flag off = today's
 binary's behaviour; flag on today = the refusal line at init, nothing else; then grade the predictions once
 the peer's item lands.
+
+## RUN 18 — BF16 measured: attribution confirmed, the sweep re-mapped, 1905 t/s (reviewer, autonomous overnight)
+
+BF16 + per-stage re-pricing (`89190c7e` + `0a941f88`), merged with the decode head-split contract (`de4f7da3`):
+
+- **Attribution CONFIRMED**: `rows 114.6 -> 56.3 ms` = 50.9% ~= BF16's byte-weight exactly. The return bytes
+  were the wall (the reviewer's confound question answered by the A/B itself). Comp 105.3 -> 52.3 (share shrank with it).
+- Prefill **1905 t/s** at 8192 (from 1393 pre-RAM-reader, 1406 post). Concurrent pair 64.2 s (from 87.0).
+- Stage B's overload fixed: peer-wait 88.3 -> 40.1. Lead-experts 114.4 -> 78.1, blobs 101.9 -> 67.8.
+- Crossover moved 10,619 -> ~19.3k (boot line: 825-836 MiB/1024 tokens vs 15.8-16.1k MiB held blobs).
+- Stage-serialization check: measured 4.28 s/chunk vs ideal 2-stage pipeline 3.85 vs serial 6.72 —
+  **the stages already pipeline at ~90% of the 2-stage ceiling**; Finding 2's 2x precondition is absent.
+- Chunk re-sweep (fresh boots, BF16, engagement confirmed): 2048 -> 826 (routed-only regime, <=2559 cap),
+  4096 -> 1328, 6144 -> 1692, **8192 -> 1905**, 16384 -> 1902, 24576 -> 1679, 32768 -> 1897.
+  The wall is now chunk-size-invariant: the per-layer critical path (attn 53.9 + lead-experts 78.1 +
+  peer straggler 18.0 stage A / 40.1 stage B). sglang-style 2048 does not transfer (no expert tiers there).
+- Decode canary: acc 61-65% (in the 53-67% band), solo 78.3 t/s, hit 94.6% — parity holds under BF16.
+- Next lever: the peer stragglers (phase-separated link scheduling: RAM-band compute first, P2P return
+  streamed behind VRAM-band compute) target the 18-40 ms per layer.
