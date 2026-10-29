@@ -58,6 +58,19 @@ there is no choice: nothing is priced and no other card is used or even visible 
 - **Tensor parallel**: every layer is split across the cards. It is priced and not built: the dense part is a third of
   a window's bytes, so splitting it saves about 2 ms between two cards and the exchanges between the cards (host-staged,
   about 5.4 us per 10 KiB) cost about as much; the expert tier already shares the experts.
+- **Stage pairs** (`--tp-size 2`, exploratory): each stage of a layer split is a PAIR of cards instead of one, so four
+  cards run two stages of half the model each. Stage `s` leads on CUDA `2s` and its partner is CUDA `2s+1`; the pair
+  splits its layers' experts by expert id, the lead card holding the even ids and the partner the odd ones, so each
+  card's expert tier is half the depth a single stage card's would be and every profiled pair is on exactly one of the
+  two. The partner card holds no dense weights, no session and no state: the stage's verifier computes its half of the
+  rows there with the main card's kernels (so an expert's rows do not depend on which card of the pair holds it), and
+  the stage's prompt path copies those blobs over the link instead of reading them from the file. The layers are cut
+  evenly (the auto search prices one card per stage), the placement is static (no swap runs on a partner card), and the
+  experts a partner holds stay out of the RAM copy, as a tier card's do. Needs `--serve`, `--gpu` with an even number
+  of cards, at least 4, and GPU-to-GPU access; not combinable with `--split-device`, `--vram-elastic` or helper expert
+  caches. The head and GDN mixer stay whole on the lead card. The start logs `tp2/pp2: stages A(layers 0-23)=[CUDA0,
+  CUDA1] B=[CUDA2,CUDA3]` and one line per partner card. Not measured yet: the price model's tensor-parallel line
+  stays aspirational until this is benchmarked against the plain split.
 
 Only cards that match (memory bandwidth and VRAM within 10%) may pick a mechanism other than the expert tier, and only
 when it prices at least 5% below it. Unlike cards always use the expert tier. The prices are estimates fitted to

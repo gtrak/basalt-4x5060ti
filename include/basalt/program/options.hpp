@@ -201,6 +201,11 @@ struct Options {
     /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
     /// GPU, sharing everything - the bit-exact A/B of the hand-off)
     std::string split_device;
+    /// --tp-size N (or BASALT_TP2=1): how many cards share one stage of a layer split.  1 (the default) is one card
+    /// per stage, as today.  2 makes a stage a PAIR: its lead card runs the layers and holds the even-numbered
+    /// experts of them, its partner card holds the odd ones and computes those rows.  Exploratory; only 2 is built.
+    int tp_size = 1;
+    bool tp_size_given = false;   // --tp-size on the command line (the environment form does not override it)
     /// --gpu: the cards this run uses (gpu_select.hpp); empty = GPU 0 alone.  --gpu-plan prints the choice and exits.
     std::string gpu;
     bool gpu_plan = false;

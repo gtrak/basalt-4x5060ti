@@ -725,7 +725,7 @@ bool Verifier::dm_init(std::string& err) {
             if (!ok) { err = "verify: device-planned MoE buffers of a further peer"; return false; }
         }
     }
-    if (d->pdev >= 0) {
+    if (d->pdev >= 0 && !peer_experts_only_) {   // tp2: a partner card holds experts only
         hs_init();
         gs_init();
     }

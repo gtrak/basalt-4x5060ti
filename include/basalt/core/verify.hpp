@@ -120,6 +120,10 @@ public:
     /// The peer expert tier the window drives itself (persistent kernel, mapped rings) instead of the pool launching it
     /// per layer.  Before init.
     void set_peer(PeerExperts* peer) { peer_ = peer; }
+    /// tp2: the peer card of this window holds expert tiers and nothing else, so the vocabulary head split and the GDN
+    /// mixer split - which both load part of the stage's weights onto the peer card - stay off and its VRAM is the
+    /// expert tier alone.  Before init, with set_peer.
+    void set_peer_experts_only(bool on) { peer_experts_only_ = on; }
     /// A further peer card's expert tier, served like the first by a persistent kernel of its own (its own ring,
     /// doorbell and done word); only with the device-planned MoE tail.  Before init, after set_peer.
     void add_peer(PeerExperts* peer) { xpeers_.push_back(peer); }
@@ -365,6 +369,7 @@ private:
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool main_high_ = false;
     PeerExperts* peer_ = nullptr;
+    bool peer_experts_only_ = false;   ///< tp2: the peer is an expert partner; no head or GDN mixer split on it
     std::vector<PeerExperts*> xpeers_;
     basalt::kernels::cpu::ExpertPool* warm_pool_ = nullptr;
     ExpertSource* warm_src_ = nullptr;

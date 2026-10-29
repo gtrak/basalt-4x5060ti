@@ -152,6 +152,8 @@ struct GpuStage {
     cudaStream_t stream = nullptr;
     basalt::core::ExpertCache cache;
     std::vector<std::pair<int32_t, int32_t>> profile;   ///< its layers' share of the profile, hottest first
+    int pair_dev = -1;                    ///< tp2: the stage's second card, which holds half those experts (-1 alone)
+    std::unique_ptr<basalt::core::PeerExperts> pair;   ///< tp2: the partner card's expert tier, on `pair_dev`
     int32_t* d_res = nullptr;                            ///< the residency table on its device
     basalt::core::Verifier ver;
     basalt::core::Verifier ver_b;                        ///< the second chain's verifier (pipelined windows)
