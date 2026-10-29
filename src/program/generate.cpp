@@ -9,6 +9,7 @@
 #include "engine_local.hpp"
 #include "serve/loans.hpp"
 #include "basalt/program/options.hpp"
+#include "basalt/program/tp2_pair.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/logit_bias.hpp"
 #include "basalt/program/grammar/guard.hpp"
@@ -1353,20 +1354,25 @@ int main(int argc, char** argv) {
         // BASALT_FORCE_SPLIT: the price model picks the expert tier on this box, but the split keeps every expert
         // where it is computed (pipeline parallel), which is what the prompt path needs.  Opt in to compare.
         const char* force_split = std::getenv("BASALT_FORCE_SPLIT");
-        if (o.tp_size == 2 && !basalt::platform::gpu_peer_access()) {
-            basalt::log::error("basalt generate", "tp2 (--tp-size 2) puts half of a stage's experts on its partner "
-                                 "card and reads them over the link; this box offers no GPU-to-GPU access");
-            return 2;
-        }
-        if ((mp.pick == basalt::program::Mechanism::LayerSplit || (force_split && *force_split == '1') ||
-             o.tp_size == 2) && o.peer_device >= 1) {
+        if (o.tp_size == 2) {
+            // tp2 asks for the split outright - every stage of it is a pair of cards - and the price model does not
+            // price a pair, so its pick does not decide this.  The expert tier's cards go back to the stages.
+            if (!basalt::platform::gpu_peer_access()) {
+                basalt::log::error("basalt generate", "tp2 (--tp-size 2) puts half of a stage's experts on its partner "
+                                     "card and reads them over the link; this box offers no GPU-to-GPU access");
+                return 2;
+            }
             o.layer_split = "auto";
             o.peer_devices.clear();
             o.peer_device = -1;
-            if (o.tp_size == 2)
-                basalt::log::info("basalt", "tp2: each layer split stage is a pair of cards (the price model picked %s)",
-                                  basalt::program::mechanism_name(mp.pick));
-            else if (force_split && *force_split == '1' && mp.pick != basalt::program::Mechanism::LayerSplit)
+            basalt::log::info("basalt", "tp2: each layer split stage is a pair of cards (the price model picked %s)",
+                              basalt::program::mechanism_name(mp.pick));
+        } else if ((mp.pick == basalt::program::Mechanism::LayerSplit || (force_split && *force_split == '1')) &&
+                   o.peer_device >= 1) {
+            o.layer_split = "auto";
+            o.peer_devices.clear();
+            o.peer_device = -1;
+            if (force_split && *force_split == '1' && mp.pick != basalt::program::Mechanism::LayerSplit)
                 basalt::log::info("basalt", "layer split forced on (the price model picked %s)",
                                   basalt::program::mechanism_name(mp.pick));
         }
@@ -1440,7 +1446,7 @@ int main(int argc, char** argv) {
                 return 2;
             }
             split_devs.clear();
-            for (int d = 2; d < n_dev; d += 2) split_devs.push_back(d);
+            for (int s = 1; (size_t) s * o.tp_size < (size_t) n_dev; ++s) split_devs.push_back(basalt::program::pair_lead_dev(s, o.tp_size));
         }
         if (ok && !split_auto && split_devs.empty() && split_at.size() == 1) split_devs.push_back(0);   // one GPU
         split_same = ok && split_devs.size() == 1 && split_devs[0] == 0 && !split_auto;
@@ -1472,7 +1478,7 @@ int main(int argc, char** argv) {
     bool multi_gpu = !split_devs.empty() && !split_same;
     if (o.tp_size == 2 && !multi_gpu) {
         basalt::log::error("basalt generate", "tp2 (--tp-size 2) runs each stage on a pair of cards: it needs a layer "
-                             "split over at least 4 cards (--gpu 0,1,2,3)");
+                             "split over at least 4 cards (--serve --gpu 0,1,2,3)");
         return 2;
     }
     // two stages with the drafter and one conversation at a time pipeline their windows: a second chain of verifiers over
@@ -2056,7 +2062,8 @@ int main(int argc, char** argv) {
             const int64_t lb = i == 0 ? 0 : split_at[(size_t) i - 1];
             const int64_t le = i + 1 < ns ? split_at[(size_t) i] : g.n_layers;
             top += " " + std::string(1, (char) ('A' + i)) + "(layers " + std::to_string(lb) + "-" + std::to_string(le - 1) +
-                   ")=[CUDA" + std::to_string(2 * i) + ",CUDA" + std::to_string(2 * i + 1) + "]";
+                   ")=[CUDA" + std::to_string(basalt::program::pair_lead_dev(i, o.tp_size)) + ",CUDA" +
+                   std::to_string(basalt::program::pair_partner_dev(i, o.tp_size)) + "]";
         }
         basalt::log::info("basalt generate", "tp2/pp2: stages%s", top.c_str());
     } else if (multi_gpu && split_auto) {
@@ -3221,12 +3228,9 @@ int main(int argc, char** argv) {
     // tp2: a stage's pair splits its layers' experts by expert id - the stage's lead card holds the even ids and its
     // partner card the odd ones (below), so no pair is held twice and each card's tier is half its stage's depth.
     // The ranking is unchanged: each card takes its own half, hottest first.
-    auto pair_holds = [&](int32_t expert, int rank) { return o.tp_size == 1 || (int) (expert % o.tp_size) == rank; };
+    auto pair_holds = [&](int32_t expert, int rank) { return basalt::program::pair_holds(expert, o.tp_size, rank); };
     auto pair_ranked = [&](const std::vector<std::pair<int32_t, int32_t>>& ranked, int rank) {
-        std::vector<std::pair<int32_t, int32_t>> out;
-        for (const auto& pr : ranked)
-            if (pair_holds(pr.second, rank)) out.push_back(pr);
-        return out;
+        return basalt::program::pair_ranked(ranked, o.tp_size, rank);
     };
     // A native pack's blobs differ per layer, so with a profile its slots are sized per pair: the same VRAM holds more
     // IQ3_XXS experts than slots of the largest blob would.
@@ -3422,11 +3426,14 @@ int main(int argc, char** argv) {
         if (free_ram) {
             uint64_t cache_bytes_now = 0;
             if (!profile.empty() && srcp != nullptr) {
+                // tp2: CUDA0's cache holds its half of its layers' experts; the partner cards' room is not counted
+                // here, so this mmap-mode estimate is conservative about what stays off the SSD.
+                const std::vector<std::pair<int32_t, int32_t>> lead0 = pair_ranked(profile, 0);
                 const int64_t n = xcache.per_layer_admission()
-                                      ? (int64_t) profile.size()
-                                      : std::min<int64_t>((int64_t) profile.size(), xcache.slots());
+                                      ? (int64_t) lead0.size()
+                                      : std::min<int64_t>((int64_t) lead0.size(), xcache.slots());
                 for (int64_t i = 0; i < n; ++i)
-                    cache_bytes_now += basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
+                    cache_bytes_now += basalt::kernels::cpu::expert_layout().blob_bytes(lead0[(size_t) i].first);
             }
             cache_bytes_now = std::min(cache_bytes_now, expert_total_bytes);
             const uint64_t vram = cuda0_fixed_bytes + cache_bytes_now;
@@ -3599,7 +3606,7 @@ int main(int argc, char** argv) {
     // It carries no dense weights, no session and no state: it is an expert tier the stage's verifier computes rows
     // on and the stage's prompt path reads over the link.  The placement is static - no swap runs on a partner card.
     std::unique_ptr<basalt::core::PeerExperts> stage0_pair;
-    const int stage0_pair_dev = 1;
+    const int stage0_pair_dev = basalt::program::pair_partner_dev(0, o.tp_size);
     if (o.tp_size == 2) {
         auto open_partner = [&](int pair_dev, const std::vector<std::pair<int32_t, int32_t>>& ranked,
                                 int64_t lead_held, basalt::core::PeerExperts& pair) -> bool {
@@ -3640,9 +3647,9 @@ int main(int argc, char** argv) {
         };
         stage0_pair = std::make_unique<basalt::core::PeerExperts>();
         if (!open_partner(stage0_pair_dev, profile, xcache.resident(), *stage0_pair)) return 1;
-        for (auto& stp : stages) {
-            GpuStage& st = *stp;
-            st.pair_dev = st.dev + 1;
+        for (size_t si = 0; si < stages.size(); ++si) {
+            GpuStage& st = *stages[si];
+            st.pair_dev = basalt::program::pair_partner_dev((int) si, o.tp_size);
             st.pair = std::make_unique<basalt::core::PeerExperts>();
             if (!open_partner(st.pair_dev, st.profile, st.cache.resident(), *st.pair)) return 1;
         }
@@ -5634,11 +5641,11 @@ int main(int argc, char** argv) {
             basalt::log::error("basalt serve", "%s", err.c_str());
             return 1;
         }
-        if (pipe_on) {   // tp2: the second chain of stage A's windows drives its partner too
-            if (!peer.valid() && stage0_pair && stage0_pair->valid()) {
-                ver_b.set_peer(stage0_pair.get());
-                ver_b.set_peer_experts_only(true);
-            }
+        if (pipe_on && !peer.valid() && stage0_pair && stage0_pair->valid()) {
+            // tp2: the second chain of stage A's windows drives its partner too (its own peer window, the tier itself
+            // is read-only to both chains)
+            ver_b.set_peer(stage0_pair.get());
+            ver_b.set_peer_experts_only(true);
         }
         if (pipe_on && !ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err)) {
             basalt::log::error("basalt serve", "pipelined windows: %s", err.c_str());

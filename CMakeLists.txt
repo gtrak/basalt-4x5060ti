@@ -985,6 +985,13 @@ basalt_embed_manifest(auto_plan_test)
 basalt_cpu_test(NAME auto_plan_test COMMAND auto_plan_test)
 set_tests_properties(auto_plan_test PROPERTIES TIMEOUT 60)
 
+# tp2: of a stage's pair of cards exactly one holds each expert, and the cards come in pairs (CPU only)
+add_executable(tp2_pair_test tests/program/tp2_pair_test.cpp)
+target_include_directories(tp2_pair_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(tp2_pair_test PRIVATE warnings)
+basalt_cpu_test(NAME tp2_pair_test COMMAND tp2_pair_test)
+set_tests_properties(tp2_pair_test PROPERTIES TIMEOUT 60)
+
 # the grammar engine: parse, accept/reject, UTF-8 across tokens, clone, lazy triggers and the vocabulary mask (CPU only)
 add_executable(grammar_test tests/program/grammar_test.cpp)
 target_link_libraries(grammar_test PRIVATE grammar warnings)
