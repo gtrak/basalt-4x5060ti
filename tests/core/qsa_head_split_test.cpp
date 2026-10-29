@@ -1,8 +1,10 @@
 // tests/core/qsa_head_split_test.cpp - the pair's attention-head split: every head on exactly one card, the KV
 // groups kept whole, the projection runs on their block boundaries, and the indexer left whole.  Pure arithmetic,
 // so this is the whole oracle for the shard (the kernels that consume it are parity-tested separately).
+#include "basalt/core/gdn_head_split.hpp"
 #include "basalt/core/qsa_head_split.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <set>
 #include <vector>
@@ -13,9 +15,10 @@ using basalt::kernels::QsaShapes;
 namespace {
 
 int g_fail = 0;
-#define CHECK(c)                                                          \
-    do {                                                                  \
-        if (!(c)) { std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++g_fail; } \
+// variadic so a check may contain a braced initializer, whose commas the preprocessor would otherwise split
+#define CHECK(...)                                                                                       \
+    do {                                                                                                 \
+        if (!(__VA_ARGS__)) { std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #__VA_ARGS__); ++g_fail; } \
     } while (0)
 
 // the artifact: 24 query heads, 2 KV heads, head_dim 256, the indexer's own 4 heads of 128
@@ -126,7 +129,7 @@ void the_projection_runs() {
         CHECK(qsa_shard_cols_aligned(b, HEAD_DIM, blk));
     }
     CHECK(!qsa_shard_cols_aligned(a, HEAD_DIM, 0));
-    CHECK(!qsa_shard_cols_aligned(a, 96, 128));   // 96 columns cannot start a 128-column block
+    CHECK(!qsa_shard_cols_aligned(a, 100, 128));  // 12 heads of 100 columns is not a whole number of blocks
     CHECK(qsa_shard_rows_aligned(a, HEAD_DIM, 1));
     CHECK(!qsa_shard_rows_aligned(a, HEAD_DIM, 0));
 
@@ -138,6 +141,64 @@ void the_projection_runs() {
     for (const QsaHeadRun& r : two) covered += r.len;
     CHECK(covered == N_HEAD);
     CHECK(qsa_head_runs(QsaHeadShard{N_HEAD, 8, 0, 4}).size() == 4);
+}
+
+// The packer the engine will use for a shard's weights: gdn_head_split.hpp's row and column gathers, which are
+// generic over a row-major matrix.  A card's weight must be the SAME BYTES the whole layer would have read for
+// that head range - otherwise the shard is a different model, not the same model's half.
+void the_weight_slices_are_the_whole_layers_bytes() {
+    const int64_t dim = HEAD_DIM, n_embd = 8;   // 8 rows of output; columns are the head axis
+    const QsaHeadShard r0{N_HEAD, N_HEAD_KV, 0, 2}, r1{N_HEAD, N_HEAD_KV, 1, 2};
+    // ---- o_proj: [n_embd rows][n_head * head_dim columns], blocked along columns
+    for (const int64_t block : {32LL, 64LL, 128LL, 256LL}) {
+        if (!qsa_shard_cols_aligned(r0, dim, block)) { std::printf("skip block %lld\n", (long long) block); continue; }
+        std::vector<float> full((size_t) n_embd * N_HEAD * dim);
+        for (size_t i = 0; i < full.size(); ++i) full[i] = (float) i * 0.25f;
+        const size_t block_bytes = (size_t) block * sizeof(float);
+        std::vector<float> part0((size_t) n_embd * r0.nq() * dim), part1((size_t) n_embd * r1.nq() * dim);
+        const QsaHeadRun c0 = qsa_out_cols(r0, dim), c1 = qsa_out_cols(r1, dim);
+        gdn_gather_cols(full.data(), n_embd, N_HEAD * dim, block, block_bytes, {{c0.start, c0.len}}, part0.data());
+        gdn_gather_cols(full.data(), n_embd, N_HEAD * dim, block, block_bytes, {{c1.start, c1.len}}, part1.data());
+        // each card's packed weight is the whole layer's row, its own columns, in order - so the two cards
+        // side by side are the whole weight, and a card's matvec reads the same numbers the whole layer would
+        const int64_t half = r0.nq() * dim;
+        CHECK(2 * half == N_HEAD * dim);
+        CHECK(part0.size() == (size_t) n_embd * half && part1.size() == (size_t) n_embd * half);
+        bool same = true;
+        for (int64_t row = 0; row < n_embd && same; ++row)
+            for (int64_t c = 0; c < half; ++c) {
+                const size_t w = (size_t) row * N_HEAD * dim;
+                if (part0[(size_t) row * half + c] != full[w + (size_t) r0.q0() * dim + c] ||
+                    part1[(size_t) row * half + c] != full[w + (size_t) r1.q0() * dim + c]) {
+                    same = false;
+                    break;
+                }
+            }
+        CHECK(same);
+    }
+    // an odd head_dim cannot be cut on blocks: the packer must be refused, not silently mis-read
+    CHECK(!qsa_shard_cols_aligned(QsaHeadShard{N_HEAD, N_HEAD_KV, 0, 2}, 100, 128));
+    CHECK(qsa_shard_cols_aligned(QsaHeadShard{N_HEAD, N_HEAD_KV, 0, 2}, 100, 100));
+
+    // ---- attn_k / attn_v / attn_q: whole rows per head, so gdn_gather_rows on the head axis
+    // attn_k is [n_head_kv * head_dim rows][n_embd columns]; the card takes whole rows, so this is a row gather
+    constexpr int64_t k_cols = 4;   // stands in for the model's 4096 input dim, which the gather cannot see
+    const QsaHeadRun kr = qsa_kv_rows(r0, dim);
+    std::vector<float> kfull((size_t) N_HEAD_KV * dim * k_cols), kpart((size_t) r0.nkv() * dim * k_cols);
+    for (size_t i = 0; i < kfull.size(); ++i) kfull[i] = (float) (i % 977);
+    gdn_gather_rows(kfull.data(), sizeof(float) * (size_t) k_cols, std::vector<GdnRun>{{kr.start, kr.len}},
+            kpart.data());
+    // the card's K rows are the whole matrix's rows [kv0 * head_dim, ...) verbatim
+    CHECK(std::equal(kpart.begin(), kpart.end(), kfull.begin() + (ptrdiff_t) kr.start * k_cols));
+    const QsaHeadRun qr = qsa_q_rows(r0, dim);
+    CHECK(qr.start == r0.q0() * 2 * dim && qr.len == r0.nq() * 2 * dim);
+    std::vector<float> qfull((size_t) N_HEAD * 2 * dim), qpart((size_t) r0.nq() * 2 * dim);
+    for (size_t i = 0; i < qfull.size(); ++i) qfull[i] = (float) (i % 311) - 7.f;
+    gdn_gather_rows(qfull.data(), sizeof(float), std::vector<GdnRun>{{qr.start, qr.len}}, qpart.data());
+    CHECK(std::equal(qpart.begin(), qpart.end(), qfull.begin() + (ptrdiff_t) qr.start));
+    // the pair's q rows cover every query head exactly once
+    const QsaHeadRun qr1 = qsa_q_rows(r1, dim);
+    CHECK(qr.start + qr.len == qr1.start && qr1.start + qr1.len == N_HEAD * 2 * dim);
 }
 
 void shards_are_comparable() {
@@ -156,6 +217,7 @@ int main() {
     the_indexer_stays_whole();
     what_is_refused();
     the_projection_runs();
+    the_weight_slices_are_the_whole_layers_bytes();
     shards_are_comparable();
     if (g_fail != 0) { std::printf("qsa head split test failed: %d\n", g_fail); return 1; }
     std::printf("qsa head split test ok\n");
