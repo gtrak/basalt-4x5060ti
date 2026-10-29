@@ -261,8 +261,8 @@ int main(int argc, char** argv) {
         k::qsa_block_topk(O[0].scores + (size_t) f * MAXB, steps + f * k::kStepCount, n, MAXB, cap, S_,
                           O[0].ids + (size_t) f * cap, cs);
         k::qsa_dec_attn(O[0].qcur + (size_t) f * NH * HD, pools_of(x, int8), O[0].ids + (size_t) f * cap,
-                        steps + f * k::kStepCount, cap, S_, O[0].scratch + sf * f, O[0].attn + (size_t) f * NH * HD, n, cs,
-                        qfull + (size_t) f * NH * 2 * HD, O[0].gated + (size_t) f * NH * HD, O[0].xq + f * q8row);
+                        steps + f * k::kStepCount, cap, S_, S_.n_head_kv, O[0].scratch + sf * f, O[0].attn + (size_t) f * NH * HD,
+                        n, cs, qfull + (size_t) f * NH * 2 * HD, O[0].gated + (size_t) f * NH * HD, O[0].xq + f * q8row);
     };
     auto seg_table = [&](const Window& w, int l) {
         k::QsaSegTable t;
@@ -427,9 +427,9 @@ int main(int argc, char** argv) {
             for (int j = 0; j < nseg; ++j) {
                 const int f = w.first[j];
                 k::qsa_dec_attn(O[0].qcur + (size_t) f * NH * HD, pools_of(A[0][j], true), O[0].ids + (size_t) f * cap,
-                                steps + f * k::kStepCount, cap, S_, O[0].scratch + sf * f, O[0].attn + (size_t) f * NH * HD,
-                                w.len[j], cs, qfull + (size_t) f * NH * 2 * HD, O[0].gated + (size_t) f * NH * HD,
-                                O[0].xq + f * q8row);
+                                steps + f * k::kStepCount, cap, S_, S_.n_head_kv, O[0].scratch + sf * f,
+                                O[0].attn + (size_t) f * NH * HD, w.len[j], cs, qfull + (size_t) f * NH * 2 * HD,
+                                O[0].gated + (size_t) f * NH * HD, O[0].xq + f * q8row);
             }
         });
         const double at_g = time([&] {

@@ -26,7 +26,9 @@
 
 #include "basalt/core/expert_source.hpp"
 #include "basalt/core/layer.hpp"
+#include "basalt/core/qsa_head_split.hpp"
 #include "basalt/core/session.hpp"
+#include "basalt/core/tp2_shard_weights.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/kernels/qsa_seg.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
@@ -124,6 +126,10 @@ public:
     /// mixer split - which both load part of the stage's weights onto the peer card - stay off and its VRAM is the
     /// expert tier alone.  Before init, with set_peer.
     void set_peer_experts_only(bool on) { peer_experts_only_ = on; }
+    /// --exp decode_headsplit: the stage's QSA layers run the decode head split - CUDA0 its KV group's query heads,
+    /// the peer card the other group's, the o_proj partials meeting on the mixer's done word.  Before init, with
+    /// set_peer.  Refused at init while the peer's QSA item is unbuilt.
+    void set_decode_headsplit(bool on) { qhs_requested_ = on; }
     /// A further peer card's expert tier, served like the first by a persistent kernel of its own (its own ring,
     /// doorbell and done word); only with the device-planned MoE tail.  Before init, after set_peer.
     void add_peer(PeerExperts* peer) { xpeers_.push_back(peer); }
@@ -394,6 +400,10 @@ private:
     // the GDN mixer split by key head with the peer card, when the peer streams the mixer's bytes faster than CUDA0
     void gs_init();
     void gs_free();
+    // the QSA decode head split with the peer card: CUDA0's shard, the packed o_proj columns, the doorbell and the
+    // peer's partial
+    bool qhs_init(std::string& err);
+    void qhs_free();
     // the peer's heads of every GDN layer between CUDA0's full state and gs_state_: to the peer before the first split
     // window, back before anything reads the whole state (wait_commit, a batch window); between windows only
     bool gs_move(bool to_peer, std::string& err);
@@ -688,6 +698,17 @@ private:
     bool gs_live_ = false, gs_split_ = false;
     SessionState* gs_ss_ = nullptr;
     float *gs_h_full_ = nullptr, *gs_h_slice_ = nullptr;   // pinned staging for gs_move: CUDA0's whole layers, the slice
+    // QSA decode head split (--exp decode_headsplit): CUDA0 runs rank 0's KV group, the peer rank 1's; the peer's
+    // o_proj partial lands in the mapped buffer and is added into CUDA0's by the mixer combine
+    bool qhs_requested_ = false;
+    bool qhs_live_ = false;
+    QsaHeadShard qhs_heads_;
+    std::vector<basalt::core::QsaShardWeight> qhs_o_cols_;   // per QSA layer of the stage: the packed attn_output columns
+    std::vector<void*> qhs_owned_;                           // their device buffers
+    float *qhs_h_part_ = nullptr, *qhs_m_part_ = nullptr;    // mapped: the peer's o_proj partial, max_t_ rows
+    uint8_t *qhs_h_xq_ = nullptr, *qhs_m_xq_ = nullptr;      // mapped: the doorbell's q8_1 rows, one ring per layer
+    float *qhs_h_x_ = nullptr, *qhs_m_x_ = nullptr;          // mapped: the doorbell's fp32 rows
+    int32_t *qhs_h_pos_ = nullptr, *qhs_m_pos_ = nullptr;    // the shard's q positions, one copy per running head
     uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and row list (q6k_vhead)
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM

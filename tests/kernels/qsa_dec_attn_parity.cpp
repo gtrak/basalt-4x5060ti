@@ -127,11 +127,11 @@ int main(int argc, char** argv) {
         float* scr_ref = dalloc<float>(sf * n_q);
         float* scr_new = dalloc<float>(sf * n_q);
         const k::QsaAttnPools a = pools_of(mode);
-        k::qsa_decode_attn_batch(q, a, ids, steps, cap, s, scr_ref, out_ref, n_q, st);
+        k::qsa_decode_attn_batch(q, a, ids, steps, cap, s, s.n_head_kv, scr_ref, out_ref, n_q, st);
         k::native_qsa_gate_apply(out_ref, qfull, gated_ref, NH * n_q, D, st);
-        k::qsa_dec_attn(q, a, ids, steps, cap, s, scr_new, out_new, n_q, st, qfull, gated_new);
+        k::qsa_dec_attn(q, a, ids, steps, cap, s, s.n_head_kv, scr_new, out_new, n_q, st, qfull, gated_new);
         k::native_quantize_q8_1(gated_ref, xq_ref, NH * D, (int) n_q, st);
-        k::qsa_dec_attn(q, a, ids, steps, cap, s, scr_new, out_fm, n_q, st, qfull, gated_fm, xq_fm);
+        k::qsa_dec_attn(q, a, ids, steps, cap, s, s.n_head_kv, scr_new, out_fm, n_q, st, qfull, gated_fm, xq_fm);
         ck(cudaStreamSynchronize(st), "sync");
         {   // the merge writing the q8_1 rows too
             const size_t nn = (size_t) n_q * NH * D, nb = k::native_q8_1_bytes(NH * D, (int) n_q);
@@ -169,7 +169,7 @@ int main(int argc, char** argv) {
             for (int rep = 0; rep < 2; ++rep) {
                 cudaEventRecord(e0, st);
                 for (int it = 0; it < iters; ++it) {
-                    k::qsa_decode_attn_batch(q, a, ids, steps, cap, s, scr_ref, out_ref, n_q, st);
+                    k::qsa_decode_attn_batch(q, a, ids, steps, cap, s, s.n_head_kv, scr_ref, out_ref, n_q, st);
                     k::native_qsa_gate_apply(out_ref, qfull, gated_ref, NH * n_q, D, st);
                 }
                 cudaEventRecord(e1, st);
@@ -177,7 +177,7 @@ int main(int argc, char** argv) {
                 cudaEventElapsedTime(&ms_ref, e0, e1);
                 cudaEventRecord(e0, st);
                 for (int it = 0; it < iters; ++it)
-                    k::qsa_dec_attn(q, a, ids, steps, cap, s, scr_new, out_new, n_q, st, qfull, gated_new);
+                    k::qsa_dec_attn(q, a, ids, steps, cap, s, s.n_head_kv, scr_new, out_new, n_q, st, qfull, gated_new);
                 cudaEventRecord(e1, st);
                 cudaEventSynchronize(e1);
                 cudaEventElapsedTime(&ms_new, e0, e1);
@@ -185,7 +185,7 @@ int main(int argc, char** argv) {
             float ms_fm = 0;
             cudaEventRecord(e0, st);
             for (int it = 0; it < iters; ++it)
-                k::qsa_dec_attn(q, a, ids, steps, cap, s, scr_new, out_fm, n_q, st, qfull, gated_fm, xq_fm);
+                k::qsa_dec_attn(q, a, ids, steps, cap, s, s.n_head_kv, scr_new, out_fm, n_q, st, qfull, gated_fm, xq_fm);
             cudaEventRecord(e1, st);
             cudaEventSynchronize(e1);
             cudaEventElapsedTime(&ms_fm, e0, e1);
@@ -243,8 +243,8 @@ int main(int argc, char** argv) {
                 up(ids, hid);
                 up(steps, hs);
                 std::vector<float> out[2];
-                k::qsa_decode_attn_batch(q, a, ids, steps, cap, s, scr, out_ref, 1, st);
-                k::qsa_dec_attn(q, a, ids, steps, cap, s, scr, out_new, 1, st);
+                k::qsa_decode_attn_batch(q, a, ids, steps, cap, s, s.n_head_kv, scr, out_ref, 1, st);
+                k::qsa_dec_attn(q, a, ids, steps, cap, s, s.n_head_kv, scr, out_new, 1, st);
                 ck(cudaStreamSynchronize(st), "sync");
                 out[0] = down(out_ref, (size_t) NH * D);
                 out[1] = down(out_new, (size_t) NH * D);
@@ -286,7 +286,7 @@ int main(int argc, char** argv) {
                 // the same call again and again: the same bits every time
                 size_t unstable = 0;
                 for (int rep = 0; rep < 200; ++rep) {
-                    k::qsa_dec_attn(q, a, ids, steps, cap, s, scr, out_ref, 1, st);
+                    k::qsa_dec_attn(q, a, ids, steps, cap, s, s.n_head_kv, scr, out_ref, 1, st);
                     ck(cudaStreamSynchronize(st), "sync");
                     const auto again = down(out_ref, (size_t) NH * D);
                     if (std::memcmp(again.data(), out[1].data(), again.size() * 4) != 0) ++unstable;
@@ -315,9 +315,9 @@ int main(int argc, char** argv) {
                         double tot = 0;
                         const int it_n = cold ? 50 : iters;
                         auto call = [&] {
-                            if (on) k::qsa_dec_attn(q, a, ids, steps, cap, s, scr, out_new, 1, st, qfull, gated_new);
+                            if (on) k::qsa_dec_attn(q, a, ids, steps, cap, s, s.n_head_kv, scr, out_new, 1, st, qfull, gated_new);
                             else {
-                                k::qsa_decode_attn_batch(q, a, ids, steps, cap, s, scr, out_ref, 1, st);
+                                k::qsa_decode_attn_batch(q, a, ids, steps, cap, s, s.n_head_kv, scr, out_ref, 1, st);
                                 k::native_qsa_gate_apply(out_ref, qfull, gated_ref, NH, D, st);
                             }
                         };
@@ -382,7 +382,7 @@ int main(int argc, char** argv) {
                 for (int it = 0; it < iters; ++it) {
                     if (cold) cudaMemsetAsync(flush, it, fn, st);
                     cudaEventRecord(e0, st);
-                    k::qsa_dec_attn(q, a, ids, steps, cap, s, scr, out_new, n_q, st, qfull, gated_new, xq_fm);
+                    k::qsa_dec_attn(q, a, ids, steps, cap, s, s.n_head_kv, scr, out_new, n_q, st, qfull, gated_new, xq_fm);
                     cudaEventRecord(e1, st);
                     cudaEventSynchronize(e1);
                     float ms = 0;

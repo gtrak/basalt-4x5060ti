@@ -1355,7 +1355,7 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
     if (st.kv_rot) basalt::kernels::fwht256_inplace_cuda(b.qcur, s.n_head, stream);   // <Hq, Hk> = <q, k>
     if (dump == nullptr) {
         const basalt::kernels::QsaAttnPools pools = qsa_attn_pools(st);
-        basalt::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s, b.attn_scratch, b.attn, stream);
+        basalt::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s, s.n_head_kv, b.attn_scratch, b.attn, stream);
     } else {
     if (st.kv_hybrid) {
         kv_gather_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, b.ids, st.step, cap, s,
