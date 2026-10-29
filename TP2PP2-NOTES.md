@@ -1357,3 +1357,113 @@ Next levers, re-ranked by the measurement:
 3. Head-split attention into decode AND prefill (attn is now ~25% of the prefill layer: 52.6 of 217).
 4. The lead's resident-row floor (114.4 ms) only moves if someone else can compute the lead's tier —
    not plausibly; so post-RAM-reader the realistic ceiling is ~attn-split + balanced return: ~1 600-1 800.
+
+## RUN 17 — the decode head split: the lead's shard is wired, the peer's item is specced (flag refuses until it lands)
+
+Scope: ship the lead-side half of the QSA decode head split behind `--exp decode_headsplit=1` (default off),
+with a clean refusal while the peer's half is unbuilt, and hand the peer's half off as a spec. The brief's
+"mirror the prefill wiring" does not hold for decode: prefill's peer half is a normal kernel the peer's prompt
+path launches; the peer's decode path is ONE cooperative persistent kernel (`dm_peer_kernel`), so the peer's
+QSA half must be an item of that kernel, not a copied launch. That item is this run's deliverable spec, not
+code.
+
+What landed (all behind the flag; default path byte-identical):
+
+1. **The pool read takes the pool's width.** `qsa_decode_attn_step` / `qsa_decode_attn_batch` / `qsa_dec_attn`
+   take `pool_kv`, the pool's KV-head count: the cell row is `(page * pool_kv + kvh) * page_size + ...`. A card
+   running a shard over the whole pool passes the pool's count (2) while running its own heads (12). A card's
+   own pool passes its own count — every existing call site is unchanged in behaviour. The shard's `kvh` starts
+   at 0, which is pool head 0 for the lead (kv0 = 0); the peer's item must offset by its own kv0 (spec below).
+2. **The lead's shard in the window.** When the flag is on and a peer exists, `qhs_init` builds the lead's
+   `QsaHeadShard{24, 2, rank 0, parts 2}` (12 query heads, KV head 0), packs each QSA layer's `attn_output`
+   columns to its own 3072-column view (`qsa_pack_weight_cols`, the prefill mechanism), and allocates the
+   doorbell's mapped rings and the peer's partial buffer. Per QSA layer the window then: reads the `attn_q`
+   row view (a pointer offset, no copy) for its 12 heads; keeps K/V, the indexer (all 4 heads, redundant —
+   the selection must be bitwise the same on both cards) and the appends whole; runs the attention at the
+   pool's width; and o_proj's into the packed columns, leaving a PARTIAL in `bo_`.
+3. **The combine node, and why it is the decode precedent, not prefill's.** The peer's item runs inside the
+   peer's own persistent window and writes its partial into the lead's MAPPED buffer, then raises the done
+   word — the GDN mixer split's protocol. So the lead's combine is `dec_moe_mix_combine` (wait the done word,
+   add the mapped partial after its own rows), not prefill's `tp2_all_reduce` (push partial, push flag,
+   add-wait): there is no push leg — the write already crossed, as a mapped write, and the done word is the
+   release. It reuses the mixer's doorbell words (publish `m_w + 48`, done `m_w + 52`) with the per-layer
+   sequence, so the GDN and QSA splits share one ring protocol and the peer processes both in layer order.
+   The add order is the lead's rows first, the peer's after — the same order prefill's all-reduce documents,
+   which is what keeps the split bitwise against the whole layer, term for term.
+4. **The q positions get a compact table.** The q post reads positions flattened over (row, head), so a shard
+   needs one copy per RUNNING head, not per whole head: `stage_inputs` fills a `[T][12]` staging and the
+   window copies it in (a graph node, capturable). The whole `[T][24]` table is untouched.
+5. **The gate and the refusal.** `--exp decode_headsplit=1` is refused at init while the peer's item is
+   unbuilt, naming what is missing: "the peer's QSA attention item is not built (the persistent window has no
+   QSA half; only the lead's shard is wired)". Running the lead's half alone would be half the attention with
+   no error and plausible tokens, so the flag must not be able to do that quietly.
+6. **The CPU oracle for the decode contract** (`tests/core/qsa_decode_combine_test.cpp`, alongside
+   `qsa_head_split_test`): the shard's heads read out of the whole pool at the pool's width give exactly what
+   the whole layer gives them; the two o_proj partials, added in the combine's order, close to the whole
+   layer (the columns split the dot exactly; only the addition order differs, so the gap is rounding); and
+   the compact q positions are the whole layer's positions one-to-one under the q post's flattened read.
+
+Validation: build green; `ctest -L cpu` 66/67 (the one failure, `expert_multi_test`, is pre-existing on this
+branch); platform-boundary and stderr-logging checks pass. The default path adds no graph nodes and no
+branches taken: every new node is gated on `qhs_layer`, which needs the flag and the peer item.
+
+Per-change predictions of the decode profile line (development A/B, to be graded by the reviewer's
+measurement; the addendum's baseline: solo attn 5.5-6.4 + experts 1.1-2.5 + wait 0.0 + combine 1.2-3.4,
+peer push 0.1-0.2/1.7; solo wall 22.2, concurrent 37.4):
+
+- **attn (lead): 5.5-6.4 -> ~3.2-4.0.** Per QSA layer the q projection, the attention, the gate and the
+  o_proj all run on 12 of 24 heads (the o_proj on 3072 of 6144 columns); the indexer stays whole and
+  redundant. Attention dominates the field, so the field falls roughly 35-45%, not 50%.
+- **experts: unchanged (1.1-2.5).** The split touches no routing.
+- **combine: 1.2-3.4 -> +0.1-0.3.** Twelve more layers each wait a done word and add a mapped partial (a few
+  us each when the peer keeps up); the GDN combines are untouched.
+- **peer push: 0.1-0.2 -> ~0.2-0.4.** Twelve more layers publish their ring rows (q8_1 + fp32, ~20 KB/layer,
+  ~250 KB/window) — the same volume the GDN layers already push, so the field roughly doubles.
+- **wait: 0.0 -> the watch item.** The peer now also computes the full indexer, the selection and the
+  attention for its 12 heads, beside its GDN mix and its expert work. If that does not fit inside the lead's
+  span, the per-layer done-word waits show up here first.
+- **walls: solo 22.2 -> ~19.5-20.5; concurrent 37.4 -> ~34-35**, if the peer's item fits the lead's span.
+
+L2 warm-up: the warm-up covers the expert router; the split changes no routing, so the "the peer's L2
+warm-up is off (a router the predictor does not cover)" line is unchanged by this wiring. Watch item for the
+peer's item: its P2P reads of the lead's pool are a read pattern the predictor does not model.
+
+### PEER-ITEM SPEC (the handoff: the peer's QSA attention item of `dm_peer_kernel`)
+
+Form: an item type of the persistent kernel, shaped like the GDN MIX item — wait its doorbell sequence on
+`m_w + 48`, work, write its partial into the lead's mapped buffer, raise `m_w + 52`. It is NOT a separate
+kernel launch: the persistent kernel occupies the peer's SMs, so nothing else can run beside it in the
+window; every pipeline below is an item of the one launch. The lead's side already publishes its ring rows
+(`qhs_m_xq_` / `qhs_m_x_`) and waits the done word per QSA layer, in layer order, with the GDN item.
+
+The pipelines, with their in-kernel precedents:
+
+1. **Ring-row ingest.** The doorbell's q8_1 + fp32 rows from the mapped ring to peer device — the MIX item's
+   block-0 copy of `mxq_m` -> `mxq`, pointed at the QSA ring.
+2. **Indexer q projection + norm + RoPE.** 4 heads x 128 dims from the fp32 rows — a `dm_mix_rows`-class
+   gemv plus the elementwise norm/rope the GDN item runs.
+3. **Indexer block scores.** The `qsa_block_scores` math over the lead's `idx_pooled` / `idx_dead` tables,
+   read over P2P (the tables live on the lead's device; run 8's P2P is the seam).
+4. **Indexer top-k.** The `qsa_block_topk` selection. Must be BITWISE the lead's selection — the indexer is
+   the one part of the split that does not split, and a flipped tie is a different attention input.
+5. **Attention.** The 12 heads over the lead's pool (K/V, page table over P2P), `kvh` offset by the peer's
+   own kv0 (1) — the `qsa_decode_attn` / `qsa_dec_attn` kernels with `pool_kv` = 2, or an item-shaped port.
+6. **Gate + quantize.** The gate apply and the q8_1 quantize of the gated rows — the elementwise launches the
+   lead runs, as item work.
+7. **o_proj partial.** The gemv against the peer's packed 3072-column `attn_output` view into the lead's
+   mapped partial — the MIX item's `dm_mix_rows_m` partial write, at o_proj width.
+
+Obligations (AGENTS.md): every new kernel gets a parity test against the lead's current kernel and a plain
+CPU reference (random inputs + real geometry) and a microbench line; the split as a whole goes through the
+quality gate (PPL/KLD against the Q8_0 reference, `basalt-bench --quality`) — the expectation is bitwise
+against the whole layer, the same claim prefill's split makes, because every head's terms are unchanged and
+the partials add in the documented order; `docs/precision/` updates in the same change; no engine code names
+an OS or a compiler, no `fprintf` to stderr.
+
+Acceptance: with the flag on, decode runs and the refusal goes away; greedy output is identical to the
+flag-off run (bitwise claim) or the quality gate passes and the drift is reported; the decode profile line
+is measured against the predictions above; the flag-off run stays byte-identical (greedy-identity check).
+
+Reviewer checklist: build; `ctest -L cpu` (expect 66/67, `expert_multi_test` pre-existing); flag off = today's
+binary's behaviour; flag on today = the refusal line at init, nothing else; then grade the predictions once
+the peer's item lands.
