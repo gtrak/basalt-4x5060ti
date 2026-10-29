@@ -1321,3 +1321,39 @@ What CAN overlap the next run is exactly the store swap: `mtp_preswap`.
 Build green (`cmake --build build -j4`). `ctest -L cpu` 66/67 with only the pre-existing
 `expert_multi_test` (this CPU lacks AVX512-VNNI/VBMI). No engine start, no `basalt-ctl`, nothing
 bound on :8000. GPU runs are the reviewer's.
+
+## RUN 14/15 addendum — the reviewer's measurement (boot 8192 + --peer-ram-rows + decode_profile=1)
+
+Prediction grading (A's six, against the fresh 122300-token read):
+
+| # | prediction | measured | verdict |
+|---|---|---|---|
+| 1 | stage A layer 220.6 -> 175-195, blobs 114.3 -> 57-70, prefill -> 1500-1650 | layer 217.0, blobs 101.9, **prefill 1406** | **missed** — mechanism worked, magnitude capped |
+| 2 | stage B ~150 or `off: no RAM band` | 160.8, engaged | partial |
+| 3 | `(peer read N from RAM)` nonzero, ~50-56 visits/layer | **peer read 9224 from RAM** (~25/layer) | engaged; below the predicted share |
+| 4 | lead experts ~126.4 ± | 114.4 (own rows 34375/81528 visits = 42%) | ok |
+| 5 | partner's link not serializing | partner comp 105.3 runs beside lead 114.4 | ok, BUT see the straggler below |
+| 6 | flag absent = run 13 | not re-run; code default-off | by construction |
+
+**The new critical path is the peer's RESULT-ROW RETURN, not the blob feed.** Chunk lines: stage A
+`peer act 26.9 quant 0.3 comp 105.3 rows 114.6 ms` — the peer's computed rows take 114.6 ms to come back,
+36.3 ms after the lead finished its own experts (peer-wait 36.3). Stage B worse: lead-experts fell to 15.5
+but peer-wait ballooned to 88.3 (its peer computes 51% of rows; comp 83.5 + return 90.1). The price model
+billed result bytes w as small against blob bytes B — the measurement says the return leg dominates at this
+chunk. The lead's floor is now attn 52.6 + its own resident rows (114.4): the share moved work off the lead
+but the wall didn't follow.
+
+Decode (both stages now measure every line): solo cached turn 80.4 t/s, acc 67%, hit 94.2% — parity holds
+under --peer-ram-rows. Per-stage: attn 5.5-6.4 + experts 1.1-2.5 + wait 0.0 + combine 1.2-3.4, peer push
+0.1-0.2 / 1.7. Concurrent windows ~20.7-24.3 ms wall.
+
+`--exp mtp_preswap=1` A/B: solo 76.4 t/s vs 80.4, profile walls 20.7-22.0 vs 20.2-24.3 — **no measurable
+win at solo cadence**; default stays off. `batch_lines` untested (diagnostic gate).
+
+Next levers, re-ranked by the measurement:
+1. Re-price the share with the MEASURED return cost (w is not small) and make it per-stage — stage B's
+   peer is overloaded (wait 88.3) while stage A's is balanced (36.3).
+2. Quantize the peer's return rows (FP32 -> FP8 halves the 114.6 ms leg).
+3. Head-split attention into decode AND prefill (attn is now ~25% of the prefill layer: 52.6 of 217).
+4. The lead's resident-row floor (114.4 ms) only moves if someone else can compute the lead's tier —
+   not plausibly; so post-RAM-reader the realistic ceiling is ~attn-split + balanced return: ~1 600-1 800.
