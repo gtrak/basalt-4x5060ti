@@ -45,7 +45,8 @@ static uint64_t ple_hist_bytes() {
     return (uint64_t) basalt::kernels::NG_HIST * basalt::kernels::NG_HC_DIM * sizeof(float);
 }
 
-uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi) {
+uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi,
+                       const QsaHeadShard& heads) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     // QSA layers are `l % interval == interval-1`, so exactly `bound / interval` of them live below `bound`
@@ -58,8 +59,9 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     n += (uint64_t) gdn_n * gdn_state_floats(g) * 4;
     // One QSA state carries the RoPE table; the others borrow it.
     if (g.n_qsa_layers() > 0)
-        n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false);
-    n += qsa_buffers_bytes(g, max_cells);
+        n += qsa_state_bytes(g, max_cells, true, 0, heads) +
+             (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false, 0, heads);
+    n += qsa_buffers_bytes(g, max_cells, heads);
     n += moe_buffers_bytes(g, k);
     n += block_buffers_bytes(g);
     n += ple_hist_bytes();                       // the PLE's NG_HIST normalized history rows
@@ -67,7 +69,7 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
 }
 
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                      int64_t layer_lo, int64_t layer_hi) {
+                      int64_t layer_lo, int64_t layer_hi, const QsaHeadShard& heads) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     uint8_t* p = (uint8_t*) base;
@@ -82,6 +84,7 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     s.k = k;
     s.layer_lo = layer_lo;
     s.layer_hi = layer_hi;
+    s.heads = heads;
     const int64_t I = std::max<int64_t>(g.qsa_interval, 1);
     const int64_t q_n_range = layer_hi / I - layer_lo / I;
     s.qsa_ord0 = layer_lo / I;
@@ -97,7 +100,8 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // same way, which is a coupling with nothing to gain.  Only the range's ordinals are initialized; the
     // rest stay value-initialized nulls.  The FIRST ALLOCATED one (the session's primary, ordinal qsa_ord0)
     // owns the RoPE table that the others - and the prefill staging identity, and the MTP drafter - borrow.
-    const uint64_t first = qsa_state_bytes(g, max_cells, true), rest = qsa_state_bytes(g, max_cells, false);
+    const uint64_t first = qsa_state_bytes(g, max_cells, true, 0, heads),
+                 rest = qsa_state_bytes(g, max_cells, false, 0, heads);
     s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t) (s.qsa_alloc - 1) * rest : 0);
     s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()]();
     s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
@@ -107,9 +111,10 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
     for (int64_t j = 0; j < s.qsa_alloc; ++j)
         if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
-                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0]) == 0)
+                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0], 0,
+                           heads) == 0)
             return 0;
-    qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
+    qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs, heads);
 
     s.moe_arena = take(moe_buffers_bytes(g, k));
     moe_buffers_init(g, k, s.moe_arena, s.moe);
@@ -213,7 +218,7 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
 namespace {
 // the prompt session's layout over `base`; `s` gets the pointers
 uint64_t prompt_session_layout(const ModelGeometry& g, int64_t max_cells, int64_t k, uint8_t* base, SessionState& s,
-                               int64_t layer_lo, int64_t layer_hi) {
+                               int64_t layer_lo, int64_t layer_hi, const QsaHeadShard& heads) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     uint64_t used = 0;
@@ -228,14 +233,16 @@ uint64_t prompt_session_layout(const ModelGeometry& g, int64_t max_cells, int64_
     s.k = k;
     s.layer_lo = layer_lo;
     s.layer_hi = layer_hi;
+    s.heads = heads;
     s.qsa_ord0 = layer_lo / I;
     s.qsa_alloc = std::max<int64_t>(q_n_range, g.n_qsa_layers() > 0 ? 1 : 0);   // the primary state, as session_init
     s.gdn_ord0 = layer_lo - layer_lo / I;
     s.gdn_alloc = std::max<int64_t>((layer_hi - layer_lo) - q_n_range, 0);
     s.gdn_state = (float*) take((uint64_t) s.gdn_alloc * gdn_state_floats(g) * 4);
     if (s.qsa_states == nullptr && g.n_qsa_layers() > 0) s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()]();
-    const uint64_t per = qsa_prompt_state_bytes(g, max_cells);
-    for (int64_t j = 0; j < s.qsa_alloc; ++j) qsa_prompt_state_carve(g, max_cells, take(per), s.qsa_states[s.qsa_ord0 + j]);
+    const uint64_t per = qsa_prompt_state_bytes(g, max_cells, heads);
+    for (int64_t j = 0; j < s.qsa_alloc; ++j)
+        qsa_prompt_state_carve(g, max_cells, take(per), s.qsa_states[s.qsa_ord0 + j], heads);
     s.ple_hist = (float*) take(ple_hist_bytes());
     s.ple.hist = s.ple_hist;
     s.ple.emb_dev = (float*) take((uint64_t) basalt::kernels::NG_N_EMBD * 4);
@@ -247,17 +254,18 @@ uint64_t prompt_session_layout(const ModelGeometry& g, int64_t max_cells, int64_
 }
 }  // namespace
 
-uint64_t prompt_session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t layer_lo, int64_t layer_hi) {
+uint64_t prompt_session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t layer_lo, int64_t layer_hi,
+                              const QsaHeadShard& heads) {
     SessionState s;
     const uint64_t n = prompt_session_layout(g, max_cells, 10, reinterpret_cast<uint8_t*>(uint64_t{1} << 20), s,
-                                             layer_lo, layer_hi);
+                                             layer_lo, layer_hi, heads);
     delete[] s.qsa_states;
     return align_up(n, SESSION_STATE_ALIGN) + 4096;
 }
 
 void prompt_session_carve(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                          int64_t layer_lo, int64_t layer_hi) {
-    prompt_session_layout(g, max_cells, k, (uint8_t*) base, s, layer_lo, layer_hi);
+                          int64_t layer_lo, int64_t layer_hi, const QsaHeadShard& heads) {
+    prompt_session_layout(g, max_cells, k, (uint8_t*) base, s, layer_lo, layer_hi, heads);
 }
 
 void prompt_session_clear(SessionState& s, const ModelGeometry& g, void* stream) {
@@ -308,16 +316,12 @@ void gdn_point_at(const ModelGeometry& g, int64_t layer, SessionState& s) {
 /// The per-token staging every QSA layer's captured H2D reads FROM.  Must run before each replay: the graphs
 /// captured the SOURCE POINTER, not the value, and that is exactly why the buffers are pinned and fixed.
 void stage_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s) {
-    basalt::kernels::QsaShapes sh = basalt::kernels::qsa_real_shapes();
-    sh.n_head = g.n_head;
-    sh.n_head_kv = g.n_head_kv;
-    sh.head_dim = g.head_dim;
-    sh.idx_n_head = g.idx_q_heads;
-    sh.idx_dim = g.idx_key_dim;
+    // the session's own shard: `host_pos` has one row per head THIS card runs, and a pair's cards run half
+    const basalt::kernels::QsaShapes sh = qsa_shard_shapes(g, s.heads);
     for (int64_t j = 0; j < s.qsa_alloc; ++j) {
         QsaState& q = s.qsa_states[s.qsa_ord0 + j];
         qsa_step_fill(q.host_step, pos, sh);
-        for (int64_t h = 0; h < g.n_head; ++h) q.host_pos[h] = (int32_t) (pos_base + pos);
+        for (int64_t h = 0; h < sh.n_head; ++h) q.host_pos[h] = (int32_t) (pos_base + pos);
     }
 }
 

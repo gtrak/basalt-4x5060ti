@@ -401,7 +401,10 @@ if (!moe_route(tables, g, layer, k, b, x, stream, err, db)) return false;    ret
 namespace {using basalt::kernels::QsaIndexerBuffers;using basalt::kernels::QsaShapes;
 /// The geometry the QSA kernels want, from the one place that defines it.  `ModelGeometry` carries the widths
 /// the LAYOUT needs; `QsaShapes` adds `n_rot`, `idx_block` and `idx_top_k`, which are kernel contracts.
-QsaShapes qsa_shapes(const ModelGeometry& g) {    QsaShapes s = basalt::kernels::qsa_real_shapes();    s.n_head = g.n_head;    s.n_head_kv = g.n_head_kv;    s.head_dim = g.head_dim;    s.idx_n_head = g.idx_q_heads;    s.idx_dim = g.idx_key_dim;    return s;}
+QsaShapes qsa_shapes(const ModelGeometry& g) { return basalt::core::qsa_real_shapes(g); }
+/// The shapes ONE CARD of a pair runs the layer with: the card's query and KV heads, the indexer whole.  An empty
+/// shard (the default everywhere) is the whole layer, so every caller that does not split is unchanged.
+QsaShapes qsa_shapes(const ModelGeometry& g, const QsaHeadShard& heads) { return qsa_shard_shapes(qsa_shapes(g), heads); }
 uint64_t align_up16(uint64_t n) { return (n + 15) & ~15ull; }
 /// One cursor over an arena, so every region is 16-byte aligned without a list of hand-added offsets.
 struct Cursor {    uint8_t* p;    uint64_t used = 0;    template <typename T>    T* take(uint64_t count) {        T* r = (T*) (p + used);        used = align_up16(used + count * sizeof(T));        return r;    }    uint8_t* take_bytes(uint64_t n) {        uint8_t* r = p + used;        used = align_up16(used + n);        return r;    }};
@@ -454,13 +457,30 @@ uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8
 }
 }  // namespace
 
+/// The geometry the QSA kernels want, from the one place that defines it.  See the header: this is the mapping
+/// from `ModelGeometry` to `QsaShapes`, and every consumer asks for it rather than rebuilding it.
+basalt::kernels::QsaShapes qsa_real_shapes(const ModelGeometry& g) {
+    QsaShapes s = basalt::kernels::qsa_real_shapes();
+    s.n_head = g.n_head;
+    s.n_head_kv = g.n_head_kv;
+    s.head_dim = g.head_dim;
+    s.idx_n_head = g.idx_q_heads;
+    s.idx_dim = g.idx_key_dim;
+    return s;
+}
+
+basalt::kernels::QsaShapes qsa_shard_shapes(const ModelGeometry& g, const QsaHeadShard& heads) {
+    return basalt::core::qsa_shard_shapes(qsa_real_shapes(g), heads);
+}
+
 void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0; }
 int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
-uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
-    const QsaShapes s = qsa_shapes(g);
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells,
+                         const QsaHeadShard& heads) {
+    const QsaShapes s = qsa_shapes(g, heads);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     uint64_t n = 0;
     const bool elastic = kv_elastic_state(s, p);   // elastic: pools, pooled keys and rope live in their own ranges
@@ -480,8 +500,9 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 }
 
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope, int64_t ring_cells) {
-    const QsaShapes s = qsa_shapes(g);
+                        const QsaState* share_rope, int64_t ring_cells, const QsaHeadShard& heads) {
+    const QsaShapes s = qsa_shapes(g, heads);
+    st.heads = heads;   // everything that later reads these pools derives the head counts from here
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     const int64_t pages = p.pages;
     Cursor c{(uint8_t*) base};
@@ -688,7 +709,7 @@ void qsa_state_release(QsaState& st) {
 }
 
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
-    const QsaShapes s = qsa_shapes(g);
+    const QsaShapes s = qsa_shapes(g, st.heads);
     cudaStream_t cs = (cudaStream_t) stream;
     // elastic: only the backed pages (the rest has no memory; mapping more zeroes it)
     const int64_t pages = st.kv_arena != nullptr ? st.kv_arena->cells() / s.page_size : st.n_slots;
@@ -723,11 +744,13 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
 
 namespace {
 // The prompt-time state's layout, the pool part as qsa_state_init's whole-in-VRAM one
-uint64_t qsa_prompt_layout(const ModelGeometry& g, int64_t max_cells, uint8_t* base, QsaState& st) {
-    const QsaShapes s = qsa_shapes(g);
+uint64_t qsa_prompt_layout(const ModelGeometry& g, int64_t max_cells, uint8_t* base, QsaState& st,
+                           const QsaHeadShard& heads) {
+    const QsaShapes s = qsa_shapes(g, heads);
     const int64_t pages = (max_cells + s.page_size - 1) / s.page_size;
     Cursor c{base};
     st = QsaState{};
+    st.heads = heads;   // after the reset: a prompt-time state is carved for one card's heads too
     st.kv_int8 = g_kv_int8 && !g_kv_q4;
     st.kv_q4 = g_kv_q4;
     if (g_kv_hybrid) {
@@ -772,13 +795,14 @@ uint64_t qsa_prompt_layout(const ModelGeometry& g, int64_t max_cells, uint8_t* b
 }
 }  // namespace
 
-uint64_t qsa_prompt_state_bytes(const ModelGeometry& g, int64_t max_cells) {
+uint64_t qsa_prompt_state_bytes(const ModelGeometry& g, int64_t max_cells, const QsaHeadShard& heads) {
     QsaState st;
-    return align_up16(qsa_prompt_layout(g, max_cells, reinterpret_cast<uint8_t*>(uint64_t{1} << 20), st)) + 256;
+    return align_up16(qsa_prompt_layout(g, max_cells, reinterpret_cast<uint8_t*>(uint64_t{1} << 20), st, heads)) + 256;
 }
 
-uint64_t qsa_prompt_state_carve(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st) {
-    return qsa_prompt_layout(g, max_cells, (uint8_t*) base, st);
+uint64_t qsa_prompt_state_carve(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
+                                const QsaHeadShard& heads) {
+    return qsa_prompt_layout(g, max_cells, (uint8_t*) base, st, heads);
 }
 
 void qsa_prompt_state_clear(const QsaState& st, const ModelGeometry& g, void* stream) {
@@ -788,10 +812,14 @@ void qsa_prompt_state_clear(const QsaState& st, const ModelGeometry& g, void* st
 
 bool qsa_state_copy_cells(QsaState& dst, const QsaState& src, const ModelGeometry& g, int64_t cell0, int64_t cell1,
                           const DeviceCopy& copy, std::string& err) {
-    const QsaShapes s = qsa_shapes(g);
+    const QsaShapes s = qsa_shapes(g, src.heads);
     if (dst.kv_mode != 0 || src.kv_mode != 0 || dst.kv_int8 != src.kv_int8 || dst.kv_q4 != src.kv_q4 ||
         dst.kv_hybrid != src.kv_hybrid) {
         err = "a QSA state copy needs two whole-in-VRAM states of one format";
+        return false;
+    }
+    if (dst.heads != src.heads) {
+        err = "a QSA state copy between two different head shards";
         return false;
     }
     if (cell0 < 0 || cell1 < cell0 || cell1 > dst.max_cells || cell1 > src.max_cells) {
@@ -842,12 +870,12 @@ void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* i
                     int64_t cap, void* stream) {
     if (st.kv_mode != 1) return;
     basalt::kernels::kv_stream_resolve(st.map, qsa_attn_pools(st), st.host, qsa_kv_format(st), ids, steps, n_q, cap,
-                                       qsa_shapes(g), stream);
+                                       qsa_shapes(g, st.heads), stream);
 }
 
-uint64_t qsa_buffers_bytes(const ModelGeometry& g, int64_t max_cells) {    const QsaShapes s = qsa_shapes(g);    const int64_t cap = basalt::kernels::qsa_selection_width(basalt::kernels::kTopkMaxCells, s);    uint64_t n = 0;    n += (uint64_t) q8k_bytes(g.n_embd);    n += (uint64_t) (g.n_embd / 32) * 34;
+uint64_t qsa_buffers_bytes(const ModelGeometry& g, int64_t max_cells, const QsaHeadShard& heads) {    const QsaShapes s = qsa_shapes(g, heads);    const int64_t cap = basalt::kernels::qsa_selection_width(basalt::kernels::kTopkMaxCells, s);    uint64_t n = 0;    n += (uint64_t) q8k_bytes(g.n_embd);    n += (uint64_t) (g.n_embd / 32) * 34;
 // block_q8_0
-n += (uint64_t) g.n_embd * 2;    n += (uint64_t) g.n_head * 2 * g.head_dim * 4;    n += (uint64_t) g.n_head * g.head_dim * 4;    n += (uint64_t) g.n_head_kv * g.head_dim * 4 * 2;    n += (uint64_t) g.idx_key_dim * 4;    n += (uint64_t) g.idx_q_heads * g.idx_key_dim * 4;    n += (uint64_t) max_cells * 4;    n += (uint64_t) cap * 4;    n += (uint64_t) cap * g.n_head_kv * g.head_dim * 2 * 2;    n += (uint64_t) g.n_head * g.head_dim * 4;
+n += (uint64_t) g.n_embd * 2;    n += (uint64_t) s.n_head * 2 * s.head_dim * 4;    n += (uint64_t) s.n_head * s.head_dim * 4;    n += (uint64_t) s.n_head_kv * s.head_dim * 4 * 2;    n += (uint64_t) g.idx_key_dim * 4;    n += (uint64_t) g.idx_q_heads * g.idx_key_dim * 4;    n += (uint64_t) max_cells * 4;    n += (uint64_t) cap * 4;    n += (uint64_t) cap * s.n_head_kv * s.head_dim * 2 * 2;    n += (uint64_t) s.n_head * s.head_dim * 4;
 // attn
 n += (uint64_t) g.n_head * g.head_dim * 2;
 // attn16
@@ -858,7 +886,7 @@ n += (uint64_t) q8k_bytes(g.n_head * g.head_dim);
 n += basalt::kernels::qsa_decode_attn_scratch_floats(cap, s) * 4 + 16;
 // attn_scratch
 return align_up16(n) + 256;}
-uint64_t qsa_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaBuffers& b) {    const QsaShapes s = qsa_shapes(g);    const int64_t cap = basalt::kernels::qsa_selection_width(basalt::kernels::kTopkMaxCells, s);    Cursor c{(uint8_t*) base};    b.x_q8k = c.take_bytes(q8k_bytes(g.n_embd));    b.x_q8_0 = c.take_bytes((uint64_t) (g.n_embd / 32) * 34);    b.x_bf16 = c.take<uint16_t>((uint64_t) g.n_embd);    b.q_full = c.take<float>((uint64_t) g.n_head * 2 * g.head_dim);    b.qcur = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.kcur = c.take<float>((uint64_t) g.n_head_kv * g.head_dim);    b.vcur = c.take<float>((uint64_t) g.n_head_kv * g.head_dim);    b.idx_raw = c.take<float>((uint64_t) g.idx_key_dim);    b.q_idx = c.take<float>((uint64_t) g.idx_q_heads * g.idx_key_dim);    b.cell_scores = c.take<float>((uint64_t) max_cells);    b.ids = c.take<int32_t>((uint64_t) cap);    b.k_scratch = c.take<uint16_t>((uint64_t) cap * g.n_head_kv * g.head_dim);    b.v_scratch = c.take<uint16_t>((uint64_t) cap * g.n_head_kv * g.head_dim);    b.attn = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.attn16 = c.take<uint16_t>((uint64_t) g.n_head * g.head_dim);    b.attn32 = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.attn_q8k = c.take_bytes(q8k_bytes(g.n_head * g.head_dim));    b.attn_scratch = c.take<float>(basalt::kernels::qsa_decode_attn_scratch_floats(cap, s));    return c.used;}
+uint64_t qsa_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaBuffers& b,                          const QsaHeadShard& heads) {    const QsaShapes s = qsa_shapes(g, heads);    b.heads = heads;    const int64_t cap = basalt::kernels::qsa_selection_width(basalt::kernels::kTopkMaxCells, s);    Cursor c{(uint8_t*) base};    b.x_q8k = c.take_bytes(q8k_bytes(g.n_embd));    b.x_q8_0 = c.take_bytes((uint64_t) (g.n_embd / 32) * 34);    b.x_bf16 = c.take<uint16_t>((uint64_t) g.n_embd);    b.q_full = c.take<float>((uint64_t) s.n_head * 2 * s.head_dim);    b.qcur = c.take<float>((uint64_t) s.n_head * s.head_dim);    b.kcur = c.take<float>((uint64_t) s.n_head_kv * s.head_dim);    b.vcur = c.take<float>((uint64_t) s.n_head_kv * s.head_dim);    b.idx_raw = c.take<float>((uint64_t) g.idx_key_dim);    b.q_idx = c.take<float>((uint64_t) g.idx_q_heads * g.idx_key_dim);    b.cell_scores = c.take<float>((uint64_t) max_cells);    b.ids = c.take<int32_t>((uint64_t) cap);    b.k_scratch = c.take<uint16_t>((uint64_t) cap * s.n_head_kv * s.head_dim);    b.v_scratch = c.take<uint16_t>((uint64_t) cap * s.n_head_kv * s.head_dim);    b.attn = c.take<float>((uint64_t) s.n_head * s.head_dim);    b.attn16 = c.take<uint16_t>((uint64_t) s.n_head * s.head_dim);    b.attn32 = c.take<float>((uint64_t) s.n_head * s.head_dim);    b.attn_q8k = c.take_bytes(q8k_bytes(s.n_head * s.head_dim));    b.attn_scratch = c.take<float>(basalt::kernels::qsa_decode_attn_scratch_floats(cap, s));    return c.used;}
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
 //
 // Event pairs are recorded per (layer, stage) and read once at the end, so **NOTHING IS SYNCHRONISED DURING THE

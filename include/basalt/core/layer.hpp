@@ -31,6 +31,7 @@
 #pragma once
 
 #include "basalt/core/layout.hpp"
+#include "basalt/core/qsa_head_split.hpp"
 #include "basalt/core/weights.hpp"
 
 #include "basalt/kernels/gr.hpp"
@@ -262,12 +263,26 @@ struct QsaState {
     /// copy and give back the overlap the doorbell protocol exists for.
     int32_t* host_step = nullptr;    ///< (kStepCount,) pinned
     int32_t* host_pos = nullptr;     ///< (n_head,) pinned
+    /// THE HEAD SHARD this state was carved for (`qsa_head_split.hpp`).  `parts` 1 is every head, which is what
+    /// every session today is; a pair's two cards hold two different shards of the same layer, so their pools are
+    /// half as wide and their per-token staging has half the positions.  Recorded here because everything that
+    /// touches the pools has to agree with what carved them.
+    QsaHeadShard heads;
 };
 
 /// The RoPE cos/sin table (max_cells x n_rot/2 x 2 floats) is identical in every QSA layer.  `with_rope = false` sizes a
 /// state that borrows it; `share_rope` points `st` at another state's table instead of building a copy (the session
 /// builds it once, in the first QSA layer).
-uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0);
+/// The kernels' QSA geometry for this model: the widths `ModelGeometry` carries, plus the kernel contracts
+/// (`n_rot`, `idx_block`, `idx_top_k`, `page_size`) that only `qsa_real_shapes()` states.  The ONE place that turns
+/// a geometry into shapes - everywhere else asked for a copy of this five-line function and drifted.
+basalt::kernels::QsaShapes qsa_real_shapes(const ModelGeometry& g);
+/// The same for one card of a head pair: the card's heads, the indexer whole (`qsa_head_split.hpp`).  An empty
+/// shard is the whole layer, which is what every session that is not part of a pair asks for.
+basalt::kernels::QsaShapes qsa_shard_shapes(const ModelGeometry& g, const QsaHeadShard& heads);
+
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0,
+                         const QsaHeadShard& heads = {});
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
 /// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully
@@ -306,7 +321,8 @@ inline int qsa_kv_format(const QsaState& st) {
     return st.kv_q4 ? basalt::kernels::kKvQ4 : st.kv_int8 ? basalt::kernels::kKvInt8 : basalt::kernels::kKvF16;
 }
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
+                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0,
+                        const QsaHeadShard& heads = {});
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.
 basalt::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,
@@ -318,8 +334,9 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);
 /// of the decode state (rope tables, per-token staging).  `qsa_prompt_state_carve` lays its pointers out over `base`
 /// (DEVICE memory, `qsa_prompt_state_bytes` long) and writes nothing; `qsa_prompt_state_clear` zeroes it and writes the
 /// page table, on `stream`.
-uint64_t qsa_prompt_state_bytes(const ModelGeometry& g, int64_t max_cells);
-uint64_t qsa_prompt_state_carve(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st);
+uint64_t qsa_prompt_state_bytes(const ModelGeometry& g, int64_t max_cells, const QsaHeadShard& heads = {});
+uint64_t qsa_prompt_state_carve(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
+                                const QsaHeadShard& heads = {});
 void qsa_prompt_state_clear(const QsaState& st, const ModelGeometry& g, void* stream);
 /// A queued copy of device memory between two sessions' cards (`dst`, `src`, bytes); false when it could not be queued.
 using DeviceCopy = std::function<bool(void* dst, const void* src, uint64_t bytes)>;
@@ -369,10 +386,14 @@ struct QsaBuffers {
     float* attn32 = nullptr;
     uint8_t* attn_q8k = nullptr;
     float* attn_scratch = nullptr;   // split-K decode attention partials
+    /// The head shard these were carved for; `qsa_buffers_bytes` narrowed the head-following buffers to it and
+    /// left the indexer's and the selection's whole (`qsa_head_split.hpp`).
+    QsaHeadShard heads;
 };
 
-uint64_t qsa_buffers_bytes(const ModelGeometry& g, int64_t max_cells);
-uint64_t qsa_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaBuffers& b);
+uint64_t qsa_buffers_bytes(const ModelGeometry& g, int64_t max_cells, const QsaHeadShard& heads = {});
+uint64_t qsa_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaBuffers& b,
+                          const QsaHeadShard& heads = {});
 
 /// `x` (n_embd f32) through one QSA layer to `out` (n_embd f32) at sequence position `pos`.
 ///

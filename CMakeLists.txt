@@ -990,6 +990,12 @@ set_tests_properties(image_loan_test PROPERTIES TIMEOUT 60)
 add_executable(auto_plan_test tests/program/auto_plan_test.cpp)
 target_link_libraries(auto_plan_test PRIVATE engine_session warnings)
 basalt_embed_manifest(auto_plan_test)
+# the session carve with a head shard: a pair's card carves less and only in the QSA part (sizing only, no device)
+add_executable(session_head_shard_test tests/core/session_head_shard_test.cpp)
+target_link_libraries(session_head_shard_test PRIVATE engine)
+basalt_cpu_test(NAME session_head_shard_test COMMAND session_head_shard_test)
+set_tests_properties(session_head_shard_test PROPERTIES TIMEOUT 60)
+
 basalt_cpu_test(NAME auto_plan_test COMMAND auto_plan_test)
 set_tests_properties(auto_plan_test PROPERTIES TIMEOUT 60)
 

@@ -60,6 +60,13 @@ struct SessionState {
     int64_t qsa_alloc = 0;                ///< allocated QSA states (>= 1 whenever the model has any)
     int64_t gdn_ord0 = 0;                 ///< global GDN ordinal of `gdn_state` row 0
     int64_t gdn_alloc = 0;                ///< allocated GDN rows
+
+    /// **THE HEAD SHARD (a pair of cards per stage).**  A pair's two cards run the same layers and split their
+    /// attention heads by KV group, so each card's QSA state and scratch are carved for half the heads and its
+    /// K/V holds half the cache.  The GDN state, the residual stack, the expert handoff and the PLE history are
+    /// NOT split: both cards hold them whole, so a card's session is the same carve with a narrower QSA part.
+    /// `parts` 1 is every head on one card, which is every session that is not part of a pair.
+    QsaHeadShard heads;
     int qsa_primary() const { return (int) qsa_ord0; }
     /// The doorbell the host loop polls.  Null until a caller provides one - the engine runs without it, and
     /// neither `session_token` nor `session_replay` looks at it.
@@ -94,11 +101,15 @@ struct SessionState {
 /// [layer_lo, layer_hi) carves only that range's per-layer state (a split stage runs a slice of the model); the
 /// default full range is the whole-model carve.  Pure arithmetic - safe to call for a candidate range before anything
 /// is allocated, which is how the layer-split search prices a placement.
+/// `heads` carves the QSA state and scratch for one card of a pair (`qsa_head_split.hpp`); the default is every
+/// head, and it is the only value anything but a tp2 stage uses.  The figure is exactly the whole carve minus what
+/// the other shard's heads would have taken, which tests/core/qsa_head_split_test.cpp and
+/// tests/program/tp2_head_shard_test.cpp check.
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo = 0,
-                       int64_t layer_hi = -1);
+                       int64_t layer_hi = -1, const QsaHeadShard& heads = {});
 /// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.  Same range convention as `session_bytes`.
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                      int64_t layer_lo = 0, int64_t layer_hi = -1);
+                      int64_t layer_lo = 0, int64_t layer_hi = -1, const QsaHeadShard& heads = {});
 /// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the rope
 /// kernels' registered angle table), so a later session never rotates by freed memory.
 void session_release(SessionState& s);
@@ -122,9 +133,10 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
 /// buffers - at `max_cells`.  `prompt_session_carve` lays pointers out over `base` (DEVICE memory,
 /// `prompt_session_bytes` long) and writes nothing; it may be carved again (another size or place) between prompts.
 /// The PLE weights and table are the caller's to set.
-uint64_t prompt_session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t layer_lo, int64_t layer_hi);
+uint64_t prompt_session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t layer_lo, int64_t layer_hi,
+                              const QsaHeadShard& heads = {});
 void prompt_session_carve(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                          int64_t layer_lo, int64_t layer_hi);
+                          int64_t layer_lo, int64_t layer_hi, const QsaHeadShard& heads = {});
 /// Zeroes a carved prompt session, as `session_zero` a whole one, on `stream`.
 void prompt_session_clear(SessionState& s, const ModelGeometry& g, void* stream);
 /// Copies the state of layers [layer_lo, layer_hi) from `src` into `dst` through `copy`: the GDN rows, the QSA layers'
