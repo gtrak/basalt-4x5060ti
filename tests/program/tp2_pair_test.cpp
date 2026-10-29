@@ -69,11 +69,11 @@ void partner_follows_the_lead() {
 }
 
 void exactly_one_card_holds_each_expert() {
-    for (int32_t e = 0; e < 512; ++e) {
-        CHECK((int) pair_holds(e, 2, 0) + (int) pair_holds(e, 2, 1) == 1);
-        CHECK(pair_holds(e, 2, (int) (e % 2)));
-        CHECK(!pair_holds(e, 2, (int) ((e + 1) % 2)));
-    }
+    // Under a rank split the id alone cannot say which card holds an expert - the ranked list decides - so the
+    // partition property is asserted on `pair_ranked` (halves_cover_and_disjoint below).  `pair_holds` answers only
+    // the single-card stage (tp_size 1: the lead holds everything, there is no partner rank).
+    CHECK(pair_holds(411, 1, 0));
+    CHECK(!pair_holds(411, 1, 1));
 }
 
 void halves_cover_and_disjoint() {
@@ -116,11 +116,13 @@ void an_empty_half_is_empty() {
     const Ranked none;
     CHECK(pair_ranked(none, 2, 0).empty());
     CHECK(pair_ranked(none, 2, 1).empty());
-    // a stage's layers hold ids of one parity only: the other card's half is empty, which is what the start says so
-    Ranked evens;
-    for (int32_t e = 0; e < 8; e += 2) evens.push_back({3, e});
-    CHECK(pair_ranked(evens, 2, 0).size() == 4);
-    CHECK(pair_ranked(evens, 2, 1).empty());
+    // a rank split keeps the ranking's order inside each half: the lead's half is the hottest prefix, in order
+    Ranked four;
+    for (int32_t e = 0; e < 8; e += 2) four.push_back({3, e});
+    const Ranked lead = pair_ranked(four, 2, 0), partner = pair_ranked(four, 2, 1);
+    CHECK(lead.size() == 2 && partner.size() == 2);
+    CHECK(lead[0] == four[0] && lead[1] == four[1]);
+    CHECK(partner[0] == four[2] && partner[1] == four[3]);
 }
 
 }  // namespace
