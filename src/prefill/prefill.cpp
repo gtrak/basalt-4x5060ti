@@ -2562,6 +2562,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             core::progress_at("reading the prompt (batched): layer", l, p0);   // a stall names layer and chunk
             const int64_t tl = l - LB;   // the timing markers are per stage layer
             m.tm.begin_layer(tl);
+            // Whether the partner reads this layer's blob for one of its experts out of the RAM tier: decided
+            // for the whole chunk at its start, before the routing was known.  One test for the split, the
+            // peer's group order and the ring walk, so they cannot disagree about who reads a blob.
+            const auto peer_reads_it_from_ram = [&](int32_t e) {
+                return !ram_take.empty() && ram_take[(size_t) l * (size_t) m.g->n_expert + (size_t) e] != 0;
+            };
             m.tm.mark(tl, ChunkTiming::kAttn, m.cs);
             const core::LayerView v(*m.wt, l);
             if (l == std::max<int64_t>(LB, 1) && !ple_land()) return false;   // the PLE rows, read from layer 1 on
@@ -2932,7 +2938,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 // A band expert's blob never reached this card's ring, so only the partner can
                                 // compute its rows; the row cap (never reached: the peer's tables hold the whole
                                 // chunk's rows) bounds only the experts this card could have streamed itself.
-                                const bool ram = !ram_take.empty() && ram_take[(size_t) l * m.g->n_expert + e] != 0;
+                                const bool ram = peer_reads_it_from_ram(e);
                                 if (!ram && (!ppc->peer || !ppc->peer->has(l, e))) continue;
                                 if (!ram && rows_peer + c > ppc->cap_rows) { continue; }
                                 on_peer[(size_t) e] = 1;
@@ -2969,6 +2975,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 rows_local -= rows_cpu;
                             }
                         }
+                        // The experts each card runs. The lead's own walk stays in id order; the peer's experts
+                        // come with the ones whose blob it reads out of the RAM tier first and its tier-resident
+                        // ones after, so its window takes the host downlink's wait up front and then computes the
+                        // experts whose blobs are already on the card while the band's rows stream back, instead
+                        // of stalling for a blob and feeding a row out in every group. Inside each half the ids
+                        // stay ascending, which is what lets the peer wait on one ring copy per group; with the
+                        // band off every expert is tier-resident and the order is the id order it has always been.
+                        // The peer's rows follow this order in Dm: each of its groups needs its rows contiguous.
+                        std::vector<int32_t> order, order_peer;
+                        for (int32_t e = 0; e < m.g->n_expert; ++e)
+                            if (m.cnt[(size_t) e] > 0 && (on_cpu.empty() || !on_cpu[(size_t) e]))
+                                (!on_peer.empty() && on_peer[(size_t) e] ? order_peer : order).push_back(e);
                         {
                             int32_t r = 0;
                             for (int32_t e = 0; e < m.g->n_expert; ++e)
@@ -2976,9 +2994,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     m.off[(size_t) e] = r;
                                     r += m.cnt[(size_t) e];
                                 }
-                            // the peer's rows in order_peer's order: its groups need them contiguous
-                            for (int32_t e = 0; e < m.g->n_expert && !on_peer.empty(); ++e)
-                                if (on_peer[(size_t) e]) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
+                            // the peer's rows in the order its groups run them: its groups need them contiguous
+                            std::stable_sort(order_peer.begin(), order_peer.end(), [&](int32_t a, int32_t b) {
+                                return peer_reads_it_from_ram(b) && !peer_reads_it_from_ram(a);
+                            });
+                            for (int32_t e : order_peer) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
                             for (int32_t e = 0; e < m.g->n_expert && !on_cpu.empty(); ++e)   // the CPU's block, last
                                 if (on_cpu[(size_t) e]) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
                             m.off[(size_t) m.g->n_expert] = r;
@@ -2997,11 +3017,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             cudaMemcpyAsync(m.slot_dev, m.slot_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
                             cudaMemcpyAsync(m.src_dev, m.src_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
                         }
-                        // the experts, in id order: resident ones from VRAM, the others through the staging ring
-                        std::vector<int32_t> order, order_peer;
-                        for (int32_t e = 0; e < m.g->n_expert; ++e)
-                            if (m.cnt[(size_t) e] > 0 && (on_cpu.empty() || !on_cpu[(size_t) e]))
-                                (!on_peer.empty() && on_peer[(size_t) e] ? order_peer : order).push_back(e);
                         m.tm.experts(T * K, rows_local, rows_peer, order, order_peer, m.cnt,
                                       use_mmq ? (int64_t) lay.blob_bytes(l) : 0, n_ram_peer);
                         // CPU share: the pool runs the CPU's experts while this thread stages and runs the GPU's; their
@@ -3237,8 +3252,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (oj != prev_oj) {
                                         sl = -1;
                                         const int32_t e = order_peer[oj];
-                                        if (ent_of[oj] < 0 && !ram_take.empty() &&
-                                            ram_take[(size_t) l * m.g->n_expert + e]) {
+                                        if (ent_of[oj] < 0 && peer_reads_it_from_ram(e)) {
                                             p_release_to(e);   // the entries of the experts the routing sent elsewhere
                                             if (p_cur >= pseq_end || pseq[p_cur].e != e) {
                                                 err = "prefill: a RAM-band expert is on neither card's stream";
@@ -3258,7 +3272,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                             } else {
                                                 wait_pissued((size_t) ent_of[oj]);   // queued on the partner's own link
                                                 sl = ent_of[oj] % P.ring;
-                                                p_hi = ent_of[oj];                   // claimed in id order: last is highest
+                                                p_hi = ent_of[oj];                   // claimed in id order within the band: last is highest
                                                 slot_of[oj] = sl;
                                                 state[oj] = 1;
                                                 p_live[(size_t) ent_of[oj] - pseq_base] = 1;   // held till its last piece
