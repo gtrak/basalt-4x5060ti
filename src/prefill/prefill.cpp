@@ -1065,12 +1065,10 @@ bool fp4_pack() {
 }
 // A chunk shorter than this leaves most expert tiles nearly empty and the per-expert launches dominate: MMQ is faster.
 constexpr int64_t FP4_MIN_TOKENS = 1024;
-// The peer computes its experts' rows of a streamed chunk of up to this many
-// tokens (PeerPrefill::T_fp4).  The layer's activations go to it and its rows come back, and the
-// layer's end waits for that round trip; it grows with the chunk while the blobs it saves do not, so a longer chunk
-// streams the blobs instead.
-constexpr int64_t kPeerFp4Tokens = 5120;
-// A peer card slower than the main one takes the rows of routed-only chunks up to this size, no more.
+// How long a chunk the peer may compute its experts' rows of (PeerPrefill::T_fp4) is computed at setup from the
+// placement, not capped here: see PeerLink.  What stays constant is the derate for a peer card that is not alike the
+// main one: `streamed_share` is the program's cards_alike verdict, so alike cards take the routed chunks with no
+// derate and this cap is reached only by a genuinely unlike pair.
 constexpr int64_t kPeerSlowRows = 2559;
 // In such a chunk the issuing thread keeps at most this many expert copies queued on the primary's link (the ring still
 // runs as far ahead): copies on one link are served in the order they were queued, and the peer's result rows, which
@@ -1697,12 +1695,66 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
     return true;
 }
 
+// The peer's FP4 share in the one currency that decides it: bytes across the pair's link.  For one layer of one chunk
+// the leg to the peer carries the chunk's normed activations (`PeerPrefill::mixed`: N floats a token) and the leg back
+// carries its result rows (the copies into the primary's Dm: N floats a row); the FP4 planes are made on the card
+// that computes, so they never cross, and the row tables ride the host's own PCIe.  What the share saves is the
+// blobs of the experts the partner holds, which the primary's ring otherwise pulls across (the stream skips them at
+// `peer->has`).  The round trip grows with the chunk and the blobs do not, so the crossover is the longest chunk
+// whose round trip is still the cheaper side; past it the primary streams the blobs and computes alone.  Rows follow
+// the routing, which setup does not know: a chunk this side of the crossover hits every expert, so a card's rows of
+// a layer are the chunk's K rows a token in that card's share of the layer's experts.
+struct PeerLink {
+    int64_t layers = 0, held = 0;   // the layers of the stage where the peer holds experts, and those experts
+    uint64_t per_token = 0;         // both legs' bytes for one token of the chunk, over `layers`
+    uint64_t blobs = 0;             // those layers' partner-held blob bytes
+    int64_t tokens = 0;             // per_token * tokens == blobs: the crossover, 0 when the share never pays
+};
+
+/// Both sides of the pair's link bill for `peer`'s placement over the layers [lb, le); `n_expert`: a layer's experts.
+static PeerLink peer_link(const core::PeerExperts& peer, int64_t lb, int64_t le, int64_t n_expert) {
+    PeerLink pl;
+    if (n_expert <= 0) return pl;
+    uint64_t num = 0;   // the two legs' bytes per token times n_expert, so a layer's share stays a fraction
+    for (int64_t l = lb; l < le; ++l) {
+        int64_t held = 0;
+        for (int64_t e = 0; e < n_expert; ++e)
+            if (peer.has(l, e)) ++held;
+        if (held == 0) continue;
+        ++pl.layers;
+        pl.held += held;
+        pl.blobs += (uint64_t) held * core::PeerExperts::slot_bytes(l);
+        num += (uint64_t) N * 4 * (uint64_t) n_expert + (uint64_t) K * (uint64_t) held * ((uint64_t) N * 4);
+    }
+    pl.per_token = num / (uint64_t) n_expert;
+    pl.tokens = pl.per_token ? (int64_t) (pl.blobs / pl.per_token) : 0;
+    return pl;
+}
+
+/// The greatest crossover any placement of this pack can reach: a whole layer on the peer, every expert held.  The
+/// share's gate never opens wider than this, so the tier's reserve - taken before the peer is filled, with no
+/// residency to read - sizes its buffers for it.
+static int64_t peer_fp4_ceiling(int64_t lb, int64_t le, int64_t n_expert) {
+    int64_t top = 0;
+    for (int64_t l = lb; l < le; ++l)
+        top = std::max(top, (int64_t) ((uint64_t) n_expert * core::PeerExperts::slot_bytes(l) /
+                                       ((uint64_t) N * 4 * (uint64_t) (1 + K))));
+    return top;
+}
+
+/// Whether the peer can take a streamed chunk's rows at all, before the placement decides how long one may be.
+static bool peer_fp4_possible(bool streamed_share) {
+    return streamed_share && fp4_every_layer() && !fused_ring() && stream_all_min() >= FP4_MIN_TOKENS;
+}
+
 uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share) {
     if (!mmq_plan().any) return 0;
+    const basalt::kernels::cpu::ExpertLayout& lay = basalt::kernels::cpu::expert_layout();
     PeerPrefill pp;
     pp.T_max = std::min<int64_t>(chunk, streamed_share ? stream_all_min() - 1 : kPeerSlowRows);
-    const int64_t t_fp4 = !streamed_share || !fp4_every_layer() || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
-                              ? 0 : std::min<int64_t>(chunk, kPeerFp4Tokens);
+    // the widest the share's gate can open: the placement that sets the crossover is not known until the tier is filled
+    const int64_t t_fp4 = peer_fp4_possible(streamed_share)
+                              ? std::min(chunk, peer_fp4_ceiling(0, lay.n_layers, lay.n_expert)) : 0;
     const int64_t tf = t_fp4 >= stream_all_min() ? t_fp4 : 0;
     const int64_t Tp = std::max(pp.T_max, tf);
     uint64_t sum = 0;
@@ -1714,12 +1766,21 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
     Impl& m = *impl_;
     if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
     // The peer takes the rows of the routed-only chunks (below stream_all_min()), whose activations and result rows
-    // cross over the link and whose streamed ring stays off.  It also takes those of a streamed chunk of up to
-    // kPeerFp4Tokens (PeerPrefill::T_fp4) where those buffers fit too; those cross the same way when the pair has
-    // peer access, and through pinned host buffers when it does not.
+    // cross over the link and whose streamed ring stays off.  It also takes those of a streamed chunk, on the FP4
+    // kernels, for as long as that round trip is the cheaper side of the pair's link (PeerLink): PeerPrefill::T_fp4.
+    // Those bytes cross the same way when the pair has peer access, and through pinned host buffers when it does not.
     if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
-    const int64_t t_fp4 = !streamed_share || !fp4_every_layer() || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
-                              ? 0 : std::min<int64_t>(m.T_max, kPeerFp4Tokens);
+    const int64_t ne = m.g ? m.g->n_expert : basalt::kernels::cpu::expert_layout().n_expert;
+    const int64_t lb = stage_lb_, le = stage_le_ < 0 ? (m.g ? m.g->n_layers : 0) : stage_le_;
+    const PeerLink pl = peer_link(*peer, lb, le, ne);
+    // capped by the ceiling `peer_bytes` sized its buffers for, so the allocation always fits the reserve
+    const int64_t t_fp4 = peer_fp4_possible(streamed_share)
+                              ? std::min({m.T_max, pl.tokens, peer_fp4_ceiling(lb, le, ne)}) : 0;
+    basalt::log::info("basalt prefill",
+                      "peer fp4 crossover %lld tokens: %llu MiB of activations and rows per 1024 tokens against "
+                      "%llu MiB of partner-held blobs over %lld layers (%lld experts held)",
+                      (long long) t_fp4, (unsigned long long) (pl.per_token * 1024 >> 20),
+                      (unsigned long long) (pl.blobs >> 20), (long long) pl.layers, (long long) pl.held);
     std::unique_ptr<PeerPrefill> pp;
     const int64_t t_routed = streamed_share ? m.T_max : std::min<int64_t>(m.T_max, kPeerSlowRows);
     bool ok = make_peer(peer, t_routed, cap_rows, t_fp4 >= stream_all_min() ? t_fp4 : 0, pp, err);
