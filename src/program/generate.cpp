@@ -504,6 +504,8 @@ void usage() {
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
                  "  --peer-prefill-rows N  prompt rows per layer the peer computes (default half of chunk x top-k;\n"
                  "                       0 = the prompt path stays on the primary)\n"
+                 "  --peer-ram-rows        with a prompt peer: it also computes the rows of the experts NEITHER card\n"
+                 "                       holds, reading their blobs from RAM over its own link (off)\n"
                  "  --pool-workers N     CPU expert pool worker count.  Auto when not set: every physical core\n"
                  "                       except the one the host loop spins on (on a hybrid CPU, with --pool-affinity\n"
                  "                       auto: P-cores minus 1 plus half the E-cores; p-cores: P-cores minus 1),\n"
@@ -1170,6 +1172,7 @@ int main(int argc, char** argv) {
         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
         else if (a == "--peer-prefill-rows") o.peer_prefill_rows = std::atoll(next("--peer-prefill-rows"));
+        else if (a == "--peer-ram-rows") o.peer_ram_rows = true;
         else if (a == "--expert-profile-save") o.expert_profile_save = next("--expert-profile-save");
         else if (a == "--expert-profile-save-every")
             o.expert_profile_save_min = std::atof(next("--expert-profile-save-every"));
@@ -3090,13 +3093,14 @@ int main(int argc, char** argv) {
     // what the peer's prompt buffers take on its card: they are allocated after its tier is filled, so the tier leaves them free
     auto peer_prompt_bytes = [&]() -> uint64_t {
         return o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0
-                   ? basalt::prefill::Prefill::peer_bytes(o.prefill_chunk, peer_streamed_share) : 0;
+                   ? basalt::prefill::Prefill::peer_bytes(o.prefill_chunk, peer_streamed_share, o.peer_ram_rows) : 0;
     };
     // tp2: the same bytes on a stage's partner card - its prompt peer buffers are allocated after its expert tier is
     // filled, so the room the partner's tier is sized from leaves them out too (see `open_partner`)
     auto pair_prompt_bytes = [&](int lead_dev, int partner_dev) -> uint64_t {
         return o.serve && o.tp_size == 2 && o.peer_prefill_rows != 0
-                   ? basalt::prefill::Prefill::peer_bytes(o.prefill_chunk, pair_streamed_share(lead_dev, partner_dev))
+                   ? basalt::prefill::Prefill::peer_bytes(o.prefill_chunk, pair_streamed_share(lead_dev, partner_dev),
+                                                           o.peer_ram_rows)
                    : 0;
     };
     // the GDN mixer split is priced once, before either card sizes its experts: its peer reserve displaces experts
@@ -5389,7 +5393,8 @@ int main(int argc, char** argv) {
                 // and the partner sits idle (measured: `no peer` chunk lines, the lead's blob feed the whole layer).
                 if (st.pair && st.pair->valid() && o.peer_prefill_rows != 0) {
                     const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
-                    if (!st.sp.set_peer(st.pair.get(), rows, pair_streamed_share(st.dev, st.pair_dev), err)) {
+                    if (!st.sp.set_peer(st.pair.get(), rows, pair_streamed_share(st.dev, st.pair_dev),
+                                        o.peer_ram_rows, err)) {
                         basalt::log::warn("basalt serve", "layer split, CUDA%d prompt peer: %s - its stage's prompt "
                                              "path stays on its lead card", st.dev, err.c_str());
                         err.clear();   // a stage without its prompt peer reads slower; it is not a start failure
@@ -5494,7 +5499,7 @@ int main(int argc, char** argv) {
         if (peer.valid() && o.peer_exclusive) sp.set_ring_peer(&peer);
         if (peer.valid() && o.peer_prefill_rows != 0) {
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
-            if (!sp.set_peer(&peer, rows, peer_streamed_share, err)) {
+            if (!sp.set_peer(&peer, rows, peer_streamed_share, o.peer_ram_rows, err)) {
                 basalt::log::warn("basalt serve", "%s - the prompt path stays on the primary GPU", err.c_str());
                 err.clear();
             }
@@ -5506,7 +5511,8 @@ int main(int argc, char** argv) {
         if (stage0_pair && stage0_pair->valid() && o.peer_prefill_rows != 0) {
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
             if (!sp.set_peer(stage0_pair.get(), rows,
-                             pair_streamed_share(basalt::program::pair_lead_dev(0, o.tp_size), stage0_pair_dev), err)) {
+                             pair_streamed_share(basalt::program::pair_lead_dev(0, o.tp_size), stage0_pair_dev),
+                             o.peer_ram_rows, err)) {
                 basalt::log::warn("basalt serve", "CUDA%d prompt peer: %s - the prompt path stays on the primary GPU",
                              stage0_pair_dev, err.c_str());
                 err.clear();

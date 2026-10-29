@@ -113,6 +113,9 @@ struct Options {
     /// the prompt path's rows per layer the peer computes: -1 = half of chunk x top-k, 0 = the prompt path stays on
     /// the primary
     int64_t peer_prefill_rows = -1;
+    /// --peer-ram-rows: on a streamed chunk the prompt peer also computes the rows of the experts neither card's
+    /// tier holds, reading their blobs from the RAM tier over its own PCIe link (off: they stay on the primary).
+    bool peer_ram_rows = false;
     /// Names the model's expert profile when it carries one (the file and `#profile`); empty means none.  A profile
     /// decides residency by routing frequency instead of by first use.
     std::string expert_profile;

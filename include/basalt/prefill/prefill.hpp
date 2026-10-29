@@ -134,11 +134,14 @@ public:
     /// rows per layer).  Allocates the peer's buffers for chunks of up to init's `chunk` tokens: the routed-only
     /// chunks, and the streamed ones up to a fixed size on the FP4 experts (the same bits as this GPU's), with the
     /// activations and the rows crossing card to card when the pair has peer access and through host memory when it
-    /// does not.
-    bool set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_share, std::string& err);
+    /// does not.  `peer_ram_rows` (--peer-ram-rows) goes further: for the streamed chunks the partner also reads the
+    /// blobs of the experts NEITHER card holds - the RAM tier's - over its own PCIe link and computes their rows, so
+    /// this card's link carries only the rows back.  Off leaves them here, as before.
+    bool set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_share, bool peer_ram_rows,
+                  std::string& err);
     /// The bytes `set_peer` takes on the peer card for chunks of up to `chunk` tokens (0: no peer share); the peer tier
     /// leaves them free when it sizes itself.
-    static uint64_t peer_bytes(int64_t chunk, bool streamed_share);
+    static uint64_t peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_rows);
     /// --peer-exclusive: experts only `peer` holds have no host copy; the prompt path copies them from its memory
     /// through host staging into the ring.  Independent of set_peer.
     void set_ring_peer(core::PeerExperts* peer);

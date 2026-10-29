@@ -350,6 +350,7 @@ struct ChunkTiming {
     // the read's totals: what the experts on each card actually were given
     int64_t rd_chunks = 0, rd_tokens = 0, rd_layers = 0;
     int64_t rows = 0, rows_lead = 0, rows_peer = 0, exp_lead = 0, exp_peer = 0, grp_lead = 0, grp_peer = 0;
+    int64_t exp_peer_ram = 0;   // of the peer's expert-visits, those whose blob it read from RAM itself
     double bytes_lead = 0, bytes_peer = 0, flop_lead = 0, flop_peer = 0, ms_lead = 0, ms_peer = 0;
     int64_t rpe_min = 0, rpe_max = 0, rpe_n = 0;
     double rpe_sum = 0;
@@ -459,11 +460,13 @@ struct ChunkTiming {
 
     /// The layer's experts, as the run routed them: the rows and blobs each card was given, and the rows per expert.
     void experts(int64_t T_K, int64_t local, int64_t peer_rows, const std::vector<int32_t>& ord,
-                 const std::vector<int32_t>& ord_peer, const std::vector<int32_t>& cnt, int64_t blob_bytes) {
+                 const std::vector<int32_t>& ord_peer, const std::vector<int32_t>& cnt, int64_t blob_bytes,
+                 int64_t peer_ram = 0) {
         if (!on) return;
         rows += T_K; rows_lead += local; rows_peer += peer_rows;
         exp_lead += (int64_t) ord.size();
         exp_peer += (int64_t) ord_peer.size();
+        exp_peer_ram += peer_ram;
         grp_lead += ((int64_t) ord.size() + 15) / 16;
         bytes_lead += (double) ord.size() * (double) blob_bytes;
         bytes_peer += (double) ord_peer.size() * (double) blob_bytes;
@@ -578,7 +581,8 @@ struct ChunkTiming {
         basalt::log::info("basalt prefill",
                           "peer read layers %lld-%lld: %lld chunks, %lld tokens, %lld timed layers; expert shape "
                           "gate/up 1280x%lld + down %lldx640, %lld experts of the layer, %lld rows per token; "
-                          "row-visits per layer all %.1f lead %.1f peer %.1f; expert-visits lead %lld peer %lld; "
+                          "row-visits per layer all %.1f lead %.1f peer %.1f; expert-visits lead %lld peer %lld "
+                          "(peer read %lld from RAM); "
                           "groups per layer lead %.1f peer %.1f; "
                           "rows/expert min %lld mean %.1f max %lld; "
                           "lead %.2f GiB %.2f TFLOP = %.0f GB/s %.1f TFLOP/s; "
@@ -588,7 +592,7 @@ struct ChunkTiming {
                           rd_layers ? (double) rows / (double) rd_layers : 0.0,
                           rd_layers ? (double) rows_lead / (double) rd_layers : 0.0,
                           rd_layers ? (double) rows_peer / (double) rd_layers : 0.0,
-                          (long long) exp_lead, (long long) exp_peer,
+                          (long long) exp_lead, (long long) exp_peer, (long long) exp_peer_ram,
                           rd_layers ? (double) grp_lead / (double) rd_layers : 0.0,
                           rd_layers ? (double) grp_peer / (double) rd_layers : 0.0,
                           (long long) rpe_min, rpe_n ? rpe_sum / (double) rpe_n : 0.0, (long long) rpe_max,
@@ -597,7 +601,7 @@ struct ChunkTiming {
                           bytes_peer / (1u << 30), flop_peer / tf,
                           peer_s > 0 ? bytes_peer / gb / peer_s : 0.0, peer_s > 0 ? flop_peer / tf / peer_s : 0.0);
         rd_chunks = rd_tokens = rd_layers = 0;
-        rows = rows_lead = rows_peer = exp_lead = exp_peer = grp_lead = grp_peer = 0;
+        rows = rows_lead = rows_peer = exp_lead = exp_peer = grp_lead = grp_peer = exp_peer_ram = 0;
         bytes_lead = bytes_peer = flop_lead = flop_peer = ms_lead = ms_peer = 0;
         rpe_min = rpe_max = rpe_n = 0;
         rpe_sum = 0;
@@ -676,6 +680,24 @@ struct PeerPrefill {
     cudaEvent_t ev_h2d[kRes] = {};        // primary: hres[b]'s rows are in Dm
     cudaEvent_t ev_res = nullptr;         // primary: the layer's peer rows are in Dm
     bool hx_live = false, res_live[kRes] = {};
+    // The RAM band: the experts neither card's tier holds.  Their blobs are page-locked, so this card reads them from
+    // host RAM over its OWN link into a ring of its own slots and computes their rows there; the lead's link then
+    // carries only the rows back.  The ring runs the primary's staging protocol: a copy is issued once the entry
+    // `ring` before it has been given back, and a slot is refilled only after the group that read it said it was done.
+    bool ram_rows = false;                  // the program asked for it and the placement pays (`set_peer`)
+    int ram_num = 0;                        // `ram_num` of every PeerRamShare::kDen band experts take the band
+    int64_t ram_top = 0;                    // no chunk longer than this uses the band (PeerRamShare::top)
+    int ring = 0;                           // staging slots, 0 with the share off
+    static constexpr int kRing = 48;        // three groups' blobs in flight: the peer's copy engine never waits on
+                                            // its own compute, and a slot is 2.4 MiB of the peer's VRAM
+    int span = 0;                           // extra slots, for an expert with more rows than one group holds
+    static constexpr int kSpan = 16;        // ... re-read on demand by the group that needs it again
+    cudaStream_t copy = nullptr;            // this card's own host->device copy stream
+    cudaStream_t span_copy = nullptr;       // ... and the stream the re-reads take, so they queue behind nothing
+    std::vector<uint8_t*> stage;            // [ring + span] blob slots on this card
+    std::vector<cudaEvent_t> copied, used;  // [ring + span]: its copy landed; the compute stream is done with it
+    std::vector<int> used_of;               // [slot]: the `used` event the slot's last reader recorded
+    std::vector<char> live;                 // [slot]: a copy was issued into it, so refilling it waits
     ~PeerPrefill() {
         if (dev < 0) return;
         int prev = 0;
@@ -686,6 +708,12 @@ struct PeerPrefill {
         for (void* p : owned) cudaFree(p);
         if (ev_done) cudaEventDestroy(ev_done);
         if (s_out) cudaStreamSynchronize(s_out);
+        if (copy) cudaStreamSynchronize(copy);
+        if (span_copy) cudaStreamSynchronize(span_copy);
+        for (cudaEvent_t e : copied) if (e) cudaEventDestroy(e);
+        for (cudaEvent_t e : used) if (e) cudaEventDestroy(e);
+        if (copy) cudaStreamDestroy(copy);
+        if (span_copy) cudaStreamDestroy(span_copy);
         for (cudaEvent_t e : ev_grp) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : ev_dm) if (e) cudaEventDestroy(e);
         if (ev_hx_free) cudaEventDestroy(ev_hx_free);
@@ -1578,6 +1606,74 @@ void Prefill::set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
     }
 }
 
+/// What pricing the RAM band needs from the prompt path's own state (`Prefill::Impl` is private to `Prefill`, so
+/// the four pointers the band's test reads come by hand): the lead card's tier and its residency table, the
+/// --peer-exclusive peer, and the expert source.
+struct RamView {
+    const int32_t* host_res = nullptr;
+    const core::ExpertCache* cache = nullptr;
+    const core::PeerExperts* ring_peer = nullptr;
+    const core::ExpertSource* src = nullptr;
+};
+
+/// The experts whose bytes lie in the RAM tier: held by no card's tier, and page-locked in host memory, so any card
+/// can read their blobs over its own PCIe link.  `set_peer` prices them and the streamed walk picks them out with
+/// this same test, so a blob the lead leaves out of its stream is always one the partner reads for itself.
+static bool in_ram_band(const RamView& v, const core::PeerExperts& peer, int64_t l, int32_t e, int64_t n_expert) {
+    if (v.host_res && v.cache && v.host_res[(size_t) l * n_expert + e] >= 0) return false;
+    if (peer.has(l, e)) return false;
+    if (v.ring_peer && v.ring_peer->exclusive() && v.ring_peer->has(l, e)) return false;
+    return v.src != nullptr && v.src->pinned(l, e);   // bytes only in the file's pages: the lead's stager reads them
+}
+
+/// What the RAM band is worth to the pair.  Moving one of a layer's `band` experts to the partner takes its blob
+/// (`B`) off the LEAD's inbound link and puts its rows (`w`) on that same link as result rows, while the partner's
+/// own link - which otherwise only ever receives - takes the blob.  It pays while `w` is the smaller; the two links
+/// balance at `r`, where the lead carries (band-r)*B + (held+r)*w and the partner r*B + `acts` (the layer's
+/// activations going out).  The prompt's own uploads to the lead are not knowable at setup and are left out, which
+/// understates the lead's side, so the share it gives is the conservative one.  A partner never takes more than half
+/// the chunk's rows, the routed share's own bound.  Priced at `chunk`, the longest chunk the share is ever given.
+struct PeerRamShare {
+    static constexpr int kDen = 8;            // the share's denominator, fixed so every card counts the band alike
+    int64_t layers = 0, band = 0, take = 0;   // the layers with a band, its experts, and those the partner reads
+    int num = 0;                              // `take` of `band`, rounded to eighths
+    int64_t top = 0;                          // the longest chunk whose expert's rows still weigh less than its blob
+    /// The band experts the partner reads: `num` of every `kDen` of them, counted in id order, so the choice never
+    /// depends on the routing and the price, the lead's stream and the row split all pick out the same ones.
+    static bool taken(int64_t k, int num) { return k % kDen < num; }
+};
+
+static PeerRamShare peer_ram_share(const RamView& v, const core::PeerExperts& peer, int64_t lb, int64_t le,
+                                   int64_t n_expert, int64_t chunk) {
+    PeerRamShare pr;
+    if (n_expert <= 0 || chunk <= 0) return pr;
+    for (int64_t l = lb; l < le; ++l) {
+        int64_t held = 0, band = 0;
+        for (int32_t e = 0; e < n_expert; ++e) {
+            if (peer.has(l, e)) { ++held; continue; }
+            if (in_ram_band(v, peer, l, e, n_expert)) ++band;
+        }
+        if (band == 0) continue;
+        const uint64_t B = core::PeerExperts::slot_bytes(l);
+        const uint64_t w = (uint64_t) chunk * (uint64_t) K / (uint64_t) n_expert * ((uint64_t) N * 4);
+        if (w >= B) continue;   // its rows already outweigh its blob: leave the whole band on the lead
+        ++pr.layers;
+        pr.band += band;
+        const int64_t top = (int64_t) (B * (uint64_t) n_expert / ((uint64_t) K * N * 4));
+        pr.top = pr.top == 0 ? top : std::min(pr.top, top);
+        const uint64_t acts = (uint64_t) chunk * N * 4;
+        const uint64_t lead = (uint64_t) band * B + (uint64_t) held * w;
+        const uint64_t denom = 2 * B - w;   // > B, since w < B
+        int64_t r = (int64_t) ((lead > acts ? lead - acts : 0) / denom);
+        r = std::min(r, (int64_t) (n_expert / 2 - held));   // never more than half the chunk's rows
+        pr.take += std::max<int64_t>(0, std::min(r, band));
+    }
+    if (pr.take > 0 && pr.band > 0)
+        pr.num = (int) std::min<int64_t>(PeerRamShare::kDen,
+                                         std::max<int64_t>(1, (pr.take * PeerRamShare::kDen + pr.band / 2) / pr.band));
+    return pr;
+}
+
 // The peer's prompt share for chunks of up to `T_max` tokens (set_peer); `tf`: PeerPrefill::T_fp4, 0 for none.
 // The peer card's prompt buffers for chunks of up to `Tp` tokens (`tf` > 0: with the FP4 share's), each from `take(bytes)`,
 // in one place so that the tier's reserve and the allocation count the same bytes.
@@ -1609,14 +1705,30 @@ static void peer_layout(PeerPrefill& pp, int64_t Tp, int64_t tf, const MmqPlan& 
         pp.f_rel_cap = (size_t) 2 * (NE + Tp * K / fp4::kTileTokens + 1);
         pp.f_rel = (int32_t*) take(pp.f_rel_cap * 4);
     }
+    if (pp.ram_rows) {   // the RAM band this card reads for itself: one blob slot per ring and span slot
+        pp.ring = PeerPrefill::kRing;
+        pp.span = PeerPrefill::kSpan;
+        const int slots = pp.ring + pp.span;
+        pp.stage.assign((size_t) slots, nullptr);
+        pp.copied.assign((size_t) slots, nullptr);
+        pp.used.assign((size_t) slots, nullptr);
+        pp.used_of.assign((size_t) slots, 0);
+        pp.live.assign((size_t) slots, 0);
+        for (int i = 0; i < slots; ++i) pp.stage[i] = (uint8_t*) take((size_t) MAXBLOB());
+    }
 }
 
-static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, int64_t tf,
+static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, int64_t tf, const PeerRamShare* ram,
                       std::unique_ptr<PeerPrefill>& out, std::string& err) {
     auto pp = std::make_unique<PeerPrefill>();
     pp->peer = peer;
     pp->T_max = std::min<int64_t>(T_max, stream_all_min() - 1);
     pp->T_fp4 = tf;
+    pp->ram_rows = ram != nullptr && tf > 0;   // the RAM band only ever rides the FP4 leg
+    if (pp->ram_rows) {
+        pp->ram_num = ram->num;
+        pp->ram_top = ram->top;
+    }
     const int64_t Tp = std::max(pp->T_max, tf);   // the longest chunk the peer takes
     pp->cap_rows = std::max<int64_t>(1, std::min<int64_t>(cap_rows, Tp * K));
     const MmqPlan& mp = mmq_plan();
@@ -1658,6 +1770,13 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
         return p;
     };
     peer_layout(*pp, Tp, tf, mp, take);
+    if (pp->ram_rows) {   // its own link: a copy stream of its own, and one wait/release event per slot
+        ok = ok && cudaStreamCreateWithFlags(&pp->copy, cudaStreamNonBlocking) == cudaSuccess &&
+             cudaStreamCreateWithFlags(&pp->span_copy, cudaStreamNonBlocking) == cudaSuccess;
+        for (int i = 0; ok && i < pp->ring + pp->span; ++i)
+            ok = cudaEventCreateWithFlags(&pp->copied[i], cudaEventDisableTiming) == cudaSuccess &&
+                 cudaEventCreateWithFlags(&pp->used[i], cudaEventDisableTiming) == cudaSuccess;
+    }
     for (int b = 0; b < 2 && ok; ++b) ok = cudaEventCreateWithFlags(&pp->ev_dm[b], cudaEventDisableTiming) == cudaSuccess;
     if (relay) {
         ok = ok && cudaEventCreateWithFlags(&pp->ev_hx_free, cudaEventDisableTiming) == cudaSuccess;
@@ -1700,31 +1819,38 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
 // carries its result rows (the copies into the primary's Dm: N floats a row); the FP4 planes are made on the card
 // that computes, so they never cross, and the row tables ride the host's own PCIe.  What the share saves is the
 // blobs of the experts the partner holds, which the primary's ring otherwise pulls across (the stream skips them at
-// `peer->has`).  The round trip grows with the chunk and the blobs do not, so the crossover is the longest chunk
-// whose round trip is still the cheaper side; past it the primary streams the blobs and computes alone.  Rows follow
-// the routing, which setup does not know: a chunk this side of the crossover hits every expert, so a card's rows of
-// a layer are the chunk's K rows a token in that card's share of the layer's experts.
+// `peer->has`) - and, with the RAM band on, the blobs of the experts NEITHER card holds, which the partner reads
+// over its own link instead (`peer_ram_share`).  The round trip grows with the chunk and the blobs do not, so the
+// crossover is the longest chunk whose round trip is still the cheaper side; past it the primary streams the blobs
+// and computes alone.  Rows follow the routing, which setup does not know: a chunk this side of the crossover hits
+// every expert, so a card's rows of a layer are the chunk's K rows a token in that card's share of the layer's experts.
 struct PeerLink {
     int64_t layers = 0, held = 0;   // the layers of the stage where the peer holds experts, and those experts
     uint64_t per_token = 0;         // both legs' bytes for one token of the chunk, over `layers`
-    uint64_t blobs = 0;             // those layers' partner-held blob bytes
+    uint64_t blobs = 0;             // those layers' blobs the lead no longer pulls: the partner's, and its band's
     int64_t tokens = 0;             // per_token * tokens == blobs: the crossover, 0 when the share never pays
+    int64_t ram = 0;                // of those, the experts of the RAM band the partner reads for itself
 };
 
 /// Both sides of the pair's link bill for `peer`'s placement over the layers [lb, le); `n_expert`: a layer's experts.
-static PeerLink peer_link(const core::PeerExperts& peer, int64_t lb, int64_t le, int64_t n_expert) {
+/// With `ram_num` the band's share (null `m`: no band), the bill includes the experts the partner reads for itself,
+/// so the share's crossover widens with the coverage it buys.
+static PeerLink peer_link(const core::PeerExperts& peer, const RamView* v, int64_t lb, int64_t le, int64_t n_expert,
+                          int ram_num) {
     PeerLink pl;
     if (n_expert <= 0) return pl;
     uint64_t num = 0;   // the two legs' bytes per token times n_expert, so a layer's share stays a fraction
     for (int64_t l = lb; l < le; ++l) {
-        int64_t held = 0;
-        for (int64_t e = 0; e < n_expert; ++e)
-            if (peer.has(l, e)) ++held;
-        if (held == 0) continue;
+        int64_t held = 0, moved = 0, k = 0;
+        for (int32_t e = 0; e < n_expert; ++e) {
+            if (peer.has(l, e)) { ++held; continue; }
+            if (v != nullptr && in_ram_band(*v, peer, l, e, n_expert) && PeerRamShare::taken(k++, ram_num)) ++moved;
+        }
+        if (held == 0 && moved == 0) continue;
         ++pl.layers;
         pl.held += held;
-        pl.blobs += (uint64_t) held * core::PeerExperts::slot_bytes(l);
-        num += (uint64_t) N * 4 * (uint64_t) n_expert + (uint64_t) K * (uint64_t) held * ((uint64_t) N * 4);
+        pl.blobs += (uint64_t) (held + moved) * core::PeerExperts::slot_bytes(l);
+        num += (uint64_t) N * 4 * (uint64_t) n_expert + (uint64_t) K * (uint64_t) (held + moved) * ((uint64_t) N * 4);
     }
     pl.per_token = num / (uint64_t) n_expert;
     pl.tokens = pl.per_token ? (int64_t) (pl.blobs / pl.per_token) : 0;
@@ -1758,7 +1884,7 @@ static bool peer_fp4_possible(bool streamed_share) {
     return peer_fp4_gate(streamed_share) == nullptr;
 }
 
-uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share) {
+uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_rows) {
     if (!mmq_plan().any) return 0;
     const basalt::kernels::cpu::ExpertLayout& lay = basalt::kernels::cpu::expert_layout();
     PeerPrefill pp;
@@ -1768,12 +1894,17 @@ uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share) {
                               ? std::min(chunk, peer_fp4_ceiling(0, lay.n_layers, lay.n_expert)) : 0;
     const int64_t tf = t_fp4 >= stream_all_min() ? t_fp4 : 0;
     const int64_t Tp = std::max(pp.T_max, tf);
+    // the same reserve rule for the band's ring: with the flag on and the share able to open, the tier leaves the
+    // ring's slots free whether or not this run's placement ends up reading it - under-reserving would fail the
+    // allocation, over-reserving only costs the partner a few tier slots the boot line reports
+    pp.ram_rows = peer_ram_rows && tf > 0;
     uint64_t sum = 0;
     peer_layout(pp, Tp, tf, mmq_plan(), [&](size_t bytes) -> void* { sum += (bytes + 255) & ~size_t(255); return nullptr; });
     return sum;
 }
 
-bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_share, std::string& err) {
+bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_share, bool peer_ram_rows,
+                       std::string& err) {
     Impl& m = *impl_;
     if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
     // The peer takes the rows of the routed-only chunks (below stream_all_min()), whose activations and result rows
@@ -1783,14 +1914,20 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
     if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
     const int64_t ne = m.g ? m.g->n_expert : basalt::kernels::cpu::expert_layout().n_expert;
     const int64_t lb = stage_lb_, le = stage_le_ < 0 ? (m.g ? m.g->n_layers : 0) : stage_le_;
-    const PeerLink pl = peer_link(*peer, lb, le, ne);
+    // The RAM band, priced at the longest chunk the partner could be given; `--peer-ram-rows` off, or a placement
+    // whose band never pays, leaves it on the lead's link as before
+    const RamView rv{m.host_res, m.cache, m.ring_peer, m.src};
+    const PeerRamShare prs = peer_ram_rows && !peer_fp4_gate(streamed_share)
+                                 ? peer_ram_share(rv, *peer, lb, le, ne, m.T_max) : PeerRamShare{};
+    const PeerLink pl = peer_link(*peer, prs.num > 0 ? &rv : nullptr, lb, le, ne, prs.num);
     // capped by the ceiling `peer_bytes` sized its buffers for, so the allocation always fits the reserve
     const int64_t t_fp4 = peer_fp4_possible(streamed_share)
                               ? std::min({m.T_max, pl.tokens, peer_fp4_ceiling(lb, le, ne)}) : 0;
     const int64_t t_routed = streamed_share ? m.T_max : std::min<int64_t>(m.T_max, kPeerSlowRows);
     const int64_t tf = t_fp4 >= stream_all_min() ? t_fp4 : 0;   // what `make_peer` is actually given
+    const bool ram_on = prs.num > 0 && tf > 0;
     // The one line that says what this pair's prompt share is: the crossover, whether the FP4 share is on and if not
-    // which gate shut, and the routed-only share with the derate an unlike partner carries.
+    // which gate shut, the routed-only share with the derate an unlike partner carries, and the RAM band's verdict.
     const char* gate = peer_fp4_gate(streamed_share);
     std::string share = gate ? std::string("off: ") + gate
                     : tf > 0 ? "on, chunks of " + std::to_string(tf) + " tokens or less"
@@ -1798,21 +1935,35 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
                                    "-token streaming floor";
     share += ", routed chunks to " + std::to_string(std::min(t_routed, stream_all_min() - 1)) + " tokens";
     if (!streamed_share) share += ", the routed share derated to " + std::to_string(kPeerSlowRows) + " tokens";
+    std::string band;
+    if (!peer_ram_rows)
+        band = "off (--peer-ram-rows)";
+    else if (!ram_on)
+        band = gate ? "off: the FP4 share is off"
+             : prs.band == 0 ? "off: no RAM band, every expert of the stage is on a card"
+             : "off: its rows outweigh its blob at " + std::to_string(m.T_max) + " tokens";
+    else
+        band = "on, " + std::to_string(prs.num) + "/" + std::to_string(PeerRamShare::kDen) + " of " +
+               std::to_string(prs.band) + " band experts over " + std::to_string(prs.layers) +
+               " layers read on the partner's own link, to " + std::to_string(prs.top) + " tokens, its ring " +
+               std::to_string(PeerPrefill::kRing) + " slots";
     basalt::log::info("basalt prefill",
                       "peer fp4 crossover %lld tokens: %llu MiB of activations and rows per 1024 tokens against "
-                      "%llu MiB of partner-held blobs over %lld layers (%lld experts held); the share is %s",
+                      "%llu MiB of partner-held blobs over %lld layers (%lld experts held, %lld band); the share is %s; "
+                      "RAM rows %s",
                       (long long) t_fp4, (unsigned long long) (pl.per_token * 1024 >> 20),
                       (unsigned long long) (pl.blobs >> 20), (long long) pl.layers, (long long) pl.held,
-                      share.c_str());
+                      (long long) pl.ram, share.c_str(), band.c_str());
     std::unique_ptr<PeerPrefill> pp;
     // `cap_rows` bounds the routed share only: with the FP4 share on, the primary leaves EVERY expert the peer holds
-    // out of its stream (before the routing is known), so the peer has to be able to take all of those experts' rows
-    // - which `peer_layout` guarantees by sizing its row tables for the whole chunk.
-    bool ok = make_peer(peer, t_routed, cap_rows, tf, pp, err);
+    // and every band expert the share moves out of its stream (before the routing is known), so the peer has to be
+    // able to take all of those experts' rows - which `peer_layout` guarantees by sizing its row tables for the
+    // whole chunk.
+    bool ok = make_peer(peer, t_routed, cap_rows, tf, ram_on ? &prs : nullptr, pp, err);
     if (!ok && t_fp4 >= stream_all_min()) {   // the routed-only chunks alone
         pp.reset();
         err.clear();
-        ok = make_peer(peer, t_routed, cap_rows, 0, pp, err);
+        ok = make_peer(peer, t_routed, cap_rows, 0, nullptr, pp, err);
     }
     if (!ok) return false;
     m.pp = std::move(pp);
@@ -2127,11 +2278,26 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;
         size_t consumed = 0;
+        // The RAM band this card hands to the partner: an expert neither card's tier holds, whose blob is page-locked
+        // so the PARTNER can read it over its own link (`PeerPrefill::ram_rows`) and whose rows it then has to
+        // compute.  Decided here, at the chunk's start and before the routing is known, exactly like the stream's
+        // other skips, and recorded in `ram_take` so the row split below always sends a skipped expert's rows there.
+        const bool peer_ram = ppc != nullptr && peer_fp4 && ppc->ram_num > 0 && T <= ppc->ram_top;
+        struct PeerEntry { int32_t l, e; const uint8_t* blob; };
+        std::vector<PeerEntry> pseq;
+        std::vector<size_t> pseq_start;
+        std::vector<uint8_t> ram_take;   // n_layers x n_expert, this chunk's decision; empty with the band off
         if (stream_all) {
             seq_start.assign((size_t) g.n_layers + 1, 0);
+            pseq_start.assign((size_t) g.n_layers + 1, 0);
+            if (peer_ram) ram_take.assign((size_t) g.n_layers * (size_t) m.g->n_expert, 0);
             std::vector<Stager::Job> js;
             for (int64_t l = LB; l < LE; ++l) {
                 seq_start[(size_t) l] = seq.size();
+                pseq_start[(size_t) l] = pseq.size();
+                // the layer's band, counted in id order: the same count prices the share at setup
+                const bool ram_l = peer_ram && mmq_plan().any && mmq_plan().layer[(size_t) l];
+                int64_t rk = 0;
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                     if (ppc && ppc->peer && ppc->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
@@ -2151,6 +2317,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     {
                         b = m.src->blob(l, e);
                         if (!b) { err = "prefill: expert source has no blob"; return false; }
+                        if (ram_l && m.src->pinned(l, e) && PeerRamShare::taken(rk++, ppc->ram_num)) {
+                            // leave it out of this card's stream entirely: the partner reads it and computes the rows
+                            ram_take[(size_t) l * m.g->n_expert + e] = 1;
+                            pseq.push_back({(int32_t) l, e, b});
+                            continue;
+                        }
                         if (!m.src->pinned(l, e)) {
                             job = (int) js.size();
                             js.push_back(make_job(*m.src, l, e, b, (size_t) lay0.blob_bytes(l)));
@@ -2161,6 +2333,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             for (int64_t l = LE; l <= g.n_layers; ++l) {
                 seq_start[(size_t) l] = seq.size();
+                pseq_start[(size_t) l] = pseq.size();
             }
             m.stager->start(std::move(js));
         }
@@ -2228,6 +2401,40 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             while (a_issued.load(std::memory_order_acquire) <= k) std::this_thread::yield();
         };
         auto give_back = [&](size_t upto) { a_consumed.store(upto, std::memory_order_release); };
+        // The partner's own reader: a second issuing thread, so the two PCIe links run ahead independently and
+        // neither card's blob feed can stall the other's.  The same bytes the lead's ring would have pulled, from
+        // the same page-locked host buffers, into the partner's own slots over its own link.
+        std::atomic<size_t> p_issued{0}, p_consumed{0};
+        std::atomic<bool> p_stop{false};
+        std::thread peer_issuer;
+        struct PeerIssuerJoin {
+            std::atomic<bool>* stop;
+            std::thread* t;
+            ~PeerIssuerJoin() { if (t->joinable()) { stop->store(true); t->join(); } }
+        } peer_issuer_join{&p_stop, &peer_issuer};
+        size_t p_cur = 0;   // the partner's ring cursor: its entries given back as the layers pass them
+        if (peer_ram && !pseq.empty()) {
+            peer_issuer = std::thread([&] {
+                const core::OnDevice od(ppc->dev);
+                for (size_t idx = 0; idx < pseq.size(); ++idx) {
+                    while (idx >= p_consumed.load(std::memory_order_acquire) + (size_t) ppc->ring) {
+                        if (p_stop.load(std::memory_order_acquire)) return;
+                        std::this_thread::yield();
+                    }
+                    const PeerEntry& en = pseq[idx];
+                    const int sl = (int) (idx % (size_t) ppc->ring);
+                    if (ppc->live[sl]) cudaStreamWaitEvent(ppc->copy, ppc->used[ppc->used_of[sl]], 0);
+                    cudaMemcpyAsync(ppc->stage[sl], en.blob, (size_t) lay0.blob_bytes(en.l), cudaMemcpyHostToDevice,
+                                    ppc->copy);
+                    cudaEventRecord(ppc->copied[sl], ppc->copy);
+                    ppc->live[sl] = true;
+                    p_issued.store(idx + 1, std::memory_order_release);
+                }
+            });
+        }
+        auto wait_pissued = [&](size_t k) {
+            while (p_issued.load(std::memory_order_acquire) <= k) std::this_thread::yield();
+        };
         // A chunk below stream_all_min(): each layer's MoE half also runs the next layer's router on its FFN rows, and the
         // experts that guess gives more rows than the CPU share takes (most first; not resident, not the peer's) are
         // copied ahead into the ring's slots past STAGE for that layer's parity, once this layer has every input of its
@@ -2658,17 +2865,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // multi-GPU: the rows of the experts the peer computes go last, as one block [rows_local, T*K)
                         const bool pre_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                         std::vector<char> on_peer;
-                        int64_t rows_local = T * K, rows_peer = 0;
+                        int64_t rows_local = T * K, rows_peer = 0, n_ram_peer = 0;
                         if (ppc && pre_mmq) {
                             on_peer.assign((size_t) m.g->n_expert, 0);
                             for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                 const int32_t c = m.cnt[(size_t) e];
-                                if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) ||
-                                    !ppc->peer || !ppc->peer->has(l, e))
+                                if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0))
                                     continue;
-                                if (rows_peer + c > ppc->cap_rows) { continue; }
+                                // A band expert's blob never reached this card's ring, so only the partner can
+                                // compute its rows; the row cap (never reached: the peer's tables hold the whole
+                                // chunk's rows) bounds only the experts this card could have streamed itself.
+                                const bool ram = !ram_take.empty() && ram_take[(size_t) l * m.g->n_expert + e] != 0;
+                                if (!ram && (!ppc->peer || !ppc->peer->has(l, e))) continue;
+                                if (!ram && rows_peer + c > ppc->cap_rows) { continue; }
                                 on_peer[(size_t) e] = 1;
                                 rows_peer += c;
+                                if (ram) ++n_ram_peer;
                             }
                             rows_local = T * K - rows_peer;
                         }
@@ -2734,7 +2946,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (m.cnt[(size_t) e] > 0 && (on_cpu.empty() || !on_cpu[(size_t) e]))
                                 (!on_peer.empty() && on_peer[(size_t) e] ? order_peer : order).push_back(e);
                         m.tm.experts(T * K, rows_local, rows_peer, order, order_peer, m.cnt,
-                                      use_mmq ? (int64_t) lay.blob_bytes(l) : 0);
+                                      use_mmq ? (int64_t) lay.blob_bytes(l) : 0, n_ram_peer);
                         // CPU share: the pool runs the CPU's experts while this thread stages and runs the GPU's; their
                         // unweighted rows land in Dm's row order, so the combine weights them like any other row
                         if (rows_cpu > 0) {
@@ -2821,6 +3033,41 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // multi-GPU: the peer's share, enqueued before the primary's own experts so both cards work at once
                         peer_now = use_mmq && !order_peer.empty();
                         m.tm.mark(tl, ChunkTiming::kPeerEnq, m.cs);
+                        // The partner's ring: entry k of `pseq` (this chunk's band experts, in id order like
+                        // `order_peer`) lands in slot k % ring, filled on the partner's own copy stream by a thread
+                        // of its own.  A slot is refilled only once the entry `ring` before it has been given back,
+                        // so this walk gives them back: at once for an expert the routing sent elsewhere, and for a
+                        // band expert once the group that reads its blob last has been enqueued.  `p_live` marks the
+                        // entries held that way and `p_hold` is the lowest of them; the thread never runs past it.
+                        // The peer's device is current here.
+                        const size_t pseq_base = peer_ram ? pseq_start[(size_t) l] : 0;
+                        const size_t pseq_end = peer_ram ? pseq_start[(size_t) l + 1] : 0;
+                        std::vector<uint8_t> p_live(pseq_end - pseq_base, 0);
+                        size_t p_hold = pseq_end;   // the lowest entry the partner still reads, none at pseq_end
+                        auto p_publish = [&] { p_consumed.store(std::min(p_cur, p_hold), std::memory_order_release); };
+                        auto p_give = [&](size_t j) {   // its blob has been read for the last time
+                            p_live[j - pseq_base] = 0;
+                            if (j == p_hold)
+                                while (p_hold < pseq_end && !p_live[p_hold - pseq_base]) ++p_hold;
+                        };
+                        auto p_release = [&](size_t upto) {   // the entries below it, none of them ever read
+                            while (p_cur < upto) {
+                                const int sl = (int) (p_cur % (size_t) ppc->ring);
+                                cudaEventRecord(ppc->used[sl], ppc->s);
+                                ppc->used_of[sl] = sl;
+                                ++p_cur;
+                            }
+                            p_publish();
+                        };
+                        auto p_release_to = [&](int32_t e_stop) {
+                            while (p_cur < pseq_end && pseq[p_cur].e < e_stop) p_release(p_cur + 1);
+                        };
+                        if (peer_ram && !peer_now) {   // the routing sent the partner nothing: all its slots come back
+                            const int prevd = m.device;
+                            cudaSetDevice(ppc->dev);
+                            p_release(pseq_end);
+                            cudaSetDevice(prevd);
+                        }
                         if (peer_now && peer_fp4) {
                             // a streamed chunk: the FP4 kernels in pieces (PeerPrefill::T_fp4)
                             PeerPrefill& P = *ppc;
@@ -2879,6 +3126,23 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             m.tm.pmark(tl, ChunkTiming::kPQuant, ps);
                             m.tm.groups(ngr);
                             const auto& f = lay.fmt[(size_t) l];
+                            // The group that reads each of the peer's experts last: a hot expert's rows are cut into
+                            // pieces over several groups and its blob's slot has to outlive all of them.
+                            std::vector<int32_t> last_grp(order_peer.size(), -1);
+                            for (int g2 = 0; g2 < ngr; ++g2)
+                                for (int i = pc.group[(size_t) g2]; i < pc.group[(size_t) g2 + 1]; ++i)
+                                    last_grp[(size_t) pc.expert[(size_t) i]] = g2;
+                            // The band experts read their blob from the partner's own ring.  Per one of the peer's
+                            // experts: `ent_of` its entry in `pseq` (-1: its blob sits in the peer's own tier),
+                            // `state` whether a ring slot holds it (1) or none does (2: spread, see below) and
+                            // `slot_of` that slot.  A spread expert is an entry the partner's thread cannot reach,
+                            // because a whole ring behind it sits an entry still being read - a group's experts need
+                            // not be neighbours in id - so its blob is read here instead, into a span slot, once for
+                            // each group that needs it.
+                            std::vector<int> ent_of(order_peer.size(), -1);
+                            std::vector<uint8_t> state(order_peer.size(), 0);
+                            std::vector<int> slot_of(order_peer.size(), -1);
+                            size_t p_span_cur = 0;   // the span slots, taken in turn
                             for (int g2 = 0; g2 < ngr; ++g2) {
                                 const int i0 = pc.group[(size_t) g2], ns = pc.group[(size_t) g2 + 1] - i0;
                                 const int64_t r0 = pc.bounds[(size_t) i0], nr = pc.bounds[(size_t) (i0 + ns)] - r0;
@@ -2887,8 +3151,67 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (P.dm_live[b]) cudaStreamWaitEvent(ps, P.ev_dm[b], 0);   // its last rows have left
                                 fp4::Group fg;
                                 fg.n = ns;
-                                for (int i = 0; i < ns; ++i)
-                                    fg.blob[i] = P.peer->slot_ptr(l, order_peer[(size_t) pc.expert[(size_t) (i0 + i)]]);
+                                int p_sl[MMQ_GROUP], p_sl_n = 0;   // the slots this group reads, freed by one event
+                                int p_w[MMQ_GROUP], p_w_n = 0;     // ... whose re-read this group has to wait for
+                                int32_t p_oj[MMQ_GROUP], p_ent[MMQ_GROUP], p_n = 0;   // the band experts it reads
+                                long p_hi = -1;      // its highest new ring entry: its copy covers the lower ones
+                                auto p_span = [&](int32_t oj) -> int {   // read an expert's blob again, for this group
+                                    const int s2 = P.ring + (int) (p_span_cur++ % (size_t) P.span);
+                                    if (P.live[s2]) cudaStreamWaitEvent(P.span_copy, P.used[P.used_of[s2]], 0);
+                                    cudaMemcpyAsync(P.stage[s2], pseq[(size_t) ent_of[oj]].blob,
+                                                    (size_t) lay0.blob_bytes(l), cudaMemcpyHostToDevice, P.span_copy);
+                                    cudaEventRecord(P.copied[s2], P.span_copy);
+                                    P.live[s2] = true;
+                                    p_w[p_w_n++] = s2;
+                                    return s2;
+                                };
+                                int32_t prev_oj = -1;   // the piece before this one: a group reads an expert's blob once
+                                int sl_prev = -1;
+                                for (int i = 0; i < ns; ++i) {
+                                    const int32_t oj = pc.expert[(size_t) (i0 + i)];
+                                    int sl = sl_prev;
+                                    if (oj != prev_oj) {
+                                        sl = -1;
+                                        const int32_t e = order_peer[oj];
+                                        if (ent_of[oj] < 0 && !ram_take.empty() &&
+                                            ram_take[(size_t) l * m.g->n_expert + e]) {
+                                            p_release_to(e);   // the entries of the experts the routing sent elsewhere
+                                            if (p_cur >= pseq_end || pseq[p_cur].e != e) {
+                                                err = "prefill: a RAM-band expert is on neither card's stream";
+                                                return false;
+                                            }
+                                            ent_of[oj] = (int) p_cur++;   // the expert's own entry, slot ent % ring
+                                            p_publish();
+                                        }
+                                        if (ent_of[oj] >= 0) {
+                                            if (state[oj] == 1) {
+                                                sl = slot_of[oj];   // a later group: the ring still holds its blob
+                                            } else if (state[oj] == 2) {
+                                                sl = p_span(oj);
+                                            } else if ((size_t) ent_of[oj] >= p_hold + (size_t) P.ring) {
+                                                state[oj] = 2;
+                                                sl = p_span(oj);
+                                            } else {
+                                                wait_pissued((size_t) ent_of[oj]);   // queued on the partner's own link
+                                                sl = ent_of[oj] % P.ring;
+                                                p_hi = ent_of[oj];                   // claimed in id order: last is highest
+                                                slot_of[oj] = sl;
+                                                state[oj] = 1;
+                                                p_live[(size_t) ent_of[oj] - pseq_base] = 1;   // held till its last piece
+                                                if ((size_t) ent_of[oj] < p_hold) p_hold = (size_t) ent_of[oj];
+                                                p_publish();
+                                            }
+                                            p_sl[p_sl_n++] = sl;
+                                            if (state[oj] == 1) { p_oj[p_n] = oj; p_ent[p_n] = ent_of[oj]; ++p_n; }
+                                        }
+                                        prev_oj = oj;
+                                        sl_prev = sl;
+                                    }
+                                    fg.blob[i] = sl >= 0 ? P.stage[(size_t) sl] : P.peer->slot_ptr(l, order_peer[oj]);
+                                }
+                                // the copies land in the order they were queued: one wait covers the ring's blobs
+                                if (p_hi >= 0) cudaStreamWaitEvent(ps, P.copied[(size_t) p_hi % P.ring], 0);
+                                for (int i = 0; i < p_w_n; ++i) cudaStreamWaitEvent(ps, P.copied[p_w[i]], 0);
                                 fg.bounds_host = P.f_rel_host.data() + P.f_rel_at[(size_t) g2];
                                 fg.bounds_dev = rb;
                                 fg.ids = P.src + r0; fg.a4x = P.f_a4x; fg.gsx = P.f_gsx; fg.tokens = T;
@@ -2899,6 +3222,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 m.tm.grp_begin(tl, (size_t) g2, ps);
                                 fp4::run_group(fg, P.G, ps);
                                 m.tm.grp_end(tl, (size_t) g2, ps);
+                                if (p_sl_n > 0) {   // the blobs are read: give those slots back, by one event
+                                    const int rel = p_sl[p_sl_n - 1];
+                                    cudaEventRecord(P.used[rel], ps);
+                                    for (int i = 0; i < p_sl_n; ++i) P.used_of[p_sl[i]] = rel;
+                                }
+                                for (int i = 0; i < p_n; ++i)   // an expert cut across groups keeps its slot till the last
+                                    if (last_grp[(size_t) p_oj[i]] == g2) p_give((size_t) p_ent[i]);
+                                p_publish();
                                 // the rows back to the primary's Dm: across the link on the copy stream, or through
                                 // a host buffer whose last rows have already reached Dm
                                 cudaEventRecord(P.ev_grp[g2 % PeerPrefill::kGrpEv], ps);
@@ -2924,6 +3255,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 cudaEventRecord(P.ev_dm[b], P.s_out);
                                 P.dm_live[b] = true;
                             }
+                            // the entries of the band experts this layer's routing did not pick come back too
+                            p_release(pseq_end);
                             // the layer's peer rows have all landed in Dm: on the copy stream across the link, or
                             // on the upload stream after the last host buffer
                             m.tm.pmark(tl, ChunkTiming::kPComp, ps);
