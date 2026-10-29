@@ -3131,11 +3131,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             m.tm.groups(ngr);
                             const auto& f = lay.fmt[(size_t) l];
                             // The group that reads each of the peer's experts last: a hot expert's rows are cut into
-                            // pieces over several groups and its blob's slot has to outlive all of them.
-                            std::vector<int32_t> last_grp(order_peer.size(), -1);
-                            for (int g2 = 0; g2 < ngr; ++g2)
-                                for (int i = pc.group[(size_t) g2]; i < pc.group[(size_t) g2 + 1]; ++i)
-                                    last_grp[(size_t) pc.expert[(size_t) i]] = g2;
+                            // pieces over several groups and its blob's slot has to outlive all of them.  Built only
+                            // with the band on: without it no expert is read from the partner's ring.
+                            std::vector<int32_t> last_grp;
+                            std::vector<int> ent_of, slot_of;
+                            std::vector<uint8_t> state;
+                            if (peer_ram) {
+                                last_grp.assign(order_peer.size(), -1);
+                                for (int g2 = 0; g2 < ngr; ++g2)
+                                    for (int i = pc.group[(size_t) g2]; i < pc.group[(size_t) g2 + 1]; ++i)
+                                        last_grp[(size_t) pc.expert[(size_t) i]] = g2;
+                                ent_of.assign(order_peer.size(), -1);
+                                state.assign(order_peer.size(), 0);
+                                slot_of.assign(order_peer.size(), -1);
+                            }
                             // The band experts read their blob from the partner's own ring.  Per one of the peer's
                             // experts: `ent_of` its entry in `pseq` (-1: its blob sits in the peer's own tier),
                             // `state` whether a ring slot holds it (1) or none does (2: spread, see below) and
@@ -3143,9 +3152,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // because a whole ring behind it sits an entry still being read - a group's experts need
                             // not be neighbours in id - so its blob is read here instead, into a span slot, once for
                             // each group that needs it.
-                            std::vector<int> ent_of(order_peer.size(), -1);
-                            std::vector<uint8_t> state(order_peer.size(), 0);
-                            std::vector<int> slot_of(order_peer.size(), -1);
                             size_t p_span_cur = 0;   // the span slots, taken in turn
                             for (int g2 = 0; g2 < ngr; ++g2) {
                                 const int i0 = pc.group[(size_t) g2], ns = pc.group[(size_t) g2 + 1] - i0;
