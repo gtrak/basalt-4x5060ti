@@ -7469,6 +7469,8 @@ int main(int argc, char** argv) {
         // batch_lines=0: the per-window token lines (BT/BDONE/BDIG) and their flush stay off, for a host-cost A/B;
         // the tokens and the profile line are computed either way
         const bool batch_lines = basalt::core::exp_flag("batch_lines", 1) != 0;
+        // mtp_preswap=1: the next window's lead slot swaps its draft K/V in beside the next run, not in the draft phase
+        const bool mtp_preswap = basalt::core::exp_flag("mtp_preswap", 0) != 0;
         std::vector<float> lh_buf;
         auto row_hash = [&](int t) -> uint64_t {
             lh_buf.resize((size_t) n_vocab);
@@ -8184,6 +8186,9 @@ int main(int argc, char** argv) {
                 }
                 mtp.set_ple_session(rsp);
                 if (!mtp.idle(err)) { std::printf("ERR %s\n", err.c_str()); return false; }   // (the kept rows are copied)
+                if (mtp_preswap && nc > 0) {   // beside the next run: the D2D swap runs on the drafter's idle stream
+                    if (!mtp.use_store(rows[cont[0]], err)) { std::printf("ERR %s\n", err.c_str()); return false; }
+                }
                 bt_draft += msd(w3, Clock::now());
                 bt_draft_last = msd(w3, Clock::now());
             }
