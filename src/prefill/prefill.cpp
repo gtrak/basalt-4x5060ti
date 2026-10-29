@@ -632,6 +632,16 @@ struct ChunkTiming {
 /// move the rows all count the same bytes.
 static uint64_t peer_row_bytes(bool rows_bf16) { return (uint64_t) N * (rows_bf16 ? 2 : 4); }
 
+/// The width of one token of a streamed chunk's activations on the pair's link: the lead's FP4 token planes by
+/// default - the E2M1 codes, the UE4M3 scales and the token's FP32 scale, exactly the bytes `fp4::quantize_tokens`
+/// writes - or the FP32 activations with `--peer-acts-fp32`.  The planes are the ones the lead rounds for its own FP4
+/// experts, from the same function on the same `mixed`, so the peer needs no quantize of its own and a row it computes
+/// is the row it would have computed.  The one place that says the width, as `peer_row_bytes` does for the rows: the
+/// copies, the share's crossover and the band's price all count the same bytes.
+static uint64_t peer_act_bytes(bool acts_planes) {
+    return acts_planes ? (uint64_t) fp4::token_bytes(1, N) + 4 : (uint64_t) N * 4;
+}
+
 struct PeerPrefill {
     core::PeerExperts* peer = nullptr;
     int dev = -1;
@@ -654,6 +664,9 @@ struct PeerPrefill {
     bool rows_bf16 = false;         // the FP4 leg's rows cross the pair's link as BF16 bits (`set_peer`)
     /// Bytes of one of this card's result rows on the link.
     size_t row_bytes() const { return (size_t) peer_row_bytes(rows_bf16); }
+    bool acts_planes = false;       // the FP4 leg's activations cross as the lead's FP4 planes (`set_peer`)
+    /// Bytes of one token of the chunk's activations on the link, in the wire this card was given.
+    size_t act_bytes() const { return (size_t) peer_act_bytes(acts_planes); }
     /// The staging of group `b` as BF16 bits (its rows are written there by the FP4 down product's epilogue).
     uint16_t* dm16(int b) const { return (uint16_t*) Dm_b[b]; }
     /// Where a group's rows land in the primary's Dm.  BF16 rows share the FP32 block's bytes: the block's first
@@ -686,7 +699,7 @@ struct PeerPrefill {
     bool p2p = false;                     // peer access between `prim` and `dev`: the copies go card to card
     int prim = -1;                        // the primary's device
     int64_t T_fp4 = 0;
-    void* f_a4x = nullptr;                // the layer's token planes and token scales (fp4::quantize_tokens)
+    void* f_a4x = nullptr;                // the layer's token planes and token scales (the lead's, or this card's quantize)
     float* f_gsx = nullptr;
     void* f_a4h = nullptr;                // a run's H planes, token scales, tile table and relative bounds
     float* f_gsh = nullptr;
@@ -1679,11 +1692,11 @@ struct PeerRamShare {
 };
 
 static PeerRamShare peer_ram_share(const RamView& v, const core::PeerExperts& peer, int64_t lb, int64_t le,
-                                   int64_t n_expert, int64_t chunk, bool rows_bf16) {
+                                   int64_t n_expert, int64_t chunk, bool rows_bf16, bool acts_planes) {
     PeerRamShare pr;
     if (n_expert <= 0 || chunk <= 0) return pr;
     const uint64_t rb = peer_row_bytes(rows_bf16);
-    const uint64_t acts = (uint64_t) chunk * N * 4;   // the layer's activations, out over the pair's link
+    const uint64_t acts = (uint64_t) chunk * peer_act_bytes(acts_planes);   // the layer's activations, out over the link
     for (int64_t l = lb; l < le; ++l) {
         int64_t held = 0, band = 0;
         for (int32_t e = 0; e < n_expert; ++e) {
@@ -1718,7 +1731,10 @@ static PeerRamShare peer_ram_share(const RamView& v, const core::PeerExperts& pe
 // in one place so that the tier's reserve and the allocation count the same bytes.
 template <class Take>
 static void peer_layout(PeerPrefill& pp, int64_t Tp, int64_t tf, const MmqPlan& mp, Take&& take) {
-    pp.mixed = (float*) take((size_t) Tp * N * 4);
+    // the activations the ROUTED leg is handed as FP32 (its products are the MMQ ones the lead also uses).  The
+    // streamed leg takes the lead's FP4 planes into `f_a4x`/`f_gsx` instead, so with that wire its staging is not
+    // sized for the streamed chunk's tokens at all - only `--peer-acts-fp32` runs the peer's own quantize.
+    pp.mixed = (float*) take((size_t) (pp.acts_planes ? pp.T_max : Tp) * N * 4);
     pp.cap_rows = Tp * K;         // no row cap: only the row tables grow with it
     pp.G = pp.T_max;              // one expert never has more rows than the chunk has tokens
     const int64_t Gr = pp.G;
@@ -1758,14 +1774,16 @@ static void peer_layout(PeerPrefill& pp, int64_t Tp, int64_t tf, const MmqPlan& 
 }
 
 static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, int64_t tf, bool rows_fp32,
-                      const PeerRamShare* ram,
+                      bool acts_fp32, const PeerRamShare* ram,
                       std::unique_ptr<PeerPrefill>& out, std::string& err) {
     auto pp = std::make_unique<PeerPrefill>();
     pp->peer = peer;
     pp->T_max = std::min<int64_t>(T_max, stream_all_min() - 1);
     pp->T_fp4 = tf;
-    // Only the FP4 leg's rows go back as BF16 bits: the routed leg's products are the MMQ ones, which store FP32.
+    // Only the FP4 leg's rows go back as BF16 bits and only its activations go out as planes: the routed leg's
+    // products are the MMQ ones, which store FP32 and are quantized from the activations themselves.
     pp->rows_bf16 = tf > 0 && !rows_fp32;
+    pp->acts_planes = tf > 0 && !acts_fp32;
     pp->ram_rows = ram != nullptr && tf > 0;   // the RAM band only ever rides the FP4 leg
     if (pp->ram_rows) {
         pp->ram_num = ram->num;
@@ -1847,7 +1865,9 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
     const std::string stream = tf > 0
         ? ", a streamed one with the primary's FP4 kernels" +
               std::string(pp->p2p ? " and a card-to-card copy" : " through pinned host memory") +
-              (pp->rows_bf16 ? ", its rows back as BF16" : ", its rows back as FP32 (--peer-rows-fp32)")
+              (pp->rows_bf16 ? ", its rows back as BF16" : ", its rows back as FP32 (--peer-rows-fp32)") +
+              (pp->acts_planes ? ", its activations as the lead's FP4 planes"
+                               : ", its activations as FP32 (--peer-acts-fp32)")
         : "";
     basalt::log::info("basalt prefill", "peer GPU %d computes its experts' rows of each prompt chunk%s, with compact group "
                          "buffers%s; %zu MiB left free on it", pp->dev,
@@ -1878,12 +1898,12 @@ struct PeerLink {
 /// Both sides of the pair's link bill for `peer`'s placement over the layers [lb, le); `n_expert`: a layer's experts.
 /// With `ram_num` the band's share (null `m`: no band), the bill includes the experts the partner reads for itself,
 /// so the share's crossover widens with the coverage it buys.  The rows back are billed at the wire's width
-/// (`peer_row_bytes`).
+/// (`peer_row_bytes`) and the activations out at theirs (`peer_act_bytes`).
 static PeerLink peer_link(const core::PeerExperts& peer, const RamView* v, int64_t lb, int64_t le, int64_t n_expert,
-                          int ram_num, bool rows_bf16) {
+                          int ram_num, bool rows_bf16, bool acts_planes) {
     PeerLink pl;
     if (n_expert <= 0) return pl;
-    const uint64_t rb = peer_row_bytes(rows_bf16);
+    const uint64_t rb = peer_row_bytes(rows_bf16), ab = peer_act_bytes(acts_planes);
     uint64_t num = 0;   // the two legs' bytes per token times n_expert, so a layer's share stays a fraction
     for (int64_t l = lb; l < le; ++l) {
         int64_t held = 0, moved = 0, k = 0;
@@ -1896,7 +1916,7 @@ static PeerLink peer_link(const core::PeerExperts& peer, const RamView* v, int64
         pl.held += held;
         pl.ram += moved;   // of the bill, the ones only the partner's own link feeds
         pl.blobs += (uint64_t) (held + moved) * core::PeerExperts::slot_bytes(l);
-        num += (uint64_t) N * 4 * (uint64_t) n_expert + (uint64_t) K * (uint64_t) (held + moved) * rb;
+        num += ab * (uint64_t) n_expert + (uint64_t) K * (uint64_t) (held + moved) * rb;
     }
     pl.per_token = num / (uint64_t) n_expert;
     pl.tokens = pl.per_token ? (int64_t) (pl.blobs / pl.per_token) : 0;
@@ -1906,8 +1926,9 @@ static PeerLink peer_link(const core::PeerExperts& peer, const RamView* v, int64
 /// The greatest crossover any placement of this pack can reach: a whole layer on the peer, every expert held.  The
 /// share's gate never opens wider than this, so the tier's reserve - taken before the peer is filled, with no
 /// residency to read - sizes its buffers for it.
-static int64_t peer_fp4_ceiling(int64_t lb, int64_t le, int64_t n_expert, bool rows_bf16) {
-    const uint64_t round = (uint64_t) N * 4 + (uint64_t) K * peer_row_bytes(rows_bf16);   // one token out and back
+static int64_t peer_fp4_ceiling(int64_t lb, int64_t le, int64_t n_expert, bool rows_bf16, bool acts_planes) {
+    // one token out (its activations, on their wire) and back (its rows)
+    const uint64_t round = peer_act_bytes(acts_planes) + (uint64_t) K * peer_row_bytes(rows_bf16);
     int64_t top = 0;
     for (int64_t l = lb; l < le; ++l)
         top = std::max(top, (int64_t) ((uint64_t) n_expert * core::PeerExperts::slot_bytes(l) / round));
@@ -1930,18 +1951,21 @@ static bool peer_fp4_possible(bool streamed_share) {
     return peer_fp4_gate(streamed_share) == nullptr;
 }
 
-uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_rows, bool peer_rows_fp32) {
+uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_rows, bool peer_rows_fp32,
+                            bool peer_acts_fp32) {
     if (!mmq_plan().any) return 0;
     const basalt::kernels::cpu::ExpertLayout& lay = basalt::kernels::cpu::expert_layout();
     PeerPrefill pp;
     pp.T_max = std::min<int64_t>(chunk, streamed_share ? stream_all_min() - 1 : kPeerSlowRows);
     // the widest the share's gate can open: the placement that sets the crossover is not known until the tier is filled
-    const bool rows_bf16 = !peer_rows_fp32;
+    const bool rows_bf16 = !peer_rows_fp32, acts_planes = !peer_acts_fp32;
     const int64_t t_fp4 = peer_fp4_possible(streamed_share)
-                              ? std::min(chunk, peer_fp4_ceiling(0, lay.n_layers, lay.n_expert, rows_bf16)) : 0;
+                              ? std::min(chunk, peer_fp4_ceiling(0, lay.n_layers, lay.n_expert, rows_bf16, acts_planes))
+                              : 0;
     const int64_t tf = t_fp4 >= stream_all_min() ? t_fp4 : 0;
     const int64_t Tp = std::max(pp.T_max, tf);
-    pp.rows_bf16 = tf > 0 && rows_bf16;   // the same rule `make_peer` follows, so the wire never outgrows the reserve
+    pp.rows_bf16 = tf > 0 && rows_bf16;   // the same rules `make_peer` follows, so no wire ever outgrows the reserve
+    pp.acts_planes = tf > 0 && acts_planes;
     // the same reserve rule for the band's ring: with the flag on and the share able to open, the tier leaves the
     // ring's slots free whether or not this run's placement ends up reading it - under-reserving would fail the
     // allocation, over-reserving only costs the partner a few tier slots the boot line reports
@@ -1952,7 +1976,7 @@ uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_r
 }
 
 bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_share, bool peer_ram_rows,
-                       bool peer_rows_fp32, std::string& err) {
+                       bool peer_rows_fp32, bool peer_acts_fp32, std::string& err) {
     Impl& m = *impl_;
     if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
     // The peer takes the rows of the routed-only chunks (below stream_all_min()), whose activations and result rows
@@ -1966,12 +1990,16 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
     // whose band never pays, leaves it on the lead's link as before
     const RamView rv{m.host_res, m.cache, m.ring_peer, m.src};
     const bool rows_bf16 = !peer_rows_fp32;   // the width of the peer's rows on the pair's link (`PeerPrefill::rows_bf16`)
+    const bool acts_planes = !peer_acts_fp32; // ... and of its activations (`PeerPrefill::acts_planes`)
     const PeerRamShare prs = peer_ram_rows && !peer_fp4_gate(streamed_share)
-                                 ? peer_ram_share(rv, *peer, lb, le, ne, m.T_max, rows_bf16) : PeerRamShare{};
-    const PeerLink pl = peer_link(*peer, prs.num > 0 ? &rv : nullptr, lb, le, ne, prs.num, rows_bf16);
+                                 ? peer_ram_share(rv, *peer, lb, le, ne, m.T_max, rows_bf16, acts_planes)
+                                 : PeerRamShare{};
+    const PeerLink pl = peer_link(*peer, prs.num > 0 ? &rv : nullptr, lb, le, ne, prs.num, rows_bf16, acts_planes);
     // capped by the ceiling `peer_bytes` sized its buffers for, so the allocation always fits the reserve
     const int64_t t_fp4 = peer_fp4_possible(streamed_share)
-                              ? std::min({m.T_max, pl.tokens, peer_fp4_ceiling(lb, le, ne, rows_bf16)}) : 0;
+                              ? std::min({m.T_max, pl.tokens,
+                                          peer_fp4_ceiling(lb, le, ne, rows_bf16, acts_planes)})
+                              : 0;
     const int64_t t_routed = streamed_share ? m.T_max : std::min<int64_t>(m.T_max, kPeerSlowRows);
     const int64_t tf = t_fp4 >= stream_all_min() ? t_fp4 : 0;   // what `make_peer` is actually given
     const bool ram_on = prs.num > 0 && tf > 0;
@@ -2005,21 +2033,22 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
     basalt::log::info("basalt prefill",
                       "peer fp4 crossover %lld tokens: %llu MiB of activations and rows per 1024 tokens against "
                       "%llu MiB of partner-held blobs over %lld layers (%lld experts held, %lld band); the share is "
-                      "%s; rows cross as %s; RAM rows %s",
+                      "%s; rows cross as %s; acts cross as %s; RAM rows %s",
                       (long long) t_fp4, (unsigned long long) (pl.per_token * 1024 >> 20),
                       (unsigned long long) (pl.blobs >> 20), (long long) pl.layers, (long long) pl.held,
                       (long long) pl.ram, share.c_str(), rows_bf16 ? "BF16" : "FP32 (--peer-rows-fp32)",
+                      acts_planes ? "the lead's FP4 planes" : "FP32 (--peer-acts-fp32)",
                       band.c_str());
     std::unique_ptr<PeerPrefill> pp;
     // `cap_rows` bounds the routed share only: with the FP4 share on, the primary leaves EVERY expert the peer holds
     // and every band expert the share moves out of its stream (before the routing is known), so the peer has to be
     // able to take all of those experts' rows - which `peer_layout` guarantees by sizing its row tables for the
     // whole chunk.
-    bool ok = make_peer(peer, t_routed, cap_rows, tf, peer_rows_fp32, ram_on ? &prs : nullptr, pp, err);
+    bool ok = make_peer(peer, t_routed, cap_rows, tf, peer_rows_fp32, peer_acts_fp32, ram_on ? &prs : nullptr, pp, err);
     if (!ok && t_fp4 >= stream_all_min()) {   // the routed-only chunks alone
         pp.reset();
         err.clear();
-        ok = make_peer(peer, t_routed, cap_rows, 0, peer_rows_fp32, nullptr, pp, err);
+        ok = make_peer(peer, t_routed, cap_rows, 0, peer_rows_fp32, peer_acts_fp32, nullptr, pp, err);
     }
     if (!ok) return false;
     m.pp = std::move(pp);
@@ -2799,6 +2828,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool fused_l = (use_mmq && stream_all && !lay.native && fused::enabled()) || fused_nat;
                     bool peer_now = false;                // multi-GPU: the peer computed rows of this layer (MMQ path only)
                     int64_t peer_lo = 0, peer_n = 0;      // ... and the block of Dm rows its share filled
+                    // This layer's token planes were rounded on the lead's compute stream: the peer's FP4 leg ships them,
+                    // so it may only run once they exist (the copy of them is ordered after that launch by `ev_in`).
+                    bool fp4_planes = false;
                     // CPU share: this layer's CPU experts (rows [T * K - rows_cpu, T * K) of Dm) run on a thread that
                     // reads on_cpu, so the future (which waits for the thread) is declared after it
                     std::vector<char> on_cpu;
@@ -3059,6 +3091,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
+                        // the layer's FP4 tables, where `moe_bufs` put them: the token planes the lead rounds once per
+                        // token (its own gate/up products read them, and a peer card's FP4 leg is shipped those very
+                        // bytes) and a group's H planes.  Named once, so the quantize and the peer's copies cannot drift.
+                        const Fp4Ptrs fp = use_mmq ? fp4_ptrs(m.Xq, m.Hq, m.T, m.g->n_expert) : Fp4Ptrs{};
                         if (use_mmq) {
                             // the layer's activations as q8_1 rows in expert order, straight from `mixed`
                             if (!fp4_l) mmq::quantize(m.mixed, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs);
@@ -3080,9 +3116,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 cudaMemcpyAsync(m.bounds_dev, m.bounds_host.data(), m.bounds_host.size() * 4,
                                                 cudaMemcpyHostToDevice, m.cs);
                             }
-                            if (fp4_l) {   // the activations as FP4, once per token: the gate/up product reads a row's token
-                                const Fp4Ptrs fp = fp4_ptrs(m.Xq, m.Hq, m.T, m.g->n_expert);
+                            if (fp4_l) {   // the activations as FP4, once per token: the gate/up product reads a row's token,
+                                           // and a peer card's FP4 leg is SHIPPED these very planes rather than making
+                                           // its own (below): this launch is what the peer's window waits on, so it stays
+                                           // above the peer's enqueue
                                 fp4::quantize_tokens(m.mixed, T, N, N, fp.a4x, fp.gsx, m.cs);
+                                fp4_planes = true;
                             }
                         } else {
                             gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
@@ -3152,35 +3191,65 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 err = "prefill: the peer's piece table is too small";
                                 return false;
                             }
-                            // the layer's activations to the peer's card: straight across the link, or down to a
-                            // pinned buffer and up again (that buffer is free once the peer's upload of the last
-                            // layer's is done)
+                            // The layer's activations to the peer's card, on the wire this pair was given: the lead's FP4
+                            // token planes - the codes, the UE4M3 scales and the token scales the lead rounded for its own
+                            // experts above, the same `fp4::quantize_tokens` on the same `mixed`, so the peer's products
+                            // read the bits it would have made and it quantizes nothing (`PeerPrefill::acts_planes`) - or
+                            // the FP32 activations, which the peer rounds itself.  Straight across the link, or down to a
+                            // pinned buffer and up again (that buffer is free once the peer's upload of the last layer's is
+                            // done); the lead's bytes of either wire live until the layer's wait on the peer's rows, as
+                            // `mixed` always did.
                             const int prevd = m.device;
                             const cudaStream_t ps = P.s;
+                            const size_t ab = fp4::token_bytes(T, N), sb = (size_t) T * 4;   // the planes' two runs
+                            const size_t fb = (size_t) T * P.act_bytes();   // the FP32 wire's one run
+                            if (P.acts_planes && !fp4_planes) {
+                                err = "prefill: the peer's FP4 planes were never rounded on the primary";
+                                return false;
+                            }
                             cudaEventRecord(P.ev_in, m.cs);
                             if (P.p2p) {
                                 cudaSetDevice(P.dev);
                                 cudaStreamWaitEvent(ps, P.ev_in, 0);
                                 m.tm.pmark(tl, ChunkTiming::kPIn, ps);
-                                cudaMemcpyPeerAsync(P.mixed, P.dev, m.mixed, prevd, (size_t) T * N * 4, ps);
+                                if (P.acts_planes) {
+                                    cudaMemcpyPeerAsync(P.f_a4x, P.dev, fp.a4x, prevd, ab, ps);
+                                    cudaMemcpyPeerAsync(P.f_gsx, P.dev, fp.gsx, prevd, sb, ps);
+                                } else {
+                                    cudaMemcpyPeerAsync(P.mixed, P.dev, m.mixed, prevd, fb, ps);
+                                }
                                 m.tm.pmark(tl, ChunkTiming::kPAct, ps);
                             } else {
+                                // the relay's pinned buffer is sized for the wider wire, the FP32 activations, and holds
+                                // either: the planes' second run starts at an aligned offset inside it
+                                const size_t so = al256(ab);
                                 cudaStreamWaitEvent(P.x_out, P.ev_in, 0);
                                 if (P.hx_live) cudaStreamWaitEvent(P.x_out, P.ev_hx_free, 0);
-                                cudaMemcpyAsync(P.hx, m.mixed, (size_t) T * N * 4, cudaMemcpyDeviceToHost, P.x_out);
+                                if (P.acts_planes) {
+                                    cudaMemcpyAsync(P.hx, fp.a4x, ab, cudaMemcpyDeviceToHost, P.x_out);
+                                    cudaMemcpyAsync((uint8_t*) P.hx + so, fp.gsx, sb, cudaMemcpyDeviceToHost, P.x_out);
+                                } else {
+                                    cudaMemcpyAsync(P.hx, m.mixed, fb, cudaMemcpyDeviceToHost, P.x_out);
+                                }
                                 cudaEventRecord(P.ev_hx, P.x_out);
                                 P.hx_live = true;
                                 cudaSetDevice(P.dev);
                                 cudaStreamWaitEvent(ps, P.ev_hx, 0);
                                 m.tm.pmark(tl, ChunkTiming::kPIn, ps);
-                                cudaMemcpyAsync(P.mixed, P.hx, (size_t) T * N * 4, cudaMemcpyHostToDevice, ps);
+                                if (P.acts_planes) {
+                                    cudaMemcpyAsync(P.f_a4x, P.hx, ab, cudaMemcpyHostToDevice, ps);
+                                    cudaMemcpyAsync(P.f_gsx, (uint8_t*) P.hx + so, sb, cudaMemcpyHostToDevice, ps);
+                                } else {
+                                    cudaMemcpyAsync(P.mixed, P.hx, fb, cudaMemcpyHostToDevice, ps);
+                                }
                                 m.tm.pmark(tl, ChunkTiming::kPAct, ps);
                                 cudaEventRecord(P.ev_hx_free, ps);
                             }
                             cudaMemcpyAsync(P.src, src_h + rows_local, (size_t) rows_peer * 4, cudaMemcpyHostToDevice, ps);
                             cudaMemcpyAsync(P.f_rel, P.f_rel_host.data(), P.f_rel_host.size() * 4, cudaMemcpyHostToDevice, ps);
-                            // the layer's activations as FP4, once per token (the primary's bytes)
-                            fp4::quantize_tokens(P.mixed, T, N, N, P.f_a4x, P.f_gsx, ps);
+                            if (!P.acts_planes) {   // the FP32 wire: the layer's activations as FP4, once per token
+                                fp4::quantize_tokens(P.mixed, T, N, N, P.f_a4x, P.f_gsx, ps);
+                            }
                             m.tm.pmark(tl, ChunkTiming::kPQuant, ps);
                             m.tm.groups(ngr);
                             const auto& f = lay.fmt[(size_t) l];
@@ -3524,7 +3593,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         auto fp4_flush = [&]() {
                             if (fp4_n == 0) return;
                             if (gg_nslots > 0) cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
-                            const Fp4Ptrs fp = fp4_ptrs(m.Xq, m.Hq, m.T, m.g->n_expert);
                             // runs of consecutive experts of at most the rows H holds: H indexes a run's own rows, the
                             // layer's Dm and row -> token table the absolute ones
                             fp4::Group fg;
