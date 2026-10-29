@@ -1668,3 +1668,155 @@ BF16 + per-stage re-pricing (`89190c7e` + `0a941f88`), merged with the decode he
 - Decode canary: acc 61-65% (in the 53-67% band), solo 78.3 t/s, hit 94.6% — parity holds under BF16.
 - Next lever: the peer stragglers (phase-separated link scheduling: RAM-band compute first, P2P return
   streamed behind VRAM-band compute) target the 18-40 ms per layer.
+
+## RUN 21 — the outgoing leg ships the lead's FP4 planes (`--peer-acts-fp32` is the A/B)
+
+Run 10 named it and run 18 left it as the last wire term: on a streamed chunk the lead ships the chunk's FP32
+activations to the partner (part of the boot line's 825-836 MiB/1024 tokens) and the partner spends `act` +
+`quant` 21.3 ms (stage A) / 13.5 (stage B) a layer rounding them for the FP4 kernels it shares with the lead.
+The lead rounds those same bytes for its own experts in the same layer, with the same function on the same input
+(`fp4::quantize_tokens(m.mixed, T, N, N, fp.a4x, fp.gsx, m.cs)`), so the planes are bit-identical to what the
+partner's own quantize would make. Ship the planes: 1 444 B a token (1 280 codes + 160 UE4M3 scales + 4 the token
+scale) instead of 10 240, and the partner's window starts quantize-free. One flag: `--peer-acts-fp32`.
+
+### 1. What crosses, and in what order
+
+`peer_act_bytes(acts_planes)` (beside `peer_row_bytes`) is the one place that says the width; the copies,
+`peer_link`, `peer_fp4_ceiling` and `peer_ram_share`'s `acts` all count it, so the price can never bill a wire
+other than the one the run uses. In the FP4 leg (`peer_now && peer_fp4`):
+
+- **planes (default)**: the lead's `fp.a4x` (`fp4::token_bytes(T, N)` bytes) and `fp.gsx` (`T` floats) are copied
+  to `P.f_a4x`/`P.f_gsx` — card to card on `P.s` with `p2p`, or through the pinned `P.hx` (whose two runs sit at
+  0 and `al256(token_bytes(T,N))`) on the relay. The peer's `fp4::quantize_tokens` is not launched; its group walk
+  reads the received planes exactly as it read its own.
+- **`--peer-acts-fp32`**: today's code exactly — `m.mixed` → `P.mixed`, then the peer's own quantize. The routed
+  (sub-`stream_all_min`) MMQ leg is untouched either way: its products are the ones the lead also uses, so it
+  keeps the FP32 activations and its own `mmq::quantize`.
+
+Ordering (run 10's precondition, checked rather than assumed): the lead's quantize is issued on `m.cs` **above** the
+peer's enqueue, and the leg's first call is `cudaEventRecord(P.ev_in, m.cs)` followed by
+`cudaStreamWaitEvent(ps, P.ev_in)` — so the peer's window already waits on that launch, and its first act is now the
+plane copies instead of a quantize. Verified against run 10's own commit, where the quantize is line 2791 and the
+enqueue marks 2798/2830: run 10's "(it runs after it today)" clause was stale. The order is now *enforced*, not
+incidental: `fp4_planes` says this layer's planes were rounded, the leg refuses with
+`prefill: the peer's FP4 planes were never rounded on the primary` if it is ever reached without them, and one
+`fp` (`fp4_ptrs`) names the planes for the quantize and the copies (fp4_flush's duplicate computation removed).
+Lifetime: the lead's plane bytes live until that layer's `cudaStreamWaitEvent(m.cs, ev_done|ev_res)` — the same
+guarantee `m.mixed` already relied on, so nothing new is pinned and the copy cannot be overtaken by the next layer.
+
+### 2. Buffers: one shrinks, the rest do not move
+
+`P.mixed` is now sized for the **routed** leg only (`T_max`, i.e. `stream_all_min()-1` = 2 559 tokens: 25 MiB at
+chunk 8 192 instead of 80). `peer_layout` sizes it, so `peer_bytes`' reserve follows automatically and the partner
+gets ~55 MiB (≈22 tier slots) back — **pin the tiers when comparing decode numbers against run 18.** Everything
+else is unchanged: `f_a4x`/`f_gsx` (already sized for the planes), `hx` (still the FP32 width, so the flag's wire
+fits), `Dm_b`, the ring. No new allocation anywhere.
+
+### 3. The parity obligation and how it is proved
+
+Bit-identity is by construction and the test asserts it, on two devices, in `prefill_fp4_test`'s peer share (512
+experts, top 10, four routings incl. hot experts, real geometry):
+
+1. the lead's planes (its own `quantize_tokens` of `x` on device 0, downloaded) equal the peer's own
+   `quantize_tokens` of the same bytes on device 1, byte for byte — the new line
+   `the lead's FP4 planes are the peer's own quantize's bytes: yes (0 of N bytes differ, 1444 B a token)`;
+2. the peer's rows computed with those shipped planes uploaded (no peer quantize at all) equal, per row and
+   bitwise, the rows it computed from its own planes — `the peer's rows from the shipped planes are its own:
+   yes (0 rows differ)`; the existing lines still hold those rows against the primary's whole layer and the BF16
+   return against those rows rounded.
+
+`peer_rows(...)` gained a `shipped` argument (the wire's bytes: codes+scales then token scales, uploaded verbatim).
+Both new lines must read `yes`; if either reads `NO` the change is **not shippable** — report the delta and stop
+for the reviewer, do not ship approximate planes. Because identity is proven this way, no PPL/KLD gate is needed:
+same bits, same rows, same combine. The gate is only required if the parity lines fail.
+
+### 4. The arithmetic, at run 14's geometry (the shipped functions transcribed into a scratch program)
+
+24 layers a stage, 512 experts a layer of 2 548 736 B, N = 2 560, K = 10, chunk 8 192, BF16 return rows.
+
+| card holds a layer | boot line's MiB/1024 tokens | placement crossover | pack ceiling |
+|---|---|---|---|
+| 256 of 512, FP32 acts | 840 | 18 205 | 21 239 |
+| 256 of 512, **planes** | **633** | **24 126** | **24 788** |
+| 200, FP32 → planes | 708 → 502 | 16 856 → 23 771 | 21 239 → 24 788 |
+| 128, FP32 → planes | 540 → 333 | 14 159 → 22 903 | 21 239 → 24 788 |
+
+Against run 18's measured 825-836 MiB/1024 tokens and ~19.3k crossover: the acts term is 24 x 10 240 B a token
+(251.6 MiB of those 825-836), so the boot line should print **618-629**, and the crossover moves up by the ratio of
+the two wires, ~19.3k → **~25.5k**, capped by the pack ceiling at **24 788** (the printed figure stays
+`min(chunk, crossover, ceiling)`, so at `--prefill 8192` it reads 8 192 either way — read the MiB field).
+
+The band's lanes re-price without a line of new logic (`acts` is now `chunk * peer_act_bytes`), and because the
+pair's lane got ~69 MiB a layer emptier, more of the RAM band moves to the partner:
+
+| card holds / band | share, FP32 acts (lanes lead/pair) | share, **planes** |
+|---|---|---|
+| 200 / 112 | 1/8, r=11, 245 / 244 MiB | **2/8, r=32, 194 / 192 MiB** |
+| 200 / 160 | 2/8, r=47, 274 / 272 | **3/8, r=56, 252 / 211** |
+| 160 / 192 | 3/8, r=81, 269 / 268 | **4/8, r=96, 233 / 211** |
+| 128 / 256 | 4/8, r=128 (row cap), 311 / 280 | 4/8, r=128, 311 / **211** |
+| 120 / 200 | 4/8, r=97, 250 / 249 | **5/8, r=118, 199 / 197** |
+
+`rows vs blob` (`prs.top`, 25 487) does not move: it bills rows, not activations.
+
+### 5. Predictions, written before any measurement (`--prefill 8192 --peer-ram-rows --tp-size 2 --gpu 0,1,2,3`)
+
+1. **`quant` collapses to the row tables**: stage A 21.3 → **0.2-1.0 ms**, stage B 13.5 → **0.2-1.0**. What is left
+   between `kPAct` and `kPQuant` is the two H2D copies of `src`/`f_rel` (~1.5 MB). If `quant` stays above a few ms
+   with the flag off, the peer is still quantizing — check `PeerPrefill::acts_planes` and the boot line.
+2. **`act` follows the bytes down ~7x** (80 MiB a layer → 11.3 MiB): whatever run 18 measured for `act`, expect
+   ~1/7 of it, floored by the copies' issue cost (~0.2-0.5 ms).
+3. **The peer's straggler term**: stage A 18.0 → **11-17 ms**, stage B 40.1 → **26-38** (the peer's window loses at
+   most its quantize). If the straggler does not move at all, the peer was not the critical path and the win is
+   bytes-only — say so; the next lever stays run 19's phase-separated link scheduling.
+4. **Prefill: 1905 → 1930-2050 t/s at 8192.** Flat is possible and would mean the peer's window overlaps the lead's
+   work already; read (1)-(3), not the headline.
+5. **Boot lines**: `acts cross as the lead's FP4 planes` and `its activations as the lead's FP4 planes`;
+   618-629 MiB/1024 tokens; the band's `num/8` at or above the FP32-acts boot's, and `(peer read N from RAM)`
+   rises with it (more band moved). `--peer-acts-fp32` on the same boot must print the FP32 clauses and reproduce
+   run 18's act/quant split — that is the A/B and the byte-identity control.
+6. **Decode is untouched** (this leg is prefill-only): solo t/s and acceptance should sit inside run 18's spread;
+   the tier gained ~22 slots per stage, so pin before comparing.
+
+### Merge surface (the second worker is in this file's peer-ring region; reviewer resolves)
+
+`src/prefill/prefill.cpp`, in order: (a) new `peer_act_bytes` after `peer_row_bytes`; (b) `PeerPrefill`'s
+`acts_planes` + `act_bytes()` + `f_a4x`'s comment; (c) `peer_ram_share`'s signature and its `acts` line;
+(d) `peer_layout`'s `mixed` line only; (e) `make_peer`'s signature, `acts_planes`, and the `peer GPU` line's new
+clause; (f) `peer_link` and `peer_fp4_ceiling`'s acts term; (g) `Prefill::peer_bytes` and `Prefill::set_peer`
+signatures, the three price calls, the `peer fp4 crossover` line's `acts cross as` clause; (h) the chunk walk's
+`fp4_planes` declaration beside `peer_now`; (i) the `fp` (`fp4_ptrs`) hoist above `if (use_mmq)` and the
+`if (fp4_l)` quantize's comment + flag; (j) the FP4 leg's **activation-transport block** — from the
+`// The layer's activations to the peer's card` comment through `m.tm.pmark(tl, ChunkTiming::kPQuant, ps)`;
+(k) `fp4_flush`'s removed duplicate `fp4_ptrs` line. Nothing else.
+Untouched, and theirs: the partner ring (`pseq`/`p_live`/`p_publish`/`p_release*`/`wait_pissued`), the peer group
+loop below `kPQuant`, the row-return copies and `ev_dm`/`ev_grp`, the combine, the routed leg, `ChunkTiming`
+itself. Only (j) and (k) sit inside their region; (j) stops before `m.tm.groups(ngr)`.
+Other files: `include/basalt/prefill/prefill.hpp` (`set_peer`, `peer_bytes`), `include/basalt/program/options.hpp`,
+`src/program/generate.cpp` (help, the flag, 2 `peer_bytes` + 3 `set_peer` sites),
+`tests/cuda/prefill_fp4_test.cpp`, `docs/precision/index.md`.
+
+### Reviewer checklist
+
+- [ ] Boot this build (the wire is chosen at `set_peer`; an old process keeps the FP32 acts).
+- [ ] Both stages' `peer fp4 crossover`: `acts cross as the lead's FP4 planes`, the 618-629 MiB field, the lanes
+      and `num/8` against the `--peer-acts-fp32` boot (prediction 5).
+- [ ] `grep "peer GPU"` says `its activations as the lead's FP4 planes` (and `FP32 (--peer-acts-fp32)` on the A/B).
+- [ ] Chunk lines both ways: `act`, `quant`, `comp`, `rows`, peer-wait/straggler (predictions 1-4).
+- [ ] `prefill_fp4_test` on two devices: the two new lines both `yes`, all four routings; the old
+      bitwise-equal and BF16 lines unchanged; the bench line's third number (the shipped-planes pass).
+- [ ] Byte identity with the flag on: a long prompt's text should match the same build before this change
+      (`--peer-acts-fp32` = the predecessor path, same launches in the same order).
+- [ ] Tier reserve: the partner's `mixed` is 55 MiB smaller, so a pinned-tier decode comparison needs the same
+      `--peer-reserve-mib` reading on both boots.
+- [ ] If either new parity line is not `yes`: stop, do not ship the planes, report the delta.
+
+### Validated here (GPU untouched: the server is live, `:8000` never touched)
+
+Build green (`cmake --build build -j4`), no new warnings (the two `prefill.cpp`/`generate.cpp` warnings are the
+baseline's). `ctest -L cpu` 67/68, only the pre-existing `expert_multi_test` (this CPU lacks AVX512-VNNI/VBMI) —
+identical to the pre-change baseline run. `tp2_pair_test`, `qsa_head_split_test`, `session_head_shard_test`,
+`tp2_shard_weights_test` pass. `tools/check_platform_boundary.sh` and `tools/check_stderr_logging.sh` ok.
+`prefill_fp4_test` compiles; its two new lines need the reviewer's two devices. The crossover/ceiling/lanes table
+above is the shipped functions transcribed into a scratch program (not committed), same method as run 16.
+**Ready for reviewer measurement.**
