@@ -1525,7 +1525,7 @@ Verifier::~Verifier() {
         for (cudaEvent_t& e : wp_peer_) if (e) { cudaEventDestroy(e); e = nullptr; }
         cudaSetDevice(prev);
     }
-    for (cudaEvent_t& e : wp_) if (e) cudaEventDestroy(e);
+    if (wp_buf_ != nullptr) { cudaFree(wp_buf_); wp_buf_ = nullptr; }
     if (arena_b_) cudaFree(arena_b_);
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     if (row_bias_device_) cudaFree(row_bias_device_);
@@ -1984,12 +1984,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const int64_t r = l - lb_;
         if (r < 0 || r >= le_ - lb_) return;
         const size_t i = (size_t) r * 5 + (size_t) m;
-        if (i < wp_.size() && cudaEventRecord(wp_[i], cs) == cudaSuccess) wp_mask_[(size_t) r] |= (uint8_t) (1u << m);
+        if (i < wp_h_.size()) { gpu_stamp(wp_buf_, (int) i, cs); wp_mask_[(size_t) r] |= (uint8_t) (1u << m); }
     };
     auto wp_end = [&]() {
         if (!wp_on_) return;
         const size_t i = (size_t) (le_ - lb_) * 5;
-        if (i < wp_.size() && cudaEventRecord(wp_[i], cs) == cudaSuccess) wp_mask_[(size_t) (le_ - lb_)] = 1;
+        if (i < wp_h_.size()) { gpu_stamp(wp_buf_, (int) i, cs); wp_mask_[(size_t) (le_ - lb_)] = 1; }
     };
     const int hrow0 = batch_rec_ ? row_base_ : 0;   // a slot group's own hand-off rows
 
@@ -3721,59 +3721,67 @@ void Verifier::wp_ensure() {
     if (wp_on_ || wp_broken_) return;
     const int64_t L = le_ - lb_;
     if (L <= 0 || L > 64) { wp_broken_ = true; return; }
-    wp_.assign((size_t) L * 5 + 1, nullptr);
-    wp_mask_.assign((size_t) L + 1, 0);
-    bool ok = true;
-    for (cudaEvent_t& e : wp_)
-        if (ok && cudaEventCreate(&e) != cudaSuccess) { e = nullptr; (void) cudaGetLastError(); ok = false; }
-    if (ok && dm_ != nullptr && dm_->pdev >= 0) {   // the partner's span lives on the partner's streams
+    const size_t n = (size_t) L * 5 + 1;
+    bool ok = false;
+    if (cudaMalloc((void**) &wp_buf_, n * 8) == cudaSuccess) {
+        cudaMemset(wp_buf_, 0, n * 8);
+        wp_h_.assign(n, 0);
+        wp_mask_.assign((size_t) L + 1, 0);
+        ok = true;
+    } else {
+        (void) cudaGetLastError();
+        wp_buf_ = nullptr;
+    }
+    if (ok && dm_ != nullptr && dm_->pdev >= 0) {   // the partner's span lives on the partner's streams (plain records, no graph)
         int prev = 0;
         cudaGetDevice(&prev);
         if (cudaSetDevice(dm_->pdev) == cudaSuccess && cudaEventCreate(&wp_peer_[0]) == cudaSuccess &&
             cudaEventCreate(&wp_peer_[1]) == cudaSuccess)
             wp_peer_dev_ = dm_->pdev;
-        else { (void) cudaGetLastError(); ok = false; }
+        else { (void) cudaGetLastError(); }
         cudaSetDevice(prev);
     }
-    if (!ok) {
-        for (cudaEvent_t& e : wp_) if (e) cudaEventDestroy(e);
-        if (wp_peer_[0] || wp_peer_[1]) {
-            int prev = 0;
-            cudaGetDevice(&prev);
-            if (dm_ != nullptr && dm_->pdev >= 0) cudaSetDevice(dm_->pdev);
-            for (cudaEvent_t& e : wp_peer_) if (e) { cudaEventDestroy(e); e = nullptr; }
-            cudaSetDevice(prev);
-        }
-        cudaGetLastError();
-        wp_.clear();
-        wp_broken_ = true;
-        return;
-    }
-    wp_on_ = true;
+    if (!ok) wp_broken_ = true;
+    else wp_on_ = true;
 }
 
 void Verifier::decode_phase(DecodePhase& out) {
     out = DecodePhase{};
-    if (!wp_on_) return;
+    if (!wp_on_) { out.why = "markers off"; return; }
     const int64_t L = le_ - lb_;
     const size_t end_i = (size_t) L * 5;
+    // one small read of the stamps at the window's own sync point; the stamps were written by graph
+    // nodes that finished with the window, so the copy waits for nothing but the drain itself
+    cudaMemcpy(wp_h_.data(), wp_buf_, wp_h_.size() * 8, cudaMemcpyDeviceToHost);
+    const auto at = [&](size_t i) { return wp_h_[i]; };
+    const auto gap = [](unsigned long long to, unsigned long long from) {
+        return (from != 0 && to != 0 && to >= from) ? (double) (to - from) : -1.0;   // ns; -1: a stamp is missing
+    };
     double attn = 0, experts = 0, wait = 0, combine = 0;
     for (int64_t l = 0; l < L; ++l) {
-        if (wp_mask_[(size_t) l] != 0x1F) return;   // a phase was never issued here
+        if (wp_mask_[(size_t) l] != 0x1F) {   // a phase was never issued here
+            static char whybuf[64];
+            std::snprintf(whybuf, sizeof whybuf, "layer %lld mask %x", (long long) l, wp_mask_[(size_t) l]);
+            out.why = whybuf;
+            return;
+        }
         const size_t b = (size_t) l * 5;
-        float ms = 0;
-        if (cudaEventElapsedTime(&ms, wp_[b], wp_[b + 1]) != cudaSuccess) return;
+        double ms = gap(at(b + 1), at(b)) / 1e6;
+        if (ms < 0) { out.why = "attn stamp missing"; return; }
         attn += ms;
-        if (cudaEventElapsedTime(&ms, wp_[b + 1], wp_[b + 2]) != cudaSuccess) return;
+        ms = gap(at(b + 2), at(b + 1)) / 1e6;
+        if (ms < 0) { out.why = "experts stamp missing"; return; }
         experts += ms;
-        if (cudaEventElapsedTime(&ms, wp_[b + 2], wp_[b + 3]) != cudaSuccess) return;
+        ms = gap(at(b + 3), at(b + 2)) / 1e6;
+        if (ms < 0) { out.why = "wait stamp missing"; return; }
         wait += ms;
-        if (cudaEventElapsedTime(&ms, wp_[b + 3], wp_[b + 4]) != cudaSuccess) return;
+        ms = gap(at(b + 4), at(b + 3)) / 1e6;
+        if (ms < 0) { out.why = "combine stamp missing"; return; }
         combine += ms;
     }
-    if (wp_mask_[end_i] == 0) return;   // the run never reached the stage's end
-    float tot = 0;
-    if (cudaEventElapsedTime(&tot, wp_[0], wp_[end_i]) != cudaSuccess) return;
+    if (wp_mask_[(size_t) L] == 0) { out.why = "stage end never marked"; return; }   // the run never reached the stage's end (the mask is indexed by layer, not by stamp slot)
+    double tot = gap(at(end_i), at(0)) / 1e6;
+    if (tot < 0) { out.why = "total stamp missing"; return; }
     out.attn = attn;
     out.experts = experts;
     out.wait = wait;
@@ -3782,9 +3790,11 @@ void Verifier::decode_phase(DecodePhase& out) {
     out.rest = tot - (attn + experts + wait + combine);
     if (wp_peer_dev_ >= 0 && wp_peer_[0] != nullptr && wp_peer_[1] != nullptr) {
         float pp = 0;
-        if (cudaEventElapsedTime(&pp, wp_peer_[0], wp_peer_[1]) == cudaSuccess) out.peer_push = pp;
+        cudaError_t e = cudaEventElapsedTime(&pp, wp_peer_[0], wp_peer_[1]);
+        if (e == cudaSuccess) out.peer_push = pp;
+        else out.why = (e == cudaErrorNotReady) ? "peer push not ready" : cudaGetErrorString(e);
     }
-    out.ok = true;
+    out.ok = out.why == nullptr;
 }
 
 // The device-planned tail's window start: residency tables, the flag words, and the peer card's persistent window.
