@@ -1097,3 +1097,26 @@ Build green (`cmake --build build -j4`). `ctest -L cpu` 66/67 with only the pre-
 `expert_multi_test` (this CPU lacks AVX512-VNNI/VBMI). `tools/check_platform_boundary.sh` and
 `tools/check_stderr_logging.sh` ok. No engine start, no `basalt-ctl`, nothing bound on :8000.
 GPU runs are the reviewer's.
+
+## RUN 13 — the gate opened; the wall moved to the RAM tier (reviewer measurement, merged binary 3c3f9d80)
+
+Sweep with `set_peer` live (boot line: `peer GPU 1/3 computes its experts' rows ... up to <chunk> tokens`):
+
+| --prefill | fresh prefill | stage A layer | stage B layer | blobs A | blobs B |
+|---|---|---|---|---|---|
+| 8192 | **1393 t/s** | 220.6 ms | 155.7 ms | 114.3 | 31.1 |
+| 4096 | 1010 t/s | 159.1 ms | 134.4 ms | 106.4 | 91.5 |
+| (12288, pre-fix) | 1074 t/s | — blob regime, no peer compute (crossover 10 619) | | | |
+
+- The FP4/p2p peer path WORKS where designed: stage B at 8192, blobs 82.8 -> 31.1, layer 181 -> 155.7.
+- Stage A regressed: the ~719 MiB peer-buffer reserve shrinks the partner's tier before fill; its misses
+  (RAM band) grew, and RAM rows still blob to the LEAD (the peer covers only its own held band).
+- 4096 loses on both stages (fixed costs + tier dynamics; lead-experts ~101-116 both stages).
+- Verdict: **the wall is the RAM-tier blob feed on the lead's lanes, chunk-size-invariant in total bytes.**
+  The sweep's peak is 8192 = 1393 t/s. The end-to-end gate (~2 600) is NOT met by the gate fix alone.
+- Next lever (evidence-backed): make the peer a **second RAM reader** — the partner pulls RAM-band blobs
+  over its own (idle) PCIe lanes and computes those rows too; the lead's link keeps only prompt uploads.
+  Stage A blobs 114 ms -> ~57, stage A layer -> ~120: projected ~2 400-2 600 t/s at 8192.
+- Decode: concurrent wall 28.4-33.4 ms (3-4 rows), GPU-reach wait 18-19.2; tg solo 77.1 t/s, hit 94.7%,
+  pcie 46.6% — decode parity holds at 8192. Per-stage decode profile lines report `not measured` under
+  graph capture (run 12's flagged risk); fix pass owed before DECODE-NEXT item 1 can be judged.
