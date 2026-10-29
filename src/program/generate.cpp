@@ -7407,6 +7407,9 @@ int main(int argc, char** argv) {
         const int S_all = S;
         basalt::spec::DraftPolicy bpolicy(S);   // the lookup-or-MTP choice, costs per row
         double bt_draft = 0, bt_draft_last = 0;
+        // the window's phase line: the last window's draft and commit times and the chain's GPU-reach wait, for the deltas
+        double wp_draft0 = 0, wp_commit0 = 0, wp_wait0 = 0;
+        int64_t wp_win = 0;
         int64_t bt_slotwin = 0, bt_dr_off = 0, bt_dr_acc = 0;
         std::vector<std::pair<std::vector<int32_t>, uint64_t>> bscript((size_t) std::max(o.batch, 0));
         const bool bdigest = basalt::core::exp_flag("concur5_digest", 0) != 0;
@@ -7970,6 +7973,12 @@ int main(int argc, char** argv) {
                 bt_miss0 = drive.d.multi_misses; bt_hits0 = drive.d.cache_hits; bt_pcie0 = drive.d.pcie_experts;
             }
             const Clock::time_point w0 = Clock::now();
+            {
+                wp_commit0 = bt_commit;
+                wp_draft0 = bt_draft;
+                wp_wait0 = ver.ms_wait;
+                for (size_t k = 0; k < stages.size(); ++k) wp_wait0 += stages[k]->ver.ms_wait;
+            }
             if (!ver.run_slot_segs(rows, lens, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                 return false;
@@ -8132,6 +8141,46 @@ int main(int argc, char** argv) {
                 bt_commit += msd(c0, Clock::now());
             }
             basalt::core::progress().busy.store(was_busy);
+            // the window's phase line, for the pair topology: every 32 windows, or every window with
+            // --exp decode_profile=1; the per-stage GPU phases are read at the window's own syncs, so the
+            // line adds no wait
+            if (stages.size() > 0) {
+                ++wp_win;
+                static const bool wp_every = basalt::core::exp_flag("decode_profile", 0) != 0;
+                if (wp_win % 32 == 0 || wp_every) {
+                    auto f2 = [](double v) { char b[32]; std::snprintf(b, sizeof b, "%.1f", v); return std::string(b); };
+                    const double wall = msd(w0, Clock::now());
+                    const double run_ms = msd(w0, w1);
+                    const double commit_ms = bt_commit - wp_commit0;
+                    const double emit_ms = msd(w2, w3);
+                    const double draft_ms = bt_draft - wp_draft0;
+                    int wp_tokens = 0;
+                    for (int sg = 0; sg < S; ++sg) wp_tokens += n_keep[sg];
+                    double gw = ver.ms_wait;
+                    for (size_t k = 0; k < stages.size(); ++k) gw += stages[k]->ver.ms_wait;
+                    gw -= wp_wait0;
+                    std::string line = "window " + std::to_string(wp_win) + ", " + std::to_string(S) + " slots, " +
+                                       std::to_string(R) + " rows, " + std::to_string(wp_tokens) + " tokens, " +
+                                       (S > 1 ? "concurrent" : "solo") + ": wall " + f2(wall) + " ms = run " +
+                                       f2(run_ms) + " + commit " + f2(commit_ms) + " + emit " + f2(emit_ms) +
+                                       " + draft " + f2(draft_ms) + "; GPU-reach wait " + f2(gw) + " ms;";
+                    std::vector<basalt::core::Verifier::DecodePhase> ph(stages.size() + 1);
+                    ver.decode_phase(ph[0]);
+                    for (size_t k = 0; k < stages.size(); ++k) stages[k]->ver.decode_phase(ph[k + 1]);
+                    for (size_t k = 0; k <= stages.size(); ++k) {
+                        char b[160];
+                        if (!ph[k].ok)
+                            std::snprintf(b, sizeof b, "; stage %zu: not measured", k + 1);
+                        else
+                            std::snprintf(b, sizeof b, "; stage %zu: %.1f ms = attn %.1f + experts %.1f + wait %.1f + "
+                                             "combine %.1f + rest %.1f, peer push %.1f",
+                                         k + 1, ph[k].total, ph[k].attn, ph[k].experts, ph[k].wait, ph[k].combine,
+                                         ph[k].rest, ph[k].peer_push);
+                        line += b;
+                    }
+                    basalt::log::info("basalt decode profile", "%s", line.c_str());
+                }
+            }
             if (!batch_on() && bt_windows > 0) {
                 const double w = (double) bt_windows, wall = msd(bt_start, Clock::now());
                 const double L = (double) g.n_layers;

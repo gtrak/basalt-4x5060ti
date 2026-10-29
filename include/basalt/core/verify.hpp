@@ -365,6 +365,18 @@ public:
     /// --profile: GPU stage times of the windows since the last call (ms per window), as one line; empty when off.
     std::string profile_report();
 
+    /// The stage's last window, in disjoint GPU phases (ms): attn (the mixer and its hyper-connections, to the
+    /// router), experts (the lead's own MoE compute, plan waits included), wait (the final spin for the peer's
+    /// rows and the CPU pool's), combine (the partials' add and the layer's tail), rest (everything else of the
+    /// stage's window, head included).  attn + experts + wait + combine + rest = total.  peer_push is the partner
+    /// card's window span (its push side of the pair sync), 0 without a peer window.  Read at the window's own
+    /// syncs, so it adds no wait; ok is false when the window's markers were not all reached.
+    struct DecodePhase {
+        double attn = 0, experts = 0, wait = 0, combine = 0, rest = 0, total = 0, peer_push = 0;
+        bool ok = false;
+    };
+    void decode_phase(DecodePhase& out);
+
 private:
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool main_high_ = false;
@@ -515,6 +527,15 @@ private:
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
+    // the batch window's per-phase markers: events recorded inside the captured window graph as the layers issue
+    // (five per layer, then the stage end), read where the run already waits for the GPU.  The partner card's
+    // window span is bracketed on its own stream.
+    bool wp_on_ = false, wp_broken_ = false;
+    std::vector<cudaEvent_t> wp_;
+    std::vector<uint8_t> wp_mask_;
+    cudaEvent_t wp_peer_[2] = {};
+    int wp_peer_dev_ = -1;
+    void wp_ensure();
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;
