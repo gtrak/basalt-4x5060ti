@@ -8221,7 +8221,8 @@ int main(int argc, char** argv) {
                     for (size_t k = 0; k <= stages.size(); ++k) {
                         char b[160];
                         if (!ph[k].ok)
-                            std::snprintf(b, sizeof b, "; stage %zu: not measured", k + 1);
+                            std::snprintf(b, sizeof b, "; stage %zu: not measured%s", k + 1,
+                                          ph[k].why != nullptr ? (std::string(" (") + ph[k].why + ")").c_str() : "");
                         else
                             std::snprintf(b, sizeof b, "; stage %zu: %.1f ms = attn %.1f + experts %.1f + wait %.1f + "
                                              "combine %.1f + rest %.1f, peer push %.1f",

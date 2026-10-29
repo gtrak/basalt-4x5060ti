@@ -374,6 +374,7 @@ public:
     struct DecodePhase {
         double attn = 0, experts = 0, wait = 0, combine = 0, rest = 0, total = 0, peer_push = 0;
         bool ok = false;
+        const char* why = nullptr;   // when !ok: which read failed (diagnostics; string literals)
     };
     void decode_phase(DecodePhase& out);
 
@@ -531,7 +532,8 @@ private:
     // (five per layer, then the stage end), read where the run already waits for the GPU.  The partner card's
     // window span is bracketed on its own stream.
     bool wp_on_ = false, wp_broken_ = false;
-    std::vector<cudaEvent_t> wp_;
+    unsigned long long* wp_buf_ = nullptr;   // device: (L*5+1) %globaltimer stamps, the prof_ mould
+    std::vector<unsigned long long> wp_h_;
     std::vector<uint8_t> wp_mask_;
     cudaEvent_t wp_peer_[2] = {};
     int wp_peer_dev_ = -1;
