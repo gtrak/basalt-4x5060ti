@@ -1357,3 +1357,182 @@ Next levers, re-ranked by the measurement:
 3. Head-split attention into decode AND prefill (attn is now ~25% of the prefill layer: 52.6 of 217).
 4. The lead's resident-row floor (114.4 ms) only moves if someone else can compute the lead's tier —
    not plausibly; so post-RAM-reader the realistic ceiling is ~attn-split + balanced return: ~1 600-1 800.
+
+## RUN 16 — the return leg, priced and halved (BF16 result rows; the band share re-priced per stage)
+
+Run 14/15's addendum: with the pair reading RAM together, the wall is no longer the blob feed but the peer's
+RESULT-ROW RETURN — stage A `peer comp 105.3 rows 114.6 ms`, `peer-wait 36.3`; stage B `comp 83.5 rows 90.1`,
+`peer-wait 88.3` with lead-experts at 15.5. Two changes, both aimed at that leg: the rows cross as BF16 bits
+(half the bytes, rounded once in the product that made them), and the band share is priced against the pair's
+link instead of the blob's own, per stage. One flag: `--peer-rows-fp32`.
+
+### 1. BF16 return rows
+
+Measured at stage A: 47 153 peer row-visits a layer x 2560 x 4 B = **483 MB a layer back over the pair's link**,
+against 80 MiB a layer of activations going out — the return is the big leg. BF16 halves it: one rounding
+(~2^-8 relative), no accumulation, and BF16's exponent is FP32's, so there are no per-row scales to manage and no
+outlier a row can overflow — the row is already FP4-rounded on its way in.
+
+- **Peer side, fused into the epilogue** (`moe_fp4.hpp/.cu`): `fp4::Product::dst16` / `fp4::Group::dm16`. Set, the
+  down product's epilogue stores `bf16x2(acc * g)` (a 4-byte pair per two values, `basalt::kernels::bf16_from_f32`
+  — the engine's RNE with the NaN clause) instead of a `float2`; a third template argument on `gemm_kernel`,
+  instantiated only for the plain (`<false,false,true>`) product, so the SwiGLU output and the primary's own rows
+  keep the F32 store path and every bit they produce today. `run()` refuses a product with both destinations.
+- **Lead side, fused into the combine's load** (`kernels.cu::moe_combine_kernel<ROWS16>`): the peer's rows land in
+  the **first half of the bytes their block of `Dm` would take as FP32** — `peer_row_bytes()` is the one place that
+  says the width, so the price, the crossover, the copies and the combine all count the same bytes. No new buffer
+  anywhere: not on the peer (its `Dm_b` staging keeps its FP32 size and BF16 uses half of it), not on the lead
+  (a BF16 mirror of `Dm` would have cost 419 MiB at chunk 8192). `moe_combine_rows16` reads each of a token's 10
+  rows from the plane it is in — one pass, one predicate per row, no second kernel. The FP32 combine is a separate
+  instantiation of the same template and is byte-for-byte the kernel it replaces.
+- The row block is `[rows_local, T*K - rows_cpu)`: the lead writes `[0, rows_local)`, the peer's copies write its
+  half-block, the CPU share writes the tail — three disjoint ranges, none of them touched by another path. Byte
+  arithmetic checked on the host (writes land inside the block, 16-byte aligned, and every value the peer wrote is
+  what the combine's indices read).
+- **The routed (sub-`stream_all_min`) peer leg stays FP32**: its products are the MMQ ones, which store FP32, and
+  the lead picks the combine variant per layer from which leg ran. The RAM band never rides that leg.
+- `--peer-rows-fp32` (`options.hpp`, `generate.cpp`, `set_peer`, `peer_bytes`): the FP32 wire, the FP32 price and
+  the FP32 combine — the A/B, and the quality gate's control.
+
+### 2. The share re-priced, per stage
+
+`peer_ram_share` billed a moved band expert's rows (`w`) against its blob (`B`) on the LEAD's link, and balanced
+`(band-r)*B + (held+r)*w` against `acts` — which put the rows on the wrong lane and made `w` look small, so both
+stages landed on the row cap (4/8) while stage B's peer drowned in its own return. Now the two lanes are what the
+measurement says they are:
+
+- the lead's own inbound link: `(band - r) * B` — the blobs it still pulls from RAM;
+- the pair's link: `acts + (held + r) * w` — the chunk's activations out (`chunk*N*4`) plus every row the peer
+  sends back, its held experts' included, at the wire's width (`peer_row_bytes`).
+
+`r* = (lead - pair) / (B + w)`, still capped at half the chunk's rows, still `PeerRamShare::kDen` eighths, still
+counted in id order by `taken()`, still over one stage's layers only (`acts`, `held` and the band are the stage's
+own, so a pair's two stages are priced apart and the boot line prints the stage's layer range with both lanes'
+MiB). `peer_link` and `peer_fp4_ceiling` bill the rows at the same width, so a BF16 return widens the FP4 crossover
+and an FP32 return narrows it; `peer_bytes` takes the flag, so the reserve can never be sized for a narrower wire
+than the one the run picks. `top` (the longest chunk whose band expert's rows still weigh less than its blob)
+follows the width: 25 487 tokens at BF16, 12 743 at FP32.
+
+### The arithmetic at run 14's geometry (the shipped `peer_ram_share`, compiled against stubs)
+
+24 layers, 512 experts a layer of 2 548 736 B, N = 2560, K = 10, chunk 8192; `w` = 0.78 MiB a band expert at BF16,
+1.56 MiB at FP32; `acts` = 80 MiB a layer.
+
+| card holds | partner holds | band | share, BF16 wire | lanes at it (lead / pair, MiB a layer) | share, `--peer-rows-fp32` |
+|---|---|---|---|---|---|
+| 256 | 256 | 0 | off: no RAM band | — | off: no RAM band |
+| 200 | 200 | 112 | **1/8** (r = 11) | 245 / 244 | **off**: the pair's link already carries more |
+| 200 | 160 | 152 | 3/8 (r = 51) | 245 / 244 | 1/8 |
+| 160 | 160 | 192 | 3/8 (r = 81) | 269 / 268 | 1/8 |
+| 128 | 128 | 256 | 4/8 (r = 128) | 311 / 280 | 3/8 |
+| 200 | 120 | 192 | 4/8 (r = 91) | 245 / 244 | 2/8 |
+| 120 | 200 | 192 | 2/8 (r = 56) | 330 / 280 | 1/8 |
+| 230 | 230 | 52 | off: the pair's link already carries more | 126 / 259 | off |
+
+Read it as: the pair's link is the tight lane, so a partner already carrying half the chunk's rows takes no band at
+all, and one carrying less takes only what fills its link. Run 14's 200/200/112 goes from 4/8 to **1/8** — the
+share is now a lever the measurement can move, not a cap both stages saturate.
+
+### What does not move
+
+No blob leg, no outgoing activation plane, no FP4 plane, no ring, no row layout. `peer_bytes` is unchanged in
+bytes (the staging is still sized for FP32 rows). With `--peer-rows-fp32` the only differences from today are the
+boot line's two new clauses. With the peer absent, none: the FP32 combine instantiation, the lead's own F32
+epilogue and the old peer legs are all still there.
+
+### The lines to grep
+
+```
+grep "peer fp4 crossover" log   # ...; the share is on, chunks of N tokens or less, ...; rows cross as BF16; RAM rows on, 1/8 of 2688 band experts of layers 0-24 over 24 layers read on the partner's own link: 245 MiB of blobs a layer left on the lead's link against 244 MiB a layer of activations and rows on the pair's, to 25487 tokens, its ring 48 slots
+grep "peer GPU" log             # ... and a card-to-card copy, its rows back as BF16, with compact group buffers; ...
+grep "peer chunk at token" log  # ... lead-experts A peer-wait B ... peer act a quant q comp c rows r ms
+```
+`rows cross as FP32 (--peer-rows-fp32)` and `its rows back as FP32 (--peer-rows-fp32)` are the flag's signatures;
+`RAM rows off (--peer-ram-rows)`, `off: the FP4 share is off`, `off: no RAM band, every expert of the stage is on a
+card`, `off: its rows outweigh its blob at N tokens` and the new `off: the pair's link already carries more than the
+lead's at N tokens` are the band's verdicts. The two stages' lines must be readable apart: they now name their
+layers (`of layers 0-24` / `of layers 24-48`).
+
+### Predictions, written before any measurement (stage A = layers 0-23, `--prefill 8192 --peer-ram-rows`, run 14/15's box)
+
+Run 14/15's baseline: stage A `comp 105.3 rows 114.6`, `peer-wait 36.3`, `blobs 101.9`, layer 217.0, prefill
+1406 t/s; stage B `comp 83.5 rows 90.1`, `peer-wait 88.3`, `lead-experts 15.5`, layer 160.8.
+
+1. **`rows ms` is the field that must move.** Two effects stack: half the bytes per row, and (at run 14's
+   placement) roughly a third fewer peer row-visits. Expect stage A **40-70 ms** (from 114.6) and stage B
+   **35-60 ms** (from 90.1). The A/B that separates the two effects is `--peer-rows-fp32` on the same boot: with
+   the price following the wire it should land back near **100-125 ms** at stage A with the band `off` — i.e. if
+   FP32 rows come back at ~115 ms while BF16 comes back at ~55 ms, the leg was byte-bound and the halving is worth
+   what it cost. If BF16 barely moves `rows ms`, the leg is NOT byte-bound (the copy span is the peer's compute
+   draining group by group) and the next lever is the copy engine's scheduling, not the format. Say which.
+2. **`peer-wait` follows it down**: stage A 36.3 -> **5-20 ms**, stage B 88.3 -> **15-40 ms**. Stage B should move
+   proportionally more (its peer was the straggler at 51% of the rows and now takes no band if it already holds
+   half the experts). If stage B's `peer-wait` stays above ~60 ms while its `comp` is under 90, the return is
+   queued behind something other than compute — look at `groups ... max` there.
+3. **`blobs on the copy stream` goes back up, on purpose**: stage A 101.9 -> **108-118 ms**, because the lead
+   keeps ~42 more band blobs a layer than at 4/8. This is the trade the price is making; the pair's link was the
+   wall, the lead's link is not (yet). If prefill t/s drops more than 2%, the price is too harsh — the first thing
+   to check is whether the boot line's two lanes really are balanced at the share it chose (they should print
+   within a few percent of each other whenever the row cap is not binding).
+4. **The two boot lines print different shares.** At similar placements they will print the same number and that is
+   fine; what must not happen any more is both saturating the row cap at 4/8. Read `experts held` and the lanes.
+5. **`(peer read N from RAM)` roughly halves or less** (9224 -> order **3000-5000**) at stage A, since the share
+   is 1/8 rather than 4/8; `expert-visits peer` drops with it. A stage whose line reads `off: the pair's link
+   already carries more...` must show `peer read 0 from RAM`.
+6. **Prefill: 1390-1440 t/s, i.e. flat.** Both walls are moved at once, in opposite directions, and the lead's own
+   floor (attn 52.6 + its resident rows 114.4) is untouched by either. Do not read a flat number as a failed run:
+   read `rows ms` and `peer-wait`, which are what this change is about.
+7. **Numerics**: peer-computed rows now enter the combine's sum with 8 mantissa bits. Greedy identity against a
+   run without the peer is NOT expected. The gate is PPL/KLD (below).
+
+### PPL quality-gate protocol (same build, `--peer-rows-fp32` against the default)
+
+`basalt-bench --quality` (`tools/ppl_gate.py`, wikitext-2, 512-token chunks, rows 256-510 through the decode path
+against the Q8_0 base) twice, same box, same power limit, tiers pinned (`--adapt-swaps 0 --peer-adapt-swaps 0`),
+`--prefill 8192 --peer-ram-rows` both times, once with `--peer-rows-fp32` and once without:
+
+- record both boot lines (their shares may legitimately differ — the price bills the wire, so the FP32 boot gets a
+  smaller band); the gate is the shipped default against the escape hatch, not two identical placements;
+- report PPL, KLD mean and same-top-1 for both, plus the `peer read N from RAM` of each, so a quality difference
+  can be told apart from a different amount of work on the peer;
+- the acceptance is that the BF16 boot is within the run-to-run spread of the FP32 boot on PPL and KLD. FP4
+  activation rounding already dominates this error budget (index.md: gate-wide PPL 2.9556 vs 2.9547 between FP4 and
+  MMQ prompt paths); one BF16 rounding of a row that is then multiplied by a router weight should sit far inside it.
+  If it does not, the peer's rows are being rounded somewhere twice — check `fg.dm16` is set exactly once, and that
+  `moe_combine_rows16`'s `[lo, hi)` matches the block the peer's copies wrote.
+
+### Reviewer checklist
+
+- [ ] Both stages' `peer fp4 crossover` lines: share, layers, the two lanes, `rows cross as BF16`.
+- [ ] Stage A and B chunk lines: `rows ms`, `peer-wait`, `comp`, `blobs`, both with the default and with
+      `--peer-rows-fp32` (predictions 1, 2, 3, 5).
+- [ ] `grep "peer GPU"` says `its rows back as BF16` (and `FP32 (--peer-rows-fp32)` on the control boot).
+- [ ] `prefill_fp4_test` (two devices): the new line `the BF16 return leg's rows are those rounded: yes (0 values
+      differ)` and the bench line's second number.
+- [ ] A short prompt's text unchanged against the same build with `--peer-rows-fp32` is NOT expected; a long prompt
+      should differ only in the last bits of a few rows. Greedy identity holds only for single-card runs.
+- [ ] `basalt-bench --quality` both ways (above).
+- [ ] Nothing was pinned to a measured bandwidth: re-running with the power limit changed should only move the
+      numbers, not which side of the balance the price picks.
+
+### What is NOT done, and the risks
+
+- No measurement (GPU untouched, no engine started, `:8000` unbound). Every number above is a prediction.
+- The price is still bytes, not measured bandwidth: it says which lane is fuller, not how long a lane takes. The
+  act of returning a row may cost more or less per byte than the act of sending an activation, and the price
+  treats them as one currency. If the reviewer's numbers show a consistent bias (e.g. the peer always the
+  straggler), the fix is a per-lane weight in `peer_ram_share`, one constant, said in the boot line.
+- The routed (MMQ) peer leg still returns FP32; a BF16 store there would mean the MMQ product kernels, which the
+  primary also uses for its own rows. Not touched: that leg is below the streaming floor.
+- The peer's `Dm_b` staging is still sized for FP32 rows (126 MiB for both buffers). Halving the staging too would
+  need the routed leg gone; left alone so the tier's reserve does not move under the reviewer.
+- A hot expert whose rows are cut across pieces writes its BF16 rows in several pieces; the pieces are disjoint
+  row ranges of the same plane, exactly as the FP32 path, and the existing `ev_dm` double-buffering is untouched.
+
+### Validated here (GPU untouched: the server is live)
+
+Build green (`cmake --build build -j4`). `ctest -L cpu` 66/67 (only the pre-existing `expert_multi_test`);
+`tp2_pair_test`, `qsa_head_split_test`, `session_head_shard_test`, `tp2_shard_weights_test` pass;
+`tools/check_platform_boundary.sh` and `tools/check_stderr_logging.sh` ok; no new compiler warnings. The host-side
+byte-arithmetic check of the aliased BF16 plane and the `peer_ram_share` transcription are described above
+(scratch programs, not committed). `prefill_fp4_test` compiles; its new BF16 line needs the reviewer's two devices.

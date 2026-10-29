@@ -1657,17 +1657,22 @@ static bool in_ram_band(const RamView& v, const core::PeerExperts& peer, int64_t
 }
 
 /// What the RAM band is worth to the pair.  Moving one of a layer's `band` experts to the partner takes its blob
-/// (`B`) off the LEAD's inbound link and puts its rows (`w`) on that same link as result rows, while the partner's
-/// own link - which otherwise only ever receives - takes the blob.  It pays while `w` is the smaller; the two links
-/// balance at `r`, where the lead carries (band-r)*B + (held+r)*w and the partner r*B + `acts` (the layer's
-/// activations going out).  The prompt's own uploads to the lead are not knowable at setup and are left out, which
-/// understates the lead's side, so the share it gives is the conservative one.  A partner never takes more than half
-/// the chunk's rows, the routed share's own bound.  Priced at `chunk`, the longest chunk the share is ever given.
+/// (`B`) off the LEAD's inbound link and puts its result rows (`w`) on the PAIR's link, which the chunk's outgoing
+/// activations already fill: it is that link's return leg a long chunk stops on, so a row is billed there, beside the
+/// activations, and never against the blob's own link.  The two lanes balance at `r`, where the lead still reads
+/// (band-r)*B from RAM and the pair's link carries `acts` out and (held+r)*w back - `held` the experts the partner
+/// already holds, whose rows cross whether or not the band moves.  The prompt's own uploads to the lead are not
+/// knowable at setup and are left out, which understates the lead's side, so the share it gives is the conservative
+/// one.  A partner never takes more than half the chunk's rows, the routed share's own bound.  Priced at `chunk`, the
+/// longest chunk the share is ever given, and over one stage's layers only: `acts`, `held` and the band are the
+/// stage's own, so a pair's two stages are priced apart.
 struct PeerRamShare {
     static constexpr int kDen = 8;            // the share's denominator, fixed so every card counts the band alike
     int64_t layers = 0, band = 0, take = 0;   // the layers with a band, its experts, and those the partner reads
+    int64_t heavy = 0;                        // of the stage's layers, those whose band's rows outweigh its blob
     int num = 0;                              // `take` of `band`, rounded to eighths
     int64_t top = 0;                          // the longest chunk whose expert's rows still weigh less than its blob
+    uint64_t lead = 0, pair = 0;              // the two lanes' bytes over those layers at the priced share
     /// The band experts the partner reads: `num` of every `kDen` of them, counted in id order, so the choice never
     /// depends on the routing and the price, the lead's stream and the row split all pick out the same ones.
     static bool taken(int64_t k, int num) { return k % kDen < num; }
@@ -1677,7 +1682,8 @@ static PeerRamShare peer_ram_share(const RamView& v, const core::PeerExperts& pe
                                    int64_t n_expert, int64_t chunk, bool rows_bf16) {
     PeerRamShare pr;
     if (n_expert <= 0 || chunk <= 0) return pr;
-    const uint64_t rb = peer_row_bytes(rows_bf16);   // the rows are billed at the width the wire actually has
+    const uint64_t rb = peer_row_bytes(rows_bf16);
+    const uint64_t acts = (uint64_t) chunk * N * 4;   // the layer's activations, out over the pair's link
     for (int64_t l = lb; l < le; ++l) {
         int64_t held = 0, band = 0;
         for (int32_t e = 0; e < n_expert; ++e) {
@@ -1687,17 +1693,19 @@ static PeerRamShare peer_ram_share(const RamView& v, const core::PeerExperts& pe
         if (band == 0) continue;
         const uint64_t B = core::PeerExperts::slot_bytes(l);
         const uint64_t w = (uint64_t) chunk * (uint64_t) K / (uint64_t) n_expert * rb;
-        if (w >= B) continue;   // its rows already outweigh its blob: leave the whole band on the lead
+        if (w >= B) { ++pr.heavy; continue; }   // its rows already outweigh its blob: leave the whole band on the lead
         ++pr.layers;
         pr.band += band;
         const int64_t top = (int64_t) (B * (uint64_t) n_expert / ((uint64_t) K * rb));
         pr.top = pr.top == 0 ? top : std::min(pr.top, top);
-        const uint64_t acts = (uint64_t) chunk * N * 4;
-        const uint64_t lead = (uint64_t) band * B + (uint64_t) held * w;
-        const uint64_t denom = 2 * B - w;   // > B, since w < B
-        int64_t r = (int64_t) ((lead > acts ? lead - acts : 0) / denom);
+        // one more expert moves `B` off the lead's link and puts `w` on the pair's: they meet at `r`
+        const uint64_t lead = (uint64_t) band * B, pair = acts + (uint64_t) held * w;
+        int64_t r = (int64_t) ((lead > pair ? lead - pair : 0) / (B + w));
         r = std::min(r, (int64_t) (n_expert / 2 - held));   // never more than half the chunk's rows
-        pr.take += std::max<int64_t>(0, std::min(r, band));
+        r = std::max<int64_t>(0, std::min(r, band));
+        pr.take += r;
+        pr.lead += (uint64_t) (band - r) * B;
+        pr.pair += acts + (uint64_t) (held + r) * w;
     }
     if (pr.take > 0 && pr.band > 0)
         pr.num = (int) std::min<int64_t>(PeerRamShare::kDen,
@@ -1886,6 +1894,7 @@ static PeerLink peer_link(const core::PeerExperts& peer, const RamView* v, int64
         if (held == 0 && moved == 0) continue;
         ++pl.layers;
         pl.held += held;
+        pl.ram += moved;   // of the bill, the ones only the partner's own link feeds
         pl.blobs += (uint64_t) (held + moved) * core::PeerExperts::slot_bytes(l);
         num += (uint64_t) N * 4 * (uint64_t) n_expert + (uint64_t) K * (uint64_t) (held + moved) * rb;
     }
@@ -1980,13 +1989,19 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
         band = "off (--peer-ram-rows)";
     else if (!ram_on)
         band = gate ? "off: the FP4 share is off"
+             : prs.heavy > 0 && prs.band == 0
+                 ? "off: its rows outweigh its blob at " + std::to_string(m.T_max) + " tokens"
              : prs.band == 0 ? "off: no RAM band, every expert of the stage is on a card"
-             : "off: its rows outweigh its blob at " + std::to_string(m.T_max) + " tokens";
+                             : "off: the pair's link already carries more than the lead's at " +
+                                   std::to_string(m.T_max) + " tokens";
     else
         band = "on, " + std::to_string(prs.num) + "/" + std::to_string(PeerRamShare::kDen) + " of " +
-               std::to_string(prs.band) + " band experts over " + std::to_string(prs.layers) +
-               " layers read on the partner's own link, to " + std::to_string(prs.top) + " tokens, its ring " +
-               std::to_string(PeerPrefill::kRing) + " slots";
+               std::to_string(prs.band) + " band experts of layers " + std::to_string(lb) + "-" + std::to_string(le) +
+               " over " + std::to_string(prs.layers) + " layers read on the partner's own link: " +
+               std::to_string(prs.lead / (prs.layers << 20)) + " MiB of blobs a layer left on the lead's link against " +
+               std::to_string(prs.pair / (prs.layers << 20)) +
+               " MiB a layer of activations and rows on the pair's, to " + std::to_string(prs.top) +
+               " tokens, its ring " + std::to_string(PeerPrefill::kRing) + " slots";
     basalt::log::info("basalt prefill",
                       "peer fp4 crossover %lld tokens: %llu MiB of activations and rows per 1024 tokens against "
                       "%llu MiB of partner-held blobs over %lld layers (%lld experts held, %lld band); the share is "
