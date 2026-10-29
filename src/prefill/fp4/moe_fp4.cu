@@ -243,15 +243,15 @@ __device__ __forceinline__ void load_stage(int stage, int kt, uint8_t* smem, con
     }
 }
 
-// One block: up to two consecutive 64-token tiles of an expert x 128 weight rows; each warp owns one tile's 64 tokens
-// and 32 rows, so a weight fragment feeds four token groups.  GATHER: a row's activations are its token's (token planes,
-// row -> token from ids); SWIGLU: the gate/up product's outputs leave as the tail-scaled SwiGLU of each gate/up pair.
 // Two products' values as one BF16 pair: the engine's own rounding (RNE, a NaN carried through), packed little-endian
 // so the pair is the row's two adjacent values in memory.
 __device__ __forceinline__ uint32_t bf16x2(float lo, float hi) {
     return (uint32_t) basalt::kernels::bf16_from_f32(lo) | ((uint32_t) basalt::kernels::bf16_from_f32(hi) << 16);
 }
 
+// One block: up to two consecutive 64-token tiles of an expert x 128 weight rows; each warp owns one tile's 64 tokens
+// and 32 rows, so a weight fragment feeds four token groups.  GATHER: a row's activations are its token's (token planes,
+// row -> token from ids); SWIGLU: the gate/up product's outputs leave as the tail-scaled SwiGLU of each gate/up pair.
 // Every output keeps the same MMA chain over K as the plain product of one tile, so the products are the same bits.
 // B16: the plain product's rows leave as BF16 bits (a peer card's return leg); the SwiGLU output never does.
 template <bool GATHER, bool SWIGLU, bool B16 = false>
