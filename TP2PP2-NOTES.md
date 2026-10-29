@@ -658,3 +658,40 @@ Build green at `-j4` (CUDA 13.2, sm_120).  `tp2_pair_test`, `tp2_shard_weights_t
    `peer access: N of M ordered pairs enabled` line plus the prefill t/s is the evidence.
 7. There is deliberately no flag for the transport: `p2p` follows the pair's peer access, so an A/B
    against the relay is `git checkout bd95c276^` for the prefill run, not a switch.
+
+## SESSION 2 RESULTS (10:30-11:15 UTC, 2026-10-29) — continuation + P2P + short-read 512
+
+The bottleneck question that unlocked it: the lead card of a tp2 pair is
+capacity-poor (dense 24 layers + head + session + arena leave ~5.9 GiB of
+expert room), so the rank split's cold tail on the partner starved the lead
+- 5.04 CPU-expert entries per layer-window vs the plain split's 1.83. The
+continuation placement (2bbfcdda: partner takes the NEXT-hottest slice after
+the lead's admissions) fixed the capacity inversion.
+
+| config | window (solo, matched depth) | solo t/s | prefill | hit |
+|---|---|---|---|---|
+| plain split (production) | 35.43 ms | 74-90 | 3750-3868 | 94-96% |
+| tp2 parity | 38.61 | 45 | 1049 | 53-78% |
+| tp2 rank (cold tail) | 40.75 | 45 | 1070 | 76.5% |
+| **tp2 continuation** | **25.29-25.85** | **76.5-81.3** | 1051-1076 | 94.9-96% |
+| tp2 continuation, real traffic | 31.69 solo-ish / 41-43 concurrent | 71.9-78.6 | read 245-1076 | 90-96% |
+
+Decode: -13% window vs production at matched depth; real-traffic solo within
+the historical band, concurrent ~7% behind (GPU-reach wait 12.6-13.8 vs 7.3-8.5
+- the pair sync under 2x rows is the remaining decode bottleneck).
+
+Prefill: P2P transport (bd95c276) did NOT move it (1051->1076) - the cost is
+the per-layer round-trip structure (primary attention -> combine -> peer MoE
+half -> merge), not the transport; the routed rate ~1050-1250 matches the old
+tier's prefill signature. Layer-block placement would remove routing but dies
+on lead capacity (3.2 GiB room vs 15.8 needed). Structural floor for this
+placement.
+
+Short-read: the windows path under tp2 ran a real 170-token read at 39.8 tok/s
+(4.3 s TTFT) - --short-read 512 set so aligned small reads go exclusive.
+Synthetic small reads could not be exercised: appends snap the prompt-cache
+reuse boundary (110592 of 122534 reused) and re-read ~12k tokens - a cache
+granularity x append interaction that turns misaligned appends into 11-15 s
+TTFT at the routed prefill rate; needs its own investigation.
+
+Live config: tp2 continuation + P2P + short-read 512, serving on :8000.
