@@ -572,6 +572,30 @@ void qsa_pair_free(QsaPair& p) {
 static bool qsa_prepare_one(QsaPair& p, const WeightRef& w, const std::string& name, int64_t col0, int64_t cols,
                             int64_t layer, int dev, std::string& err) {
     const uint64_t nb = qsa_native_bytes(w);
+    // The block width used to cut the native image is a MIRROR of the kernel's table (`qsa_native_block_elems`).
+    // Check it against the kernel's own byte figure before packing: a type added on one side and not the other
+    // then refuses here instead of slicing a weight at the wrong stride and producing a plausible product.
+    if (w.native_data) {
+        const int64_t be = qsa_native_block_elems(w.native_type);
+        if (be <= 0 || w.ne0 % be != 0) {
+            err = name + ": the native image's block width for type " + std::to_string(w.native_type) +
+                  " is unknown, so its columns cannot be cut";
+            return false;
+        }
+        try {
+            const uint64_t check =
+                basalt::kernels::native_mmvq_weight_bytes(w.native_type, (int) be, 1) * (uint64_t) (w.ne0 / be);
+            if (check != nb) {
+                err = name + ": the native image is " + std::to_string((unsigned long long) nb) +
+                      " B but the block figure implies " + std::to_string((unsigned long long) check) +
+                      " B - the split's table and the kernel's disagree";
+                return false;
+            }
+        } catch (const std::exception& e) {
+            err = name + ": the native image's size is not knowable: " + e.what();
+            return false;
+        }
+    }
     const uint64_t want = qsa_weight_cols_bytes(w, col0, cols, nb);
     if (want == 0) {
         err = name + ": its columns cannot be cut at column " + std::to_string((long long) col0) + " of " +

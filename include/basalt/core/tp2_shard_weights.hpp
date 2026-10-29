@@ -35,9 +35,22 @@
 
 namespace basalt::core {
 
-/// The native GGUF image's block width in values, from the GDN split's constant: the types the split supports
-/// pack 256 values per block along the input axis.
-constexpr int64_t kQsaNativeBlockCols = 256;
+/// The native GGUF image's block width in VALUES, for a given GGML type.  The native image is packed in blocks
+/// along the input axis - which is what makes a column cut possible at all - and the width is a property of the
+/// TYPE, not a constant: 32 values for the legacy forms (Q4_0, Q5_0, Q8_0, IQ4_NL, and Q2_0 as type 20), 64 for
+/// Q2_0 as type 42, 256 for the K-quants and the IQ wide types.  This table MIRRORS the switch in
+/// `native_mmvq_weight_bytes` (src/kernels/cuda/native_mmvq.cu); the two are checked against each other by
+/// `qsa_pair_prepare` before anything is packed, so a type added on one side and not the other refuses rather
+/// than cutting a weight at the wrong stride.  0 for a type the image cannot be cut with.
+inline int64_t qsa_native_block_elems(int native_type) {
+    switch (native_type) {
+        case 2: case 6: case 7: case 8: case 20: return 32;
+        case 42: return 64;
+        case 11: case 12: case 13: case 14: case 23:
+        case 16: case 17: case 18: case 21: case 22: case 29: return 256;
+        default: return 0;
+    }
+}
 
 /// Where one card's weight bytes are.  `codes`/`scales`/`offset` are the three canonical planes in the order the
 /// loader lays them out, `native` the native image when the tensor has one; `ne0`/`ne1` are the VIEW's shape, which
@@ -64,8 +77,10 @@ inline uint64_t qsa_plane_block_bytes(uint64_t plane_bytes, int64_t rows, int64_
 /// One block of the native image, for one row: the native blocks are 256 values wide (not `group_elems`), which
 /// is why the image needs its own figure.  0 when the tensor has no native image or the size does not divide.
 inline uint64_t qsa_weight_native_block_bytes(const WeightRef& w, uint64_t native_row_bytes) {
-    if (!w.native_data || native_row_bytes == 0 || w.ne1 <= 0 || w.ne0 % kQsaNativeBlockCols != 0) return 0;
-    return qsa_plane_block_bytes(native_row_bytes, w.ne1, w.ne0 / kQsaNativeBlockCols);
+    if (!w.native_data || native_row_bytes == 0 || w.ne1 <= 0) return 0;
+    const int64_t be = qsa_native_block_elems(w.native_type);
+    if (be <= 0 || w.ne0 % be != 0) return 0;   // a type whose image cannot be cut: refuse, never divide by it
+    return qsa_plane_block_bytes(native_row_bytes, w.ne1, w.ne0 / be);
 }
 
 /// True when the whole card's span of the input axis is legal to cut: on this form's blocks, for both the
@@ -83,7 +98,10 @@ inline bool qsa_weight_cols_fits(const WeightRef& w, int64_t col0, int64_t cols,
     if (w.offset_bytes && qsa_plane_block_bytes(w.offset_bytes, w.ne1, blocks) == 0) return false;
     if (w.has_offset != (w.offset_bytes != 0)) return false;
     if (w.native_data && qsa_weight_native_block_bytes(w, native_row_bytes) == 0) return false;
-    if (w.native_data && (col0 % kQsaNativeBlockCols != 0 || cols % kQsaNativeBlockCols != 0)) return false;
+    if (w.native_data) {
+        const int64_t be = qsa_native_block_elems(w.native_type);
+        if (be <= 0 || col0 % be != 0 || cols % be != 0) return false;
+    }
     return true;
 }
 
@@ -91,8 +109,9 @@ inline bool qsa_weight_cols_fits(const WeightRef& w, int64_t col0, int64_t cols,
 inline uint64_t qsa_weight_native_cols_bytes(const WeightRef& w, int64_t cols, uint64_t native_row_bytes,
                                              int64_t rows) {
     const uint64_t block = qsa_weight_native_block_bytes(w, native_row_bytes);
-    if (block == 0 || rows <= 0 || cols <= 0 || cols % kQsaNativeBlockCols != 0) return 0;
-    return block * (uint64_t) (cols / kQsaNativeBlockCols) * (uint64_t) rows;
+    const int64_t be = qsa_native_block_elems(w.native_type);
+    if (block == 0 || be <= 0 || rows <= 0 || cols <= 0 || cols % be != 0) return 0;
+    return block * (uint64_t) (cols / be) * (uint64_t) rows;
 }
 
 /// The bytes one packed column view costs: the three canonical planes with their spans copied out of every row,
@@ -141,7 +160,8 @@ inline QsaShardWeight qsa_pack_weight_cols(const WeightRef& w, int64_t col0, int
             gdn_gather_cols(base + w.codes_bytes + w.scales_bytes, rows, w.ne0, w.group_elems, offset_block, run,
                             out + v.codes_bytes + v.scales_bytes);
         if (v.native_bytes)
-            gdn_gather_cols((const uint8_t*) w.native_data, rows, w.ne0, kQsaNativeBlockCols,
+            gdn_gather_cols((const uint8_t*) w.native_data, rows, w.ne0,
+                            qsa_native_block_elems(w.native_type),
                             (size_t) qsa_weight_native_block_bytes(w, native_row_bytes),
                             {{col0, cols}},
                             out + v.codes_bytes + v.scales_bytes + v.offset_bytes);

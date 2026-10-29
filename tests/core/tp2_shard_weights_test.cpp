@@ -31,6 +31,8 @@ struct FakeWeight {
     int bits = 4;
     bool has_offset = true;
     bool with_native = true;
+    int native_type = 12;   ///< a 256-value-block K-quant by default; 8 is a 32-value legacy form
+    static constexpr int64_t kQsaFakeBlockFallback = 256;   ///< only for the fake's byte-fill with a bad type
     uint64_t native_row = 512;   ///< ONE row of the native image; the API takes the whole image's bytes
     uint64_t codes_bytes = 0, scales_bytes = 0, offset_bytes = 0;
     std::vector<uint8_t> canon, native;
@@ -77,13 +79,15 @@ struct FakeWeight {
         if (with_native) {
             native.resize((size_t) native_row * ne1);
             size_t n = 0;
-            const int64_t nblocks = ne0 / kQsaNativeBlockCols;
+            const int64_t nblocks = ne0 / (qsa_native_block_elems(w.native_type) > 0
+                                                       ? qsa_native_block_elems(w.native_type)
+                                                       : kQsaFakeBlockFallback);
             for (int64_t row = 0; row < ne1; ++row)
                 for (int64_t blk = 0; blk < nblocks; ++blk)
                     for (int64_t k = 0; k < (int64_t) (native_row / nblocks); ++k)
                         native[n++] = (uint8_t) (0x40 ^ (row * 13 + blk * 7 + k));
             w.native_data = native.data();
-            w.native_type = 12;
+            w.native_type = native_type;
         }
     }
     int64_t blocks() const { return ne0 / group; }
@@ -131,7 +135,8 @@ void the_column_view_is_the_wholes_bytes() {
                       f.ne1, blocks, 0, nb));
     CHECK(v.native != nullptr);
     CHECK(slice(v.native, v.native_bytes) ==
-          expect_rows(f.native, f.ne1, f.ne0 / kQsaNativeBlockCols, 0, (half / kQsaNativeBlockCols)));
+          expect_rows(f.native, f.ne1, f.ne0 / qsa_native_block_elems(f.w.native_type), 0,
+              (half / qsa_native_block_elems(f.w.native_type))));
     // the sizes the caller allocated for are exactly the sizes the view describes
     CHECK(v.codes_bytes + v.scales_bytes + v.offset_bytes + v.native_bytes == dst.size());
 }
@@ -211,6 +216,48 @@ void the_row_view_is_a_pointer() {
                       (size_t) v.codes_bytes) == 0);
     // no copy happened: the view points inside the loaded tensor
     CHECK(v.codes > base && v.codes < base + f.canon.size());
+}
+
+/// The native image is cut on ITS block width, which is a property of the GGML type: 32 values for the legacy
+/// forms, 64 for one Q2_0, 256 for the K-quants and the wide IQ types.  A 256-wide assumption would let a
+/// legacy-type span through that the kernel cannot decode from a partial block.
+void the_native_block_width_follows_the_type() {
+    CHECK(qsa_native_block_elems(8) == 32);    // Q8_0
+    CHECK(qsa_native_block_elems(2) == 32);    // Q4_0
+    CHECK(qsa_native_block_elems(42) == 64);   // Q2_0, the 64-wide one
+    CHECK(qsa_native_block_elems(12) == 256);  // Q4_K
+    CHECK(qsa_native_block_elems(23) == 256);  // IQ4_XS
+    CHECK(qsa_native_block_elems(99) == 0);    // not a native type at all
+    CHECK(qsa_native_block_elems(-1) == 0);
+
+    FakeWeight leg;
+    leg.ne0 = 1024;
+    leg.group = 32;        // so a 96-column span is legal on BOTH axes
+    leg.native_type = 8;   // 32-value native blocks
+    leg.native_row = 1024 / 32 * 34;
+    leg.build();
+    CHECK(qsa_weight_cols_fits(leg.w, 0, leg.ne0 / 2, leg.native_all()));
+    const uint64_t want = qsa_weight_cols_bytes(leg.w, 96, 96, leg.native_all());
+    CHECK(want > 0);
+    std::vector<uint8_t> d((size_t) want);
+    const QsaShardWeight v = qsa_pack_weight_cols(leg.w, 96, 96, leg.native_all(), d.data());
+    CHECK(v.ok);   // 96 is on the 32-value native blocks and on this tensor's canonical group
+    CHECK(v.native_bytes == (uint64_t) leg.ne1 * (96 / 32) * 34);
+    FakeWeight bad;
+    bad.build();
+    bad.w.native_type = 99;   // set after the build: the fake's own layout follows the type
+    CHECK(bad.w.native_data != nullptr);
+    CHECK(!qsa_weight_cols_fits(bad.w, 0, bad.ne0 / 2, bad.native_all()));
+    // a ROW view is unaffected: cutting along the output axis never splits a block, whatever its width
+    CHECK(qsa_weight_rows(bad.w, 0, 2, bad.native_all()).ok);
+
+    // a 256-wide image cannot be cut at 32, even where the canonical group allows it
+    FakeWeight kq;
+    kq.group = 32;
+    kq.native_type = 12;
+    kq.build();
+    CHECK(qsa_weight_cols_fits(kq.w, 0, 32, kq.native_all()) == false);
+    CHECK(qsa_weight_cols_fits(kq.w, 0, 256, kq.native_all()));
 }
 
 void what_is_refused() {
@@ -324,8 +371,12 @@ void the_artifacts_geometry_cuts_cleanly() {
     q.ne1 = 24 * 2 * 256;
     q.build();
     const QsaHeadRun qr = qsa_q_rows(r1, 256);
-    const QsaShardWeight vq = qsa_weight_rows(q.w, qr.start, qr.len, 0);
+    const QsaShardWeight vq = qsa_weight_rows(q.w, qr.start, qr.len, q.native_all());
     CHECK(vq.ok && vq.ne1 == qr.len);
+    // a tensor WITH a native image keeps using it: a row view that drops to the canonical planes would run a
+    // different decoder than the whole layer ran, and those two are not bitwise equal
+    CHECK(vq.native != nullptr && vq.native_bytes > 0);
+    CHECK(!qsa_weight_rows(q.w, qr.start, qr.len, 0).ok);
     CHECK(vq.codes == (const uint8_t*) q.canon.data() + (uint64_t) qr.start * (q.codes_bytes / (uint64_t) q.ne1));
 }
 
@@ -336,6 +387,7 @@ int main() {
     the_two_halves_are_the_whole_row();
     a_whole_view_is_the_tensor_itself();
     the_row_view_is_a_pointer();
+    the_native_block_width_follows_the_type();
     what_is_refused();
     the_sizes_agree_with_the_packer();
     the_artifacts_geometry_cuts_cleanly();
