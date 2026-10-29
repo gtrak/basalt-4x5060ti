@@ -589,3 +589,70 @@ split, one-push 2-way all-reduce with CPU oracles) is the reusable part.
 PRODUCTION RESTORED 07:07 UTC (37.3 GiB VRAM / 26 RAM / 0 spill / verified).
 The branch stands: 12 commits, build green, 66/67 CPU + 90/92 GPU (2 upstream),
 nothing measured beyond this file.
+
+## Run 8 — the peer's prefill rows and activations cross the link (direct P2P)
+
+The gap left after the continuation placement is prefill: 1051-1070 t/s against the plain split's
+3750-3868.  The peer's FP4 share of a streamed chunk was the one path written "WITHOUT DIRECT
+ACCESS": every layer the primary's normed activations went device->host and host->device through
+`hx`, and every group's result rows the same way through `hres[kRes]` - two link crossings per leg
+and 4 pinned buffers a pair, where the box's cards reach each other directly.  The routed-only peer
+path had always used `cudaMemcpyPeerAsync`; the FP4 one now does too.
+
+### What changed (`src/prefill/prefill.cpp`, `include/basalt/prefill/prefill.hpp`)
+
+- `PeerPrefill::p2p`, decided once in `make_peer`: `basalt::platform::gpu_peer_access()` and
+  `cudaDeviceCanAccessPeer` in BOTH directions between the primary's and the peer's card.  It is the
+  same predicate the boot's `cudaDeviceEnablePeerAccess` loop uses, so a pair the engine enabled
+  copies card to card and one it did not keeps the relay.
+- With `p2p`, the FP4 share runs the handshake the routed-only share already ran: `ev_in` on the
+  primary's compute stream, the activations' `cudaMemcpyPeerAsync` at the head of the peer's
+  `P.s`, per group `ev_grp` -> `P.s_out` -> the rows' `cudaMemcpyPeerAsync` into `m.Dm`, and
+  `ev_done` recorded on `P.s_out` as the layer's end (the relay keeps `ev_res` on `res_in`).
+- The relay stays: `hx`, `hres[]`, `x_out`, `res_in` and `ev_hx`/`ev_hx_free`/`ev_d2h`/`ev_h2d`/
+  `ev_res` are created only when `tf > 0 && !p2p`, so a pair with the link stops pinning
+  `Tp*N*4 + kRes*G*N*4` bytes of host RAM.  `Prefill::peer_bytes` is untouched: it priced the
+  peer's device buffers only, never the pinned staging.
+
+### Why it is safe, the two lifetimes that are not local
+
+- The peer's copy READS the primary's `m.mixed`.  The primary rewrites it for the next layer on
+  `m.cs`, which waits the layer's completion event before `moe_combine`; the activation copy is
+  ordered before every group on `P.s`, whose `ev_grp` orders `P.s_out`, so completion of the rows
+  implies the copy has read its bytes.  `order_peer` only holds experts with rows, so
+  `fp4::cut_pieces` always yields at least one group and the layer's event is always recorded.
+  This is the argument the routed-only path has always rested on; the FP4 path now shares it.
+- `P.Dm_b[b]` is not rewritten until `ev_dm[b]` - recorded on `P.s_out` after the copy that read
+  it - has passed, and `dm_live` is never cleared, so the wait survives a run switching between
+  the routed-only and the FP4 share across chunks (both now record `ev_done` on `P.s_out`).
+- Bits unchanged: same FP4 kernels, same activation bytes in `P.mixed`, same rows in `Dm`.  Only
+  the transport moved, so no `docs/precision/` page covers it.
+
+### Validated here (no GPU touched: the server is live)
+
+Build green at `-j4` (CUDA 13.2, sm_120).  `tp2_pair_test`, `tp2_shard_weights_test`,
+`qsa_head_split_test`, `session_head_shard_test` ok; `ctest -L cpu` 66/67 with only the known
+`expert_multi_test` AVX-512 environment failure; `check_platform_boundary.sh` and
+`check_stderr_logging.sh` ok.
+
+### The reviewer's measurement list
+
+1. Boot line, per pair: `peer GPU N computes its experts' rows of each prompt chunk up to T tokens,
+   a streamed one with the primary's FP4 kernels and a card-to-card copy; ... MiB left free on it`.
+   `through pinned host memory` instead of that means the pair was refused peer access, and the
+   run is on the relay - say which it printed.
+2. The prefill A/B, same synthetic 149k-token stream as the 07:07 verdict, `--tp-size 2` on the
+   exclusive cards with the rank split (`2d3cfb74`) and the continuation placement: the number to
+   beat is 1051-1070 t/s, the target the plain split's 3750-3868.  Label it with the power limit,
+   and take the `link`/pcie% readings too - a leg now crosses the link once, not twice.
+3. Solo decode and the window: this path is prefill-only, so 25.53 ms/window and ~81 t/s should be
+   unmoved.  Re-run the 94-window solo to confirm `ev_done` being shared with the routed path costs
+   nothing.
+4. The plain split too: `set_peer` is what the expert TIER uses as well, so a `--tp-size 1` +
+   `BASALT_FORCE_SPLIT` run with `--peer-prefill-rows` also switches transport.  That is the
+   production configuration; confirm its prefill is not slower.
+5. Quality: `basalt-bench --quality` (PPL/KLD against the Q8_0 reference) on a streamed chunk
+   between `--stream-all-min` and 5120 tokens with the peer share on, per CONTRIBUTING's gate.
+6. Risk left: nothing here can tell whether the DMA really used the peer path rather than driver
+   staging - `cudaDeviceCanAccessPeer` says the pair can, not that access was enabled.  The boot's
+   `peer access: N of M ordered pairs enabled` line plus the prefill t/s is the evidence.
