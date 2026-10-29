@@ -136,12 +136,14 @@ public:
     /// activations and the rows crossing card to card when the pair has peer access and through host memory when it
     /// does not.  `peer_ram_rows` (--peer-ram-rows) goes further: for the streamed chunks the partner also reads the
     /// blobs of the experts NEITHER card holds - the RAM tier's - over its own PCIe link and computes their rows, so
-    /// this card's link carries only the rows back.  Off leaves them here, as before.
+    /// this card's link carries only the rows back.  Off leaves them here, as before.  The rows of a streamed chunk
+    /// come back as BF16 bits, half the bytes of the FP32 ones (one rounding in transit, and BF16's exponent is
+    /// FP32's); `peer_rows_fp32` (--peer-rows-fp32) keeps the FP32 wire, for the A/B and the quality gate.
     bool set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_share, bool peer_ram_rows,
-                  std::string& err);
+                  bool peer_rows_fp32, std::string& err);
     /// The bytes `set_peer` takes on the peer card for chunks of up to `chunk` tokens (0: no peer share); the peer tier
     /// leaves them free when it sizes itself.
-    static uint64_t peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_rows);
+    static uint64_t peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_rows, bool peer_rows_fp32);
     /// --peer-exclusive: experts only `peer` holds have no host copy; the prompt path copies them from its memory
     /// through host staging into the ring.  Independent of set_peer.
     void set_ring_peer(core::PeerExperts* peer);

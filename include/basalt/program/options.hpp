@@ -116,6 +116,9 @@ struct Options {
     /// --peer-ram-rows: on a streamed chunk the prompt peer also computes the rows of the experts neither card's
     /// tier holds, reading their blobs from the RAM tier over its own PCIe link (off: they stay on the primary).
     bool peer_ram_rows = false;
+    /// --peer-rows-fp32: the prompt peer's streamed result rows cross the pair's link as FP32 instead of BF16 (the
+    /// A/B of the return leg; BF16 is the default and halves those bytes).
+    bool peer_rows_fp32 = false;
     /// Names the model's expert profile when it carries one (the file and `#profile`); empty means none.  A profile
     /// decides residency by routing frequency instead of by first use.
     std::string expert_profile;

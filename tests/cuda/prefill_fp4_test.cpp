@@ -18,9 +18,11 @@
 // and the gate/up product follows the A4 reference.  Then a microbench line (--no-bench skips it).  With a second
 // device, the peer card's share of a streamed chunk (its experts' rows in pieces of a row cap, each group planned on
 // its own copy of the activations) must equal the primary's whole-layer rows bit for bit, at 512 experts and top 10,
-// with a timing line for the peer.  Exit 77 without a CUDA device.
+// with a timing line for the peer; the same rows through the BF16 return leg (fp4::Group::dm16) must be those rows
+// rounded to BF16, value for value.  Exit 77 without a CUDA device.
 #include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
+#include "basalt/kernels/bf16_bits.hpp"
 
 #include "basalt/ggml/ggml.h"
 
@@ -636,11 +638,12 @@ std::vector<float> primary_rows(const std::vector<int32_t>& order, const std::ve
 
 // The peer card's sequence (prefill.cpp, no direct access between the cards): its experts `order` (bounds `bh`
 // relative to its block, rows laid out by `src`) in pieces of at most `cap` rows (fp4::cut_pieces), from the `T`
-// tokens' activations rounded once, into buffers of `cap` rows.  `ms`: the compute alone, timed again.
+// tokens' activations rounded once, into buffers of `cap` rows.  `ms`: the compute alone, timed again.  `rows16` (set)
+// asks for the rows as BF16 bits instead, the peer's return leg, and fills it with them.
 std::vector<float> peer_rows(const std::vector<int32_t>& order, const std::vector<int32_t>& bh, int64_t rows,
                              const float* x_dev, int64_t T, const std::vector<int32_t>& src,
                              const std::vector<const uint8_t*>& blob, int64_t cap, cudaStream_t s, float& ms,
-                             int& npieces, int& ngroups) {
+                             int& npieces, int& ngroups, std::vector<uint16_t>* rows16 = nullptr) {
     fp4::Pieces pc;
     fp4::cut_pieces(bh.data(), (int) order.size(), cap, pc);
     ngroups = (int) pc.group.size() - 1;
@@ -654,10 +657,12 @@ std::vector<float> peer_rows(const std::vector<int32_t>& order, const std::vecto
     }
     Dev src_dev(src.size() * 4 + 4), rd(rel.size() * 4 + 4), a4x(fp4::token_bytes(T, N)), gsx((size_t) T * 4),
         h((size_t) cap * FF * 4), a4h(fp4::a4_bytes(cap, FF, GROUP)), gsh(fp4::scale_count(cap, GROUP) * 4),
-        th(2 * (GROUP + 1) * 4), dm((size_t) cap * N * 4);
+        th(2 * (GROUP + 1) * 4), dm((size_t) cap * N * 4);   // BF16 rows use half of it
     ck(cudaMemcpy(src_dev.p, src.data(), src.size() * 4, cudaMemcpyHostToDevice), "src");
     ck(cudaMemcpy(rd.p, rel.data(), rel.size() * 4, cudaMemcpyHostToDevice), "bounds");
     std::vector<float> out((size_t) rows * N);
+    const size_t row_bytes = rows16 != nullptr ? 2 : 4;
+    if (rows16) rows16->assign((size_t) rows * N, 0);
     fp4::quantize_tokens(x_dev, T, N, N, a4x.p, gsx.as<float>(), s);
     auto group = [&](int g) {
         const int p0 = pc.group[(size_t) g], ns = pc.group[(size_t) g + 1] - p0;
@@ -670,15 +675,20 @@ std::vector<float> peer_rows(const std::vector<int32_t>& order, const std::vecto
         fg.bounds_dev = rb;
         fg.ids = src_dev.as<int32_t>() + r0; fg.a4x = a4x.p; fg.gsx = gsx.as<float>(); fg.tokens = T;
         fg.down_off = DOWN_OFF; fg.tail_off = TAIL_OFF;
-        fg.h = h.as<float>(); fg.dm = dm.as<float>();
+        fg.h = h.as<float>();
+        if (rows16) fg.dm16 = dm.as<uint16_t>(); else fg.dm = dm.as<float>();
         fg.a4h = a4h.p; fg.gsh = gsh.as<float>(); fg.toh = th.as<int32_t>(); fg.rel = fg.toh + (GROUP + 1);
         if (fp4::run_group(fg, cap, s) != 1) throw std::runtime_error("a peer group took more than one run");
         return std::make_pair(r0, nr);
     };
+    auto back = [&](int64_t r0, int64_t nr) {   // the group's rows to the host, in the format the product stored
+        void* dst = rows16 != nullptr ? (void*) (rows16->data() + (size_t) r0 * N) : (void*) (out.data() + (size_t) r0 * N);
+        ck(cudaMemcpyAsync(dst, dm.p, (size_t) nr * N * row_bytes, cudaMemcpyDeviceToHost, s), "rows");
+    };
     for (int g = 0; g < ngroups; ++g) {
         ck(cudaMemsetAsync(dm.p, 0xff, dm.bytes, s), "clr");
         const auto [r0, nr] = group(g);
-        ck(cudaMemcpyAsync(out.data() + (size_t) r0 * N, dm.p, (size_t) nr * N * 4, cudaMemcpyDeviceToHost, s), "rows");
+        back(r0, nr);
         ck(cudaStreamSynchronize(s), "sync peer group");
     }
     cudaEvent_t e0, e1;
@@ -754,13 +764,17 @@ bool peer_share(int d0, int d1, const PeerShape& sh, const std::vector<const uin
     cudaStream_t s1;
     ck(cudaStreamCreateWithFlags(&s1, cudaStreamNonBlocking), "stream");
     std::vector<float> per;
-    float ms = 0;
+    std::vector<uint16_t> per16;
+    float ms = 0, ms16 = 0;
     int npieces = 0, ngroups = 0;
     {
         Dev x1(x.size() * 4);
         ck(cudaMemcpy(x1.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
         const std::vector<int32_t> src_p(src2.begin() + rows_local, src2.end());
         per = peer_rows(order_p, bh_p, rows - rows_local, x1.as<float>(), sh.T, src_p, blob1, sh.cap, s1, ms, npieces, ngroups);
+        // the same rows through the BF16 return leg: the down product's epilogue's rounding, and nothing else
+        peer_rows(order_p, bh_p, rows - rows_local, x1.as<float>(), sh.T, src_p, blob1, sh.cap, s1, ms16, npieces,
+                  ngroups, &per16);
     }
     cudaStreamDestroy(s1);
     ck(cudaSetDevice(d0), "device 0");
@@ -774,15 +788,18 @@ bool peer_share(int d0, int d1, const PeerShape& sh, const std::vector<const uin
             bad += std::memcmp(a, b, (size_t) N * 4) != 0;
         }
     const int64_t rows_p = rows - rows_local;
+    int64_t bad16 = 0;
+    for (size_t i = 0; i < per16.size(); ++i) bad16 += per16[i] != basalt::kernels::bf16_from_f32(per[i]);
     const double flop = 2.0 * (double) rows_p * (1280.0 * N + (double) N * FF);
     std::printf("  peer share, %d tokens (%s routing), cap %lld: the peer's %zu experts hold %lld of %lld rows (%.1f%%, "
-                "largest %lld) in %d pieces / %d groups; bitwise equal to the primary's whole layer: %s (%lld rows differ)\n",
+                "largest %lld) in %d pieces / %d groups; bitwise equal to the primary's whole layer: %s (%lld rows differ); "
+                "the BF16 return leg's rows are those rounded: %s (%lld values differ)\n",
                 T, sh.hot ? "hot" : "even", (long long) sh.cap, order_p.size(), (long long) rows_p, (long long) rows,
                 100.0 * (double) rows_p / (double) rows, (long long) maxcnt_p, npieces, ngroups, bad == 0 ? "yes" : "NO",
-                (long long) bad);
-    std::printf("  bench: peer share on device %d: %lld rows in %.2f ms (%.1f TFLOP/s)\n", d1, (long long) rows_p, ms,
-                flop / (ms * 1e-3) * 1e-12);
-    return bad == 0;
+                (long long) bad, bad16 == 0 ? "yes" : "NO", (long long) bad16);
+    std::printf("  bench: peer share on device %d: %lld rows in %.2f ms (%.1f TFLOP/s); the same rows as BF16 bits in "
+                "%.2f ms\n", d1, (long long) rows_p, ms, flop / (ms * 1e-3) * 1e-12, ms16);
+    return bad == 0 && bad16 == 0;
 }
 
 int peer_parity(int d0, int d1) {

@@ -1,5 +1,6 @@
 // src/prefill/kernels.cu - see include/basalt/prefill/kernels.hpp.
 #include "basalt/prefill/kernels.hpp"
+#include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/kernels/mrope.hpp"
 #include "basalt/kernels/router_top10.hpp"
 
@@ -495,7 +496,12 @@ __global__ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32
     const int64_t r = i / per, j = i % per;
     reinterpret_cast<uint4*>(dst)[r * per + j] = reinterpret_cast<const uint4*>(x)[(int64_t) src[r] * per + j];
 }
-__global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+// The MoE combine's one pass over the result rows.  ROWS16: the rows [lo, hi) of the row space are BF16 bits in
+// `rows16` (a peer card's return leg) and every other row is FP32 in Dm; the plane is picked where the row is read,
+// so the BF16 rows cost no pass of their own.
+template <bool ROWS16>
+__global__ void moe_combine_kernel(const float* __restrict__ Dm, const uint16_t* __restrict__ rows16,
+                                   int32_t lo, int32_t hi, const int32_t* __restrict__ slot,
                                    const float* __restrict__ w, const float* __restrict__ shared,
                                    const float* __restrict__ sg, float* __restrict__ bo, int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -503,7 +509,13 @@ __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* 
     const int64_t t = i / N, d = i % N;
     float s = 0.0f;
 #pragma unroll
-    for (int k = 0; k < 10; ++k) s = fmaf(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
+    for (int k = 0; k < 10; ++k) {
+        const int32_t r = slot[t * 10 + k];
+        const float v = ROWS16 && r >= lo && r < hi
+                            ? basalt::kernels::f32_from_bf16(rows16[(int64_t) (r - lo) * N + d])
+                            : Dm[(int64_t) r * N + d];
+        s = fmaf(w[t * 10 + k], v, s);
+    }
     bo[i] = s + shared[i] * sigm(sg[t]);
 }
 
@@ -778,8 +790,15 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
 }
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream) {
-    moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T);
+    moe_combine_kernel<false><<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, nullptr, 0, 0, slot, w, shared,
+                                                                                    sg, bo, T);
     check("moe_combine");
+}
+void moe_combine_rows16(const float* Dm, const uint16_t* rows16, int32_t lo, int32_t hi, const int32_t* slot,
+                        const float* w, const float* shared, const float* sg, float* bo, int64_t T, void* stream) {
+    moe_combine_kernel<true><<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, rows16, lo, hi, slot, w, shared,
+                                                                                   sg, bo, T);
+    check("moe_combine_rows16");
 }
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;

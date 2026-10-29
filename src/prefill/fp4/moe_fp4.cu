@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/log.hpp"
 
 namespace basalt::prefill::fp4 {
@@ -182,6 +183,7 @@ struct GemmArgs {
     const int32_t* tile_off;
     const int32_t* ids;       // GATHER: row -> token
     float* dst;
+    uint16_t* dst16;          // B16: the rows as BF16 bits, `dst`'s row layout (`dst` null)
     int64_t ld_dst;
     size_t tail_off;          // SWIGLU: the blob's {s_gate, s_up, s_down, -}
 };
@@ -244,8 +246,15 @@ __device__ __forceinline__ void load_stage(int stage, int kt, uint8_t* smem, con
 // One block: up to two consecutive 64-token tiles of an expert x 128 weight rows; each warp owns one tile's 64 tokens
 // and 32 rows, so a weight fragment feeds four token groups.  GATHER: a row's activations are its token's (token planes,
 // row -> token from ids); SWIGLU: the gate/up product's outputs leave as the tail-scaled SwiGLU of each gate/up pair.
+// Two products' values as one BF16 pair: the engine's own rounding (RNE, a NaN carried through), packed little-endian
+// so the pair is the row's two adjacent values in memory.
+__device__ __forceinline__ uint32_t bf16x2(float lo, float hi) {
+    return (uint32_t) basalt::kernels::bf16_from_f32(lo) | ((uint32_t) basalt::kernels::bf16_from_f32(hi) << 16);
+}
+
 // Every output keeps the same MMA chain over K as the plain product of one tile, so the products are the same bits.
-template <bool GATHER, bool SWIGLU>
+// B16: the plain product's rows leave as BF16 bits (a peer card's return leg); the SwiGLU output never does.
+template <bool GATHER, bool SWIGLU, bool B16 = false>
 __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
     extern __shared__ __align__(1024) uint8_t smem[];
     __shared__ int32_t tok_s[kBlockTiles * kTileTokens];
@@ -359,6 +368,13 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
                     *(float2*) (out + 8 * r) =
                         make_float2(swiglu_tail(__fmul_rn(acc[mt][r][2 * h], g), __fmul_rn(acc[mt][r + 2][2 * h], g), tail),
                                     swiglu_tail(__fmul_rn(acc[mt][r][2 * h + 1], g), __fmul_rn(acc[mt][r + 2][2 * h + 1], g), tail));
+            } else if (B16) {
+                // the rows leave as BF16 bits (the peer's return leg): half the bytes, one rounding, and BF16's
+                // exponent is FP32's, so a row needs no scale of its own
+                uint16_t* out = a.dst16 + (row0 + t) * a.ld_dst + rb * kRowsPerBlock + warp_n * 32 + 2 * tig;
+#pragma unroll
+                for (int r = 0; r < 4; ++r)
+                    *(uint32_t*) (out + 8 * r) = bf16x2(acc[mt][r][2 * h] * g, acc[mt][r][2 * h + 1] * g);
             } else {
                 float* out = a.dst + (row0 + t) * a.ld_dst + rb * kRowsPerBlock + warp_n * 32 + 2 * tig;
 #pragma unroll
@@ -422,16 +438,16 @@ void gather_tails(const Product& p, size_t tail_off, float* dst, void* stream) {
 }
 
 // the shared-memory opt-in is per device and per kernel (a layer split runs these on several, from different threads)
-template <bool GATHER, bool SWIGLU> void launch(const GemmArgs& a, dim3 grid, cudaStream_t s) {
+template <bool GATHER, bool SWIGLU, bool B16 = false> void launch(const GemmArgs& a, dim3 grid, cudaStream_t s) {
     static std::atomic<bool> configured[64];
     int dev = 0;
     ck(cudaGetDevice(&dev), "device");
     if (dev < 0 || dev >= 64) ck(cudaErrorInvalidDevice, "device range");
     if (!configured[dev].load(std::memory_order_acquire)) {
-        ck(cudaFuncSetAttribute(gemm_kernel<GATHER, SWIGLU>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem), "smem");
+        ck(cudaFuncSetAttribute(gemm_kernel<GATHER, SWIGLU, B16>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem), "smem");
         configured[dev].store(true, std::memory_order_release);
     }
-    gemm_kernel<GATHER, SWIGLU><<<grid, kThreads, kSmem, s>>>(a);
+    gemm_kernel<GATHER, SWIGLU, B16><<<grid, kThreads, kSmem, s>>>(a);
     ck(cudaGetLastError(), "gemm");
 }
 
@@ -441,16 +457,22 @@ void run(const Product& p, void* stream) {
         basalt::log::error("basalt", "prefill fp4: token rows go with the SwiGLU output only");
         std::exit(1);
     }
+    if (p.dst != nullptr && p.dst16 != nullptr) {
+        basalt::log::error("basalt", "prefill fp4: a product's rows go to one destination format only");
+        std::exit(1);
+    }
     GemmArgs a{};
     for (int j = 0; j < p.n; ++j) a.blob[j] = p.blob[j];
     a.w_off = p.w_off; a.w_cols = (int) p.w_cols; a.half = (int) (p.w_rows / 2); a.a4 = (const uint8_t*) p.a4;
-    a.gs = p.gs; a.bounds = p.bounds; a.tile_off = p.tile_off; a.ids = p.ids; a.dst = p.dst; a.ld_dst = p.ld_dst;
+    a.gs = p.gs; a.bounds = p.bounds; a.tile_off = p.tile_off; a.ids = p.ids; a.dst = p.dst; a.dst16 = p.dst16;
+    a.ld_dst = p.ld_dst;
     a.tail_off = p.tail_off;
     a.a4s = p.ids ? (const uint8_t*) p.a4 + (size_t) p.tokens * (size_t) (p.w_cols / 2) : nullptr;
     const int block_rows = kBlockTiles * kTileTokens;
     const dim3 grid((unsigned) (p.w_rows / kRowsPerBlock), (unsigned) ((p.max_rows + block_rows - 1) / block_rows),
                     (unsigned) p.n);
     if (p.swiglu) launch<true, true>(a, grid, (cudaStream_t) stream);
+    else if (p.dst16 != nullptr) launch<false, false, true>(a, grid, (cudaStream_t) stream);
     else launch<false, false>(a, grid, (cudaStream_t) stream);
 }
 
@@ -484,7 +506,9 @@ void run_experts(const Group& g, int i0, int n, void* stream) {
     for (int i = 0; i < n; ++i) dn.blob[i] = gu.blob[i];
     dn.w_off = g.down_off; dn.w_rows = kN; dn.w_cols = kFF; dn.n = n;
     dn.a4 = g.a4h; dn.gs = g.gsh; dn.bounds = g.rel; dn.tile_off = g.toh;
-    dn.dst = g.dm + r0 * kN; dn.ld_dst = kN; dn.max_rows = maxr;
+    dn.dst = g.dm16 ? nullptr : g.dm + r0 * kN;
+    dn.dst16 = g.dm16 ? g.dm16 + r0 * kN : nullptr;
+    dn.ld_dst = kN; dn.max_rows = maxr;
     run(dn, stream);
 }
 

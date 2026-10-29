@@ -56,6 +56,7 @@ struct Product {
     const int32_t* bounds = nullptr;
     const int32_t* tile_off = nullptr;
     float* dst = nullptr;
+    uint16_t* dst16 = nullptr;   ///< the same rows as BF16 bits instead of FP32 (set: `dst` is unused)
     int64_t ld_dst = 0, max_rows = 0;
     bool swiglu = false;
     const int32_t* ids = nullptr;
@@ -69,7 +70,9 @@ void gather_tails(const Product& p, size_t tail_off, float* dst, void* stream);
 /// A group of up to kMaxExperts consecutive experts of one layer, as the prompt path runs them: the layer's token
 /// planes (already rounded to FP4) and, per run of the group, the gate/up product as the tail-scaled SwiGLU, the FP4
 /// rounding of H and the down product.  `h` holds one run's rows only (its row 0 is the run's first row); `dm` is the
-/// layer's own output, indexed by absolute row.
+/// layer's own output, indexed by absolute row.  `dm16` (set instead of `dm`) sends the down product's rows out as
+/// BF16 bits: half the bytes over the pair's link, one rounding in transit, for a peer card whose rows the primary
+/// only ever sums into the combine.
 struct Group {
     int n = 0;
     const uint8_t* blob[kMaxExperts] = {};
@@ -81,6 +84,7 @@ struct Group {
     int64_t tokens = 0;
     size_t down_off = 0, tail_off = 0;      ///< the down matrix and the 16-byte scale tail inside a blob
     float *h = nullptr, *dm = nullptr;
+    uint16_t* dm16 = nullptr;           ///< the down product's rows as BF16 bits, `dm`'s row layout (set: `dm` unused)
     void* a4h = nullptr;                    ///< a run's H planes, token scales, tile table and relative bounds
     float* gsh = nullptr;
     int32_t *toh = nullptr, *rel = nullptr; ///< kMaxExperts + 1 entries each

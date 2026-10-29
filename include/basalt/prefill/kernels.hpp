@@ -81,6 +81,10 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);
+/// The same sum where a peer card's result rows crossed the pair's link as BF16 bits: the rows [lo, hi) of the row
+/// space are read as BF16 from `rows16` (`rows16[(r - lo) * N + d]`), every other row as FP32 from `D`.
+void moe_combine_rows16(const float* D, const uint16_t* rows16, int32_t lo, int32_t hi, const int32_t* slot,
+                        const float* w, const float* shared, const float* sg, float* bo, int64_t T, void* stream);
 
 // ---- QSA helpers
 /// In place: x[r, :] = x[r, :] * rsqrt(mean x^2 + eps) * w  over rows of `cols` (row stride `ld`).
