@@ -1742,9 +1742,20 @@ static int64_t peer_fp4_ceiling(int64_t lb, int64_t le, int64_t n_expert) {
     return top;
 }
 
+/// Why the peer takes no streamed chunk's rows at all, or null when it can.  The four gates that precede the
+/// placement's own crossover; `set_peer` logs the verdict, so a run that quietly computes everything on the lead
+/// card says which gate shut rather than leaving it to be read out of this file.
+static const char* peer_fp4_gate(bool streamed_share) {
+    if (!streamed_share) return "the pair's cards are not alike";
+    if (!fp4_every_layer()) return "not every layer's experts are NVFP4";
+    if (fused_ring()) return "this pack runs the fused expert kernels";
+    if (stream_all_min() < FP4_MIN_TOKENS) return "the FP4 floor is above the streaming floor";
+    return nullptr;
+}
+
 /// Whether the peer can take a streamed chunk's rows at all, before the placement decides how long one may be.
 static bool peer_fp4_possible(bool streamed_share) {
-    return streamed_share && fp4_every_layer() && !fused_ring() && stream_all_min() >= FP4_MIN_TOKENS;
+    return peer_fp4_gate(streamed_share) == nullptr;
 }
 
 uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share) {
@@ -1776,14 +1787,28 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
     // capped by the ceiling `peer_bytes` sized its buffers for, so the allocation always fits the reserve
     const int64_t t_fp4 = peer_fp4_possible(streamed_share)
                               ? std::min({m.T_max, pl.tokens, peer_fp4_ceiling(lb, le, ne)}) : 0;
+    const int64_t t_routed = streamed_share ? m.T_max : std::min<int64_t>(m.T_max, kPeerSlowRows);
+    const int64_t tf = t_fp4 >= stream_all_min() ? t_fp4 : 0;   // what `make_peer` is actually given
+    // The one line that says what this pair's prompt share is: the crossover, whether the FP4 share is on and if not
+    // which gate shut, and the routed-only share with the derate an unlike partner carries.
+    const char* gate = peer_fp4_gate(streamed_share);
+    std::string share = gate ? std::string("off: ") + gate
+                    : tf > 0 ? "on, chunks of " + std::to_string(tf) + " tokens or less"
+                             : "off: the crossover is under the " + std::to_string(stream_all_min()) +
+                                   "-token streaming floor";
+    share += ", routed chunks to " + std::to_string(std::min(t_routed, stream_all_min() - 1)) + " tokens";
+    if (!streamed_share) share += ", the routed share derated to " + std::to_string(kPeerSlowRows) + " tokens";
     basalt::log::info("basalt prefill",
                       "peer fp4 crossover %lld tokens: %llu MiB of activations and rows per 1024 tokens against "
-                      "%llu MiB of partner-held blobs over %lld layers (%lld experts held)",
+                      "%llu MiB of partner-held blobs over %lld layers (%lld experts held); the share is %s",
                       (long long) t_fp4, (unsigned long long) (pl.per_token * 1024 >> 20),
-                      (unsigned long long) (pl.blobs >> 20), (long long) pl.layers, (long long) pl.held);
+                      (unsigned long long) (pl.blobs >> 20), (long long) pl.layers, (long long) pl.held,
+                      share.c_str());
     std::unique_ptr<PeerPrefill> pp;
-    const int64_t t_routed = streamed_share ? m.T_max : std::min<int64_t>(m.T_max, kPeerSlowRows);
-    bool ok = make_peer(peer, t_routed, cap_rows, t_fp4 >= stream_all_min() ? t_fp4 : 0, pp, err);
+    // `cap_rows` bounds the routed share only: with the FP4 share on, the primary leaves EVERY expert the peer holds
+    // out of its stream (before the routing is known), so the peer has to be able to take all of those experts' rows
+    // - which `peer_layout` guarantees by sizing its row tables for the whole chunk.
+    bool ok = make_peer(peer, t_routed, cap_rows, tf, pp, err);
     if (!ok && t_fp4 >= stream_all_min()) {   // the routed-only chunks alone
         pp.reset();
         err.clear();

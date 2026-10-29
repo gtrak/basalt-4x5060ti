@@ -1386,6 +1386,20 @@ int main(int argc, char** argv) {
     // the peer card takes expert rows of a long prompt chunk only when it is as fast as the main one: a slower card costs the
     // chunk more than the experts it saves the main card's link, so it keeps to the short chunks it helps
     const bool peer_streamed_share = chosen_cards.size() >= 2 && basalt::program::cards_alike(chosen_cards[0], chosen_cards[1]);
+    // tp2: the same verdict per pair, since each stage has its OWN two cards: CUDA0's partner is CUDA1, the next
+    // stage's lead CUDA2 works beside CUDA3.  A pair of unlike cards keeps its partner to the routed-only chunks.
+    const auto pair_streamed_share = [&](int lead_dev, int partner_dev) {
+        if (lead_dev < 0 || partner_dev < 0) return false;
+        if ((size_t) lead_dev >= chosen_cards.size() || (size_t) partner_dev >= chosen_cards.size()) return false;
+        return basalt::program::cards_alike(chosen_cards[(size_t) lead_dev], chosen_cards[(size_t) partner_dev]);
+    };
+    // every pair of the split alike: the rule the whole run's streaming floor is set by, since one floor applies to
+    // every stage (the chunks a pair's partner computes rows of must be the same ones on every card)
+    bool pairs_streamed_share = o.tp_size == 2 && !chosen_cards.empty();
+    for (int s = 0; (size_t) (s + 1) * o.tp_size <= chosen_cards.size(); ++s)
+        pairs_streamed_share = pairs_streamed_share &&
+                               pair_streamed_share(basalt::program::pair_lead_dev(s, o.tp_size),
+                                                   basalt::program::pair_partner_dev(s, o.tp_size));
     // the prompt-time layer split over the expert tier cards (PromptStage), and the most stages it may use, the main
     // card's included: every card on two cards or on three or more alike ones, none on three or more unlike cards
     // until measured on such a set.  With --batch a read splits only while no slot decodes.
@@ -1398,9 +1412,11 @@ int main(int argc, char** argv) {
     // Chunks below this take the routed-only path with the peer card computing its experts' rows; from it on
     // every expert streams through the ring.  The routed-only path costs ~0.3 ms per token, streaming ~0.12 ms
     // plus the time to move the experts the primary lacks over its link; with --peer-exclusive that includes the
-    // peer-only experts, staged through the host, so streaming loses until later.
+    // peer-only experts, staged through the host, so streaming loses until later.  A pair's partner card is a peer
+    // for this purpose too: under --tp-size 2 it computes its experts' rows of the stage's chunks as CUDA1's tier does.
     auto set_stream_all_min = [&]() {
-        if (o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0 && peer_streamed_share)
+        if (o.serve && o.peer_prefill_rows != 0 &&
+            ((o.peer_device >= 1 && peer_streamed_share) || pairs_streamed_share))
             basalt::prefill::Prefill::set_stream_all_min(o.peer_exclusive ? 4096 : 2560);
     };
     set_stream_all_min();
@@ -3076,6 +3092,13 @@ int main(int argc, char** argv) {
         return o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0
                    ? basalt::prefill::Prefill::peer_bytes(o.prefill_chunk, peer_streamed_share) : 0;
     };
+    // tp2: the same bytes on a stage's partner card - its prompt peer buffers are allocated after its expert tier is
+    // filled, so the room the partner's tier is sized from leaves them out too (see `open_partner`)
+    auto pair_prompt_bytes = [&](int lead_dev, int partner_dev) -> uint64_t {
+        return o.serve && o.tp_size == 2 && o.peer_prefill_rows != 0
+                   ? basalt::prefill::Prefill::peer_bytes(o.prefill_chunk, pair_streamed_share(lead_dev, partner_dev))
+                   : 0;
+    };
     // the GDN mixer split is priced once, before either card sizes its experts: its peer reserve displaces experts
     // only when the cards cannot hold them all
     if (o.peer_device >= 1) {
@@ -3631,7 +3654,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<basalt::core::PeerExperts> stage0_pair;
     const int stage0_pair_dev = basalt::program::pair_partner_dev(0, o.tp_size);
     if (o.tp_size == 2) {
-        auto open_partner = [&](int pair_dev, const std::vector<std::pair<int32_t, int32_t>>& ranked,
+        auto open_partner = [&](int pair_dev, int lead_dev, const std::vector<std::pair<int32_t, int32_t>>& ranked,
                                 int64_t lead_held, basalt::core::PeerExperts& pair) -> bool {
             if (ranked.empty() || srcp == nullptr) {
                 basalt::log::error("basalt generate", "tp2, CUDA%d: its stage holds no profiled experts, so its "
@@ -3642,8 +3665,12 @@ int main(int argc, char** argv) {
                 basalt::log::error("basalt generate", "tp2, CUDA%d partner tier: %s", pair_dev, err.c_str());
                 return false;
             }
-            // its buffers are allocated by now, so what that card has free beyond the reserve is its expert tier
-            const int64_t room = stage_room(pair_dev, true, 0);
+            // its buffers are allocated by now, so what that card has free beyond the reserve is its expert tier; the
+            // prompt path's peer buffers on it (`set_peer`, sized by `peer_bytes`) are held back too, since they are
+            // allocated after the tier is filled and the tier would otherwise leave them nowhere to go
+            const int64_t peer_pf_mib =
+                (int64_t) ((pair_prompt_bytes(lead_dev, pair_dev) + (1ull << 20) - 1) >> 20);
+            const int64_t room = stage_room(pair_dev, true, peer_pf_mib);
             // The partner takes the CONTINUATION of the stage's ranking, not the cold tail: the lead admits the
             // hottest pairs until its (small - it also carries the dense weights, session and head) room ends, and
             // the next-hottest slice belongs on the partner's idle VRAM before anything falls to the RAM complement.
@@ -3675,7 +3702,8 @@ int main(int argc, char** argv) {
             return true;
         };
         stage0_pair = std::make_unique<basalt::core::PeerExperts>();
-        if (!open_partner(stage0_pair_dev, profile, xcache.resident(), *stage0_pair)) return 1;
+        if (!open_partner(stage0_pair_dev, basalt::program::pair_lead_dev(0, o.tp_size), profile, xcache.resident(),
+                          *stage0_pair)) return 1;
         // A stage's partner is the card beside the one that stage leads on.  `stages` holds the stages after CUDA 0's,
         // so a stage number taken from a position in it names the pair beside the previous stage: two stages then
         // share one partner card and the other partner card holds nothing.
@@ -3694,7 +3722,7 @@ int main(int argc, char** argv) {
             if (st.pair_dev < 0 || taken) return 2;
             partners.push_back(st.pair_dev);
             st.pair = std::make_unique<basalt::core::PeerExperts>();
-            if (!open_partner(st.pair_dev, st.profile, st.cache.resident(), *st.pair)) return 1;
+            if (!open_partner(st.pair_dev, st.dev, st.profile, st.cache.resident(), *st.pair)) return 1;
         }
     }
 
@@ -5356,6 +5384,17 @@ int main(int argc, char** argv) {
                 // tp2: the experts its partner card holds have no pinned host copy; they cross the link, not the SSD
                 if (st.pair && st.pair->valid())
                     st.sp.set_ring_remotes({{st.pair->residency().data(), &st.pair->cache(), st.pair->device()}});
+                // tp2: and the partner card COMPUTES the rows of the experts it holds, the way the expert tier's
+                // peer card does.  Without this the stage's prompt path pulls every partner-held blob over the link
+                // and the partner sits idle (measured: `no peer` chunk lines, the lead's blob feed the whole layer).
+                if (st.pair && st.pair->valid() && o.peer_prefill_rows != 0) {
+                    const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
+                    if (!st.sp.set_peer(st.pair.get(), rows, pair_streamed_share(st.dev, st.pair_dev), err)) {
+                        basalt::log::warn("basalt serve", "layer split, CUDA%d prompt peer: %s - its stage's prompt "
+                                             "path stays on its lead card", st.dev, err.c_str());
+                        err.clear();   // a stage without its prompt peer reads slower; it is not a start failure
+                    }
+                }
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
         // an expert a tier card holds is copied from that card (d2d) instead of read from the file: a 16k prompt
@@ -5460,6 +5499,18 @@ int main(int argc, char** argv) {
                 err.clear();
             }
             split_peer_rows = sp.peer_routed_rows_max();
+        }
+        // tp2: CUDA0's prompt path shares its stage's experts with CUDA1, and CUDA1 is its prompt peer in exactly the
+        // way CUDA0's expert tier is for the plain configuration above (a pair-wide split names no expert tier, so
+        // the `peer` there is never valid here).
+        if (stage0_pair && stage0_pair->valid() && o.peer_prefill_rows != 0) {
+            const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
+            if (!sp.set_peer(stage0_pair.get(), rows,
+                             pair_streamed_share(basalt::program::pair_lead_dev(0, o.tp_size), stage0_pair_dev), err)) {
+                basalt::log::warn("basalt serve", "CUDA%d prompt peer: %s - the prompt path stays on the primary GPU",
+                             stage0_pair_dev, err.c_str());
+                err.clear();
+            }
         }
         // ---- the prompt-time split's stages on the tier cards.  A stage's place, from the end of its tier's slots: the
         // weights, the session (for the whole context here; for its prompt's cells and layers at each read), then the
