@@ -1120,3 +1120,126 @@ Sweep with `set_peer` live (boot line: `peer GPU 1/3 computes its experts' rows 
 - Decode: concurrent wall 28.4-33.4 ms (3-4 rows), GPU-reach wait 18-19.2; tg solo 77.1 t/s, hit 94.7%,
   pcie 46.6% — decode parity holds at 8192. Per-stage decode profile lines report `not measured` under
   graph capture (run 12's flagged risk); fix pass owed before DECODE-NEXT item 1 can be judged.
+
+## RUN 14 — the partner becomes a second RAM reader (`--peer-ram-rows`, default off)
+
+Run 13's verdict: the wall is the RAM-tier blob feed, and it all crosses the LEAD's lanes, because the peer computes
+only the experts its own tier holds. A chunk of a stage whose tier misses land in the RAM complement therefore pays
+one PCIe link for every blob. This run lets the partner read the blobs of the experts NEITHER card holds over its
+OWN link, compute those rows on its own SMs, and send only the result rows back. One file of substance,
+`src/prefill/prefill.cpp`, plus the flag. Off by default: with the flag absent nothing else moves.
+
+### What changed
+
+- `--peer-ram-rows` (`options.hpp`, `generate.cpp:1175`), threaded into `Prefill::set_peer` and `Prefill::peer_bytes`
+  as `peer_ram_rows`: "with a prompt peer: it also computes the rows of the experts NEITHER card holds, reading
+  their blobs from RAM over its own link (off)".
+- **The band.** `in_ram_band()`: an expert of the stage held by no card's tier (`host_res` / `peer->has` / the
+  `--peer-exclusive` ring all negative) whose blob is page-locked (`src->pinned`) — i.e. exactly the bytes the lead's
+  stager pulls today. `RamView` carries the four tables the test needs, so the setup-time price and the per-chunk
+  walk ask the same question of the same tables.
+- **The price.** `peer_ram_share()` (above `peer_link`) decides how much of the band to move, as an eighth
+  (`PeerRamShare::kDen`): moving one band expert takes its blob (`B`) off the LEAD's inbound link and puts its rows
+  (`w`) on that same link, while the partner's own link — which otherwise only ever receives — takes the blob. It
+  pays while `w < B`; the two links balance at `r`, the partner never takes more than half the chunk's rows. Priced
+  at `m.T_max`, the longest chunk the share is ever given. `peer_link` bills the moved experts' blobs and rows too,
+  so a wider band coverage widens the FP4 crossover as well.
+- **The same eighths everywhere.** `PeerRamShare::taken(k, num)` — `num` of every 8 band experts counted in id order
+  — picks the band out at setup (`peer_link`), at the chunk's start (the stream's skip, before the routing is known)
+  and in the row split (`ram_take`), so an expert the lead leaves out of its stream is always one the partner reads,
+  and its rows always go to the partner. The chunk's decision is recomputed per chunk and is independent of routing.
+- **The partner's ring** (`PeerPrefill::stage`, `copy`, `span_copy`, a thread of its own): entry `k` of the chunk's
+  band list lands in slot `k % ring`, read from host RAM into the partner's VRAM on its own copy stream. The lead
+  walks it with its own staging protocol: an entry the routing did not pick is given back at once, a picked one when
+  the group that reads its blob LAST has been enqueued (`last_grp`, since `fp4::cut_pieces` cuts a hot expert across
+  groups and the slot has to outlive every piece). Its issuing thread never runs past the lowest entry still held
+  (`p_hold`) plus a ring, and a slot is refilled only after the `used` event its last reader recorded. An entry too
+  far behind a held one — a group's sixteen experts need not be neighbours in id — is a **spread** expert: its blob
+  is read here instead, into one of `kSpan` span slots, once per group that needs it.
+- `ChunkTiming` counts the band: `expert-visits lead %lld peer %lld (peer read %lld from RAM)`.
+
+### The arithmetic, at run 13's geometry
+
+24 layers, 512 experts a layer of 2 548 736 B, N = 2560, K = 10, chunk 8192. `w = chunk*K/NE*N*4` is a band
+expert's expected rows, `B` its blob. The table is the shipped `peer_ram_share` compiled as it stands against
+stubs (transcription check, no device); it agrees with an independent script to the byte.
+
+| card holds | partner holds | band | `w` vs `B` | r (balance) | take | share | lead's blobs left |
+|---|---|---|---|---|---|---|---|
+| 256 | 256 | 0 | — | — | 0 | off: no band | 0 MiB |
+| 200 | 200 | 112 | 1.56 < 2.43 MiB | 285 -> 56 (row cap) | 56 | 4/8 | 136 MiB/layer |
+| 160 | 160 | 192 | idem | 96 | 96 | 4/8 | 233 MiB/layer |
+| 128 | 128 | 256 | idem | 128 | 128 | 4/8 | 311 MiB/layer |
+| 200 | 120 | 192 | idem | 56 (row cap) | 56 | 2/8 | 419 MiB/layer |
+
+`top` — the longest chunk whose band expert's rows still weigh less than its blob — is **12 743 tokens** for this
+pack, so the band is on for every chunk the FP4 share takes (its own crossover capped it at 10 619 at tp2 half-and-half).
+The share is deliberately conservative: the prompt's own uploads to the lead are not knowable at setup and are left
+out of the lead's side of the balance, which understates it and so under-prices the move.
+
+### What it costs, and what does not move
+
+`peer_bytes` reserves the ring whenever the flag is on and the FP4 leg could open: `(48 + 16) x 2.43 MiB = 155.6 MiB`
+on the partner card, on top of run 13's ~719 MiB of peer buffers. **Pin the tiers when comparing against run 13
+numbers**; a tier that shrinks by ~64 slots moves the RAM-band boundary itself, which is the effect run 13 measured
+as a regression. With the flag off the reservation, the boot line's meaning and every enqueue are run 13's: the
+`RamView` is built and never consulted, `prs.num` is 0, `peer_link` is called with a null band, `ram_take` stays
+empty, the row split, the stream and the peer legs take their old branches. The only difference is the boot line's
+trailing `RAM rows off (--peer-ram-rows)` clause.
+
+### The lines to grep
+
+```
+grep "peer fp4 crossover" log     # setup, once per stage: ...; RAM rows on, 4/8 of 112 band experts over 24 layers read on the partner's own link, to 12743 tokens, its ring 48 slots
+grep "peer GPU" log               # unchanged: "... computes its experts' rows of each prompt chunk up to N tokens, a streamed one with the primary's FP4 kernels and a card-to-card copy"
+grep "expert-visits lead" log     # per chunk: expert-visits lead 4123 peer 1876 (peer read 934 from RAM)
+```
+
+Off, the last clause reads `RAM rows off (--peer-ram-rows)` (or `off: the FP4 share is off`, `off: no RAM band,
+every expert of the stage is on a card`, `off: its rows outweigh its blob at <T_max> tokens`); in the chunk line
+`(peer read 0 from RAM)`.
+
+### Predictions, written before any measurement (stage A = layers 0-23, lead CUDA0 / peer CUDA1, `--prefill 8192`)
+
+Run 13's stage-A layer was 220.6 ms with 114.3 ms of blobs on the copy stream and 126.4 ms of lead experts; stage B
+was 155.7 ms with 31.1 ms of blobs.
+
+1. **Stage A is where it pays.** With the share at 4/8 the lead's inbound blob bytes over the band fall by half, so
+   the copy stream's 114.3 ms goes to ~57-70 ms and the layer to **~175-195 ms**; fresh prefill at 8192 should go
+   from 1393 t/s toward **1500-1650 t/s**. The rows the partner computes come back over the same link (1.5 MiB per
+   band expert at this chunk), so the saving is `moved*(B - w)`, not `moved*B` — that is why the price balances the
+   two links instead of moving the whole band.
+2. **Stage B barely moves** (155.7 -> ~150 ms): its tier misses are already small, and where the stage's tier covers
+   every expert the boot line will say `off: no RAM band`.
+3. **`(peer read N from RAM)` is the falsification test.** Expect `N ≈ num/8 x band x layers x (the band experts the
+   routing hit)`, i.e. for 4/8 of a 112-expert band, of order 50-56 visits a layer. If the chunk line reports
+   `peer` visits rising while `peer read` stays 0, the band classification disagrees with the row split and the
+   stream skip — that is the bug to look for first, and the run fails with `prefill: a RAM-band expert is on neither
+   card's stream` rather than computing wrong rows.
+4. **Lead expert time must not move much** (126.4 ms ±): the lead keeps attention, dense and its own resident
+   experts; only its blob feed shrinks. If lead time rises, the partner's rows are queuing behind the lead's own
+   work on the return path.
+5. **Watch the partner's own link**: it is the new bottleneck candidate. `p2p` is on for this box, so the peer's
+   activations still arrive over the pair's link while its band blobs arrive over its host link; the two are
+   different engines and do not serialize.
+6. `--peer-ram-rows` absent reproduces run 13 within run-to-run noise, at any chunk, on both stages.
+
+### What is NOT done
+
+- No measurement (no GPU touched, no engine started, `:8000` unbound). Every number above is a prediction.
+- The ring depth (48) and span pool (16) are reasoned, not profiled: 48 blobs is ~116 MiB, about 6 ms of host link
+  at 20 GB/s, which is thin against a layer's compute, so the depth may have to grow if the peer's copy engine is
+  seen waiting. The spread path is the measurable symptom (each spread expert costs the partner one extra blob read).
+- The band's experts are chosen by id position (`k % 8 < num`), which is routing-independent but not
+  load-aware: a router that concentrates on those ids puts more rows on the partner than the price assumed. The
+  row cap cannot protect this (the peer's row tables hold the whole chunk by design), so an extreme skew shows up
+  as the partner falling behind, not as a failure.
+
+### Validated here (GPU untouched: the server is live)
+
+Build green (`ninja -j4`). `ctest -L cpu` 66/67, the only failure the pre-existing `expert_multi_test` (no
+AVX512-VNNI/VBMI on this CPU); `tp2_pair_test`, `qsa_head_split_test`, `session_head_shard_test`,
+`tp2_shard_weights_test` pass. `tools/check_platform_boundary.sh` and `tools/check_stderr_logging.sh` ok. No new
+compiler warnings (the two the file prints, `StreamEntry::pdev_dev` and `cs`, are the ones the file printed
+before). `peer_ram_share` compiled against stubs, matching an independent script; its eighths, `take` and `top`
+are in the table above.
