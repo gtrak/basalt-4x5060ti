@@ -583,9 +583,12 @@ static bool qsa_prepare_one(QsaPair& p, const WeightRef& w, const std::string& n
             return false;
         }
         try {
-            const uint64_t check =
-                basalt::kernels::native_mmvq_weight_bytes(w.native_type, (int) be, 1) * (uint64_t) (w.ne0 / be);
-            if (check != nb) {
+            // ONE block of ONE row, from the KERNEL's table: the split's width says how many such blocks make a
+            // row and how many rows the image holds, and the product must be the image the loader sized.  Ask
+            // the kernel for the whole row instead and the check compares its table with itself.
+            const uint64_t block = basalt::kernels::native_mmvq_weight_bytes(w.native_type, (int) be, 1);
+            const uint64_t check = qsa_weight_native_bytes_from_block(w, block);
+            if (check == 0 || check != nb) {
                 err = name + ": the native image is " + std::to_string((unsigned long long) nb) +
                       " B but the block figure implies " + std::to_string((unsigned long long) check) +
                       " B - the split's table and the kernel's disagree";

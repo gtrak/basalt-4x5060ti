@@ -258,6 +258,18 @@ void the_native_block_width_follows_the_type() {
     kq.build();
     CHECK(qsa_weight_cols_fits(kq.w, 0, 32, kq.native_all()) == false);
     CHECK(qsa_weight_cols_fits(kq.w, 0, 256, kq.native_all()));
+
+    // The cross-check's own figure: one block's bytes, times the blocks in a row, times the ROWS.  A figure that
+    // leaves `ne1` out accepts a one-row image for an eight-row tensor - which is the failure this comparison
+    // exists to catch, so it is pinned from both sides.
+    CHECK(qsa_weight_native_bytes_from_block(leg.w, 34) == leg.native_all());   // Q8_0: 34 B per 32 values
+    CHECK(qsa_weight_native_bytes_from_block(leg.w, 34) == 34ull * (leg.ne0 / 32) * leg.ne1);
+    CHECK(qsa_weight_native_bytes_from_block(leg.w, 32) != leg.native_all());   // a block figure 2 B off is caught
+    CHECK(qsa_weight_native_bytes_from_block(kq.w, 128) == kq.native_all());    // Q4_K as the fake lays it out
+    CHECK(128ull * (kq.ne0 / 256) != kq.native_all());                          // the one-row figure is NOT the image
+    CHECK(qsa_weight_native_bytes_from_block(kq.w, 144) != kq.native_all());    // Q4_K's real figure, wrong here
+    CHECK(qsa_weight_native_bytes_from_block(kq.w, 0) == 0);
+    CHECK(qsa_weight_native_bytes_from_block(bad.w, 144) == 0);                 // a type with no width has no figure
 }
 
 void what_is_refused() {

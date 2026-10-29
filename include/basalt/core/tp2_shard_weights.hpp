@@ -114,6 +114,17 @@ inline uint64_t qsa_weight_native_cols_bytes(const WeightRef& w, int64_t cols, u
     return block * (uint64_t) (cols / be) * (uint64_t) rows;
 }
 
+/// What the split's block width says the WHOLE native image weighs, given one block's bytes: `block_bytes` per
+/// block, `ne0 / block_elems` blocks per row, `ne1` rows.  This is the cross-check's side of the ledger - the
+/// caller gets `block_bytes` from the kernel (`native_mmvq_weight_bytes` at one block and one row) and compares
+/// this against the image the loader actually sized, so the two tables must agree.  0 when the type's width
+/// cannot cut this tensor.
+inline uint64_t qsa_weight_native_bytes_from_block(const WeightRef& w, uint64_t block_bytes) {
+    const int64_t be = qsa_native_block_elems(w.native_type);
+    if (be <= 0 || block_bytes == 0 || w.ne0 <= 0 || w.ne1 <= 0 || w.ne0 % be != 0) return 0;
+    return block_bytes * (uint64_t) (w.ne0 / be) * (uint64_t) w.ne1;
+}
+
 /// The bytes one packed column view costs: the three canonical planes with their spans copied out of every row,
 /// and the native image's span behind them.  The caller allocates one buffer of this size per view and passes it
 /// to `qsa_pack_weight_cols`.
