@@ -1,0 +1,591 @@
+# TP=2/PP=2 work notes
+
+## 2026-10-29 00:30 — reviewer handoff (run 1 → run 2)
+
+Run 1 (2faf0aa1) was stopped deliberately at ~00:25 to escape a too-short
+run deadline; it made NO edits and NO commits (worktree was pristine). It
+spent its time reading and surveyed these areas (verify them, but start
+warm — do not re-read blind):
+
+- the expert cache sizing loop + budget contract (`auto_cache`, `shrink_to`,
+  the commit-charge failure path in generate.cpp) — M1 must not weaken it
+- the peer-expert machinery: `xpeers` creation/wiring, the refill/verify
+  path (`refill_`, `verify_slot`, `blob_bytes`, peer experts d2d) — this is
+  the pattern to reuse for EP-within-pair routing
+- the residency tables + RAM complement — the M1 invariant: no expert may
+  become unreachable when each card holds half its stage's experts
+
+Milestones per TP2PP2-BRIEF.md: M1 (stage-pair scaffold + EP-within-pair,
+flag-gated, boot log names the topology) → M2 (attention head-split +
+2-way all-reduce helper) → M3 → M4. Commit each milestone; append findings
+here as you go.
+
+Standing constraints (unchanged): production server is LIVE — never touch
+it, never run basalt-ctl, never bind :8000; builds `-j4` max in the
+worktree's own build/; house commit style per `git log --oneline -15` main.
+
+### Run 1 full transcript
+
+TP2PP2-PREVIOUS-LOG.txt (in this directory) is run 1's COMPLETE console
+transcript — every file it read (with the actual code passages: budget
+contract, auto_cache sizing, xpeers wiring, peer refill/verify, residency
+tables) and its running narration. Read it in full before implementing;
+it replaces re-exploring those areas from scratch.
+
+---
+
+## Run 2 — M1 (stage-pair scaffold + EP-within-pair)
+
+### What was built
+
+`--tp-size 2` (flag) / `BASALT_TP2=1` (environment, the launcher form) turns each
+stage of a layer split into a PAIR of cards. With `--gpu 0,1,2,3`: stage A = layers
+0-23 on CUDA0 (lead) + CUDA1 (partner), stage B = layers 24-47 on CUDA2 + CUDA3.
+Default `--tp-size 1` is the plain split, byte for byte as before; nothing in the
+tp2 path runs unless the size is 2.
+
+- Stage cards are **assigned, not chosen**: stage `s` leads on CUDA `2s`, its partner
+  is CUDA `2s+1`. `--split-device` is refused under tp2 for that reason.
+- The **expert split within a pair is by expert-id parity**: the lead holds the even
+  ids of its stage's layers, the partner the odd ones. Every profiled pair lands on
+  exactly one card, each card's tier is half the depth, and each card still fills its
+  tier hottest-first from its stage's own ranking (`pair_ranked` in generate.cpp).
+- The **partner card is a `PeerExperts` tier** attached to its stage's verifier via
+  the existing `Verifier::set_peer()` peer window, and to its stage's prompt path via
+  the existing `Prefill::set_ring_remotes()` d2d path. No new routing was written.
+  `GpuStage` gained `pair_dev` + `pair`.
+- Boot log: `tp2/pp2: stages A(layers 0-23)=[CUDA0,CUDA1] B=[CUDA2,CUDA3]`, plus one
+  `tp2: CUDA%d holds N of the M ranked pairs ...` line per partner card.
+
+### Things the code told us (not obvious from the brief)
+
+1. **`--layer-split` and `--split-device` are not CLI flags at this HEAD.** They were
+   removed by `30f0596d` ("gpu: one setting picks the cards"); the split is entered
+   only through the price model (`plan_multi_gpu` picking `LayerSplit`) or
+   `BASALT_FORCE_SPLIT=1`, both of which set `o.layer_split = "auto"` internally.
+   `Options::split_device` is now dead (nothing assigns it). So `--tp-size 2` forces
+   the split on in exactly that same place, the way `BASALT_FORCE_SPLIT` does.
+2. **Attaching a peer to a verifier silently enables two weight splits.**
+   `Verifier::dm_init()` calls `hs_init()` (head split by vocabulary) and `gs_init()`
+   (GDN mixer split by key head) whenever `dm_->pdev >= 0`, i.e. whenever *any* peer is
+   set. On a partner card that would have loaded half the head and some GDN mixers onto
+   the card we just filled with experts, and moved state off the lead card. Added
+   `Verifier::set_peer_experts_only(bool)`; the tp2 path sets it, and those two inits
+   are then skipped. This is the one engine-surface change outside `generate.cpp`.
+3. **The auto layer-split search cannot price a pair** (`predict()` gives stage `i` one
+   card's cap), so under tp2 the cut is even: `K = i * n_layers / n_stages` (48 → 24).
+   The search is left untouched for the plain split.
+4. **The RAM/budget contract is kept, deliberately on the tier-card side.** Partner-held
+   bytes are added to `peer_only`/`peer_only_bytes` exactly like the `--peer-device`
+   tier cards' bytes, so `gpu_held = min(expert_total_bytes, cache_fill_bytes +
+   peer_only_bytes)` keeps its shape and the resident complement stays the same size as
+   the plain 4-card split's (an auto-sized tier does not suddenly want ~2x the RAM).
+   Consequences, stated plainly:
+   - a partner-held expert has **no pinned host copy**; it is served by the partner's
+     peer window (device plan on), by a d2d copy in the prompt path (ring remotes), or
+   - if the device-planned MoE tail is off (non-native pack, `--remote-expert-opt`,
+     `--no-pool`...) the CPU path reads those same bytes **through the file mapping**:
+     correct, slow. `FileExpertSource::blob()` falls back to `mapped_blob()`.
+   - the adaptive swapper cannot move a partner expert: it is not `servable()` (not
+     RAM-resident) and never appears in `host_res`, so swaps stay within the lead
+     caches. `PeerExperts::adapt()` is never called on a partner tier.
+   - the alternative (counting partner bytes as CPU-side) was rejected: it doubles the
+     complement against the baseline run and would make the budget contract refuse to
+     boot on this box, i.e. unmeasurable.
+5. `set_peer_portable(true)` already covers a layer split, so the partner card's
+   mapped host rows are allocated Portable ✓; peer access is enabled for every ordered
+   pair of chosen cards ✓ (tp2 additionally refuses when `gpu_peer_access()` is false).
+6. `PeerExperts::prepare()` requires `device >= 1`; partner cards are CUDA 1,3,.. so
+   that holds by construction.
+
+### What M1 does NOT do (honest list)
+
+- **Nothing is measured.** No runtime verification at all: the production server is
+  live, so no engine start, no restart, no `basalt-ctl`. Verification was: build green
+  (`cmake --build build -j4`), `ctest` unchanged in its pass/fail set (the failures are
+  this box's environment: GPU tests hit `flush: out of memory` beside the live server,
+  `expert_multi_test` needs AVX512 this CPU lacks; both pass/fail identically when run
+  alone), `tools/check_platform_boundary.sh` ok, `tools/check_stderr_logging.sh` ok,
+  and `--help` / `--tp-size 3` / `--gpu-plan` CLI checks.
+- **Attention head-split within the pair: not done** (M2). All attention and dense
+  compute for a stage still runs on its lead card.
+- **No collectives**: no `tp2_all_reduce` helper yet (M2/M3).
+- **Partner card holds no state** and no session; it is experts only. The slot model's
+  `slot_cap` semantics are unchanged (a slot's conversation still has its state on the
+  two stage lead cards).
+- **Pipelined windows**: both chains (`ver`/`ver_b`, `gs.ver`/`gs.ver_b`) are given the
+  same partner tier. Each verifier owns its own peer window, and the tier is read-only
+  to them, so this is safe — but with both chains live the two peer kernels each take
+  the full `dec_moe_peer_blocks()` on one card, i.e. they oversubscribe it. Unmeasured.
+- `--expert-cache N` (an explicit count) is allowed and simply caps the lead's tier;
+  the partner sizes from its own card's free memory.
+- Numerics: expert rows are computed by the same kernels from the same activations on
+  either card of the pair (`peer_experts.hpp` states the bit-identity), so the placement
+  itself is not a numerics change. If the device plan is off and the file fallback is
+  taken, the CPU's rounding differs from the GPU's — the already-documented
+  resident/CPU-vs-GPU caveat, not a new one. No numerics gate was run (unmeasured).
+
+### Open questions for the reviewer
+
+1. Is counting partner-held bytes in `peer_only_bytes` the right side of the budget
+   contract, or should the resident complement stay complete (at ~2x RAM)?
+2. Should `hs_init()`/`gs_init()` be re-allowed for the *last* stage's partner card
+   (it has VRAM to spare only if its expert tier is small)? Left off for M1.
+3. Oversubscription of the partner card by the two pipelined chains: divide
+   `pblocks` by the number of chains, or refuse `--tp-size 2` with pipelined windows?
+4. `--no-pool` + tp2 was not reasoned about end to end; with the device plan off it
+   reads partner experts from the file. Refuse the combination?
+5. M2's head-split needs a decision the brief already made (KV head-sharded, 1/4 KV per
+   card): that touches the session carve (`session_bytes(..., lb, le)`), which today is
+   per stage, not per card. Flagging it early.
+
+### Runbook for the eventual measurement run (NOT executed here)
+
+```
+# from this worktree, after the maintainer stops the live server
+./bin/basalt --serve --model <pack> --gpu 0,1,2,3 --tp-size 2 \
+    --resident-experts --resident-budget-gib <as basalt-ctl picks> \
+    --max-context 262144 --parallel 4 ...        # the rest as basalt-ctl builds it
+```
+Expected start lines: `tp2: each layer split stage is a pair of cards`,
+`tp2: 2 stages of 24 layers each, K=24`, `tp2/pp2: stages A(...)=[CUDA0,CUDA1]
+B(...)=[CUDA2,CUDA3]`, then two `tp2: CUDA%d holds ...` lines. Compare against the same
+command with `--tp-size 1` (the plain 4-card split, which is what BASALT_FORCE_SPLIT
+gives today).
+
+### M1 addendum (same run): the split is now a tested header
+
+`pair_holds` / `pair_ranked` / the stage card assignment moved out of the `main` lambdas into
+`include/basalt/program/tp2_pair.hpp` (pure, inline), and `tests/program/tp2_pair_test.cpp`
+(`basalt_cpu_test`, runs here: passes) is the oracle for the invariant the whole design sits
+on: of a pair exactly one card holds each expert, the halves are disjoint and cover the
+ranking, they keep its order, they balance to one expert, and the stage cards come in pairs.
+Mutation-checked: perturbing the parity expression fails the test.
+
+While reviewing the diff for runnability (it cannot be run), three things were fixed:
+
+- `--tp-size 2` no longer depends on the price model having chosen an expert-tier card: the
+  old form turned the split on only `&& o.peer_device >= 1`, so a 4-card run whose plan
+  settled without a peer tier would have refused with "needs a layer split".
+- the mmap-mode sizing (`o.mmap_experts`, generate.cpp ~3427) counts CUDA0's cache as its
+  lead half, like every other sizing site.
+- `pair_holds(e, 1, 1)` (a rank the stage does not have) is false rather than true.
+
+Two known conservative corners, both left alone deliberately:
+- the mmap-mode estimate does not count the partner cards' room, so it can warn "the rest is
+  read from the SSD" for a placement that actually fits; the resident path (what the server
+  uses) counts them.
+- with no profile section, CUDA0's cache is still sized from the whole card's free memory
+  while only the even ids will ever be admitted to it. The pack has a profile; the plain
+  split has the same shape of waste when a profile is missing.
+
+### M2 (attention head-split + 2-way all-reduce): assessed, not attempted
+
+The brief makes M2 conditional on the code cooperating. Reading the seams, it does not, and
+the missing one is the session carve:
+
+- `session_bytes`/`session_init` (src/core/session.cpp:48) take a *layer range* only. There
+  is no head dimension anywhere in the carve, so "¼ of the full KV per card" needs a shard
+  parameter threaded through `session_init`, `session_copy_state` (the slot copy and the
+  paging paths), `prompt_session_bytes`/`_carve`, `qsa_state_bytes`, the QSA KV pools and
+  page tables, the conversation checkpoints, and the slot carve arithmetic in generate.cpp.
+  That is a state-format change, which per AGENTS.md owes a parity test, a profile and a
+  `docs/precision/` update - none of which can be produced without running the engine.
+- The arithmetic of the split itself is fine (24 query heads / 2 KV heads, head_dim 256: 12
+  query heads and 1 KV head per card), but the indexer (`idx_n_head` 4, `idx_dim` 128) and
+  the selection (`idx_top_k` 2048) are per query head and have to move with the heads
+  through `qsa_dec_attn_seg` / `qsa_decode_attn`, which take the whole `QsaShapes` plus the
+  layer's pools.
+- The GDN side has the right precedent - `gdn_head_split.hpp` + `Verifier::gs_init` already
+  split key heads onto a peer card - but for one layer group on a tier card, not for 36
+  layers inside a stage. Reusing it means changing what `gs_init` means, which tp2 currently
+  switches off (see `set_peer_experts_only`).
+- Decisive for this run: the GPU test suite does not run while the server is live (17 of the
+  35 parity tests fail with `cudaMalloc: out of memory` even when run one at a time), so a
+  new collective kernel would land with no parity test and no microbench line - which
+  AGENTS.md requires for every kernel, and which an exploratory branch should not wave
+  through. For the same reason the `tp2_all_reduce` helper was left out: uncalled and
+  unrunnable, it would be dead code a reviewer has to read and nobody can execute.
+
+What M2 needs before it is written: the engine running (server stopped), so the head-shard
+can be checked against `qsa_*_parity` and a greedy-identity decode A/B, and so the split's
+own cost is measurable against the plain 4-card split. The `docs/configuration/gpus.md`
+paragraph says so in the open.
+
+## Run 3 — M2 (the pair's head split), engine never started
+
+Constraints kept: the live server was never touched, nothing was restarted, no engine
+process was launched, builds were `cmake --build build -j4` in this worktree's own
+`build/`.  Every GPU number below is a development A/B on this box (4x RTX 5060 Ti,
+180 W limit each), not a headline.
+
+### Landed, four commits
+
+- `c10fb57f kernels: tp2_all_reduce - a 2-way all-reduce, one push per rank, tested against its reference`
+  `include/basalt/kernels/tp2_collective.hpp`, `src/kernels/cuda/tp2_collective.cu`,
+  `tests/kernels/tp2_allreduce_parity.cpp`.  A pair's two cards each push their partial
+  into the other's staging buffer and add `this + peer` in that order, which the test
+  pins bitwise against `tp2_all_reduce_ref`.  Refusals (odd rank, wrong size, no peer
+  access, over-long vector) return false; a stalled partner trips a mapped host timeout
+  word rather than hanging the caller.  Skips with rc 77 below two peer-accessible cards.
+- `6bc43264 core: a session can be carved for one card's heads - the pair's QSA shard`
+  `include/basalt/core/qsa_head_split.hpp` plus shard parameters on `qsa_state_bytes`,
+  `qsa_state_init`, `qsa_prompt_state_bytes/_carve`, `qsa_buffers_bytes/_init`,
+  `session_bytes`, `session_init`, `prompt_session_bytes/_carve`, and `heads` recorded on
+  `QsaState`, `QsaBuffers`, `SessionState`.  Every parameter defaults to the whole layer,
+  so an unsplit session's figures are unchanged.  New: `qsa_real_shapes(ModelGeometry)` is
+  the one place a geometry becomes kernel shapes.
+- `6c8d7edb kernels: the pair's head split is bitwise-exact, shown where the engine will run it`
+  `tests/kernels/tp2_head_split_parity.cpp`, and `tests/core/qsa_head_split_test.cpp`
+  registered (it had never been built) with a weight-slice section.
+- `a65ec93a core: a head shard may be sized but is refused at every QSA executor`
+  `qsa_shard_runs()` gating `qsa_layer` and `qsa_kv_resolve`, and `qsa_layer` checking
+  its state's shard against its buffers'.
+
+### Proven
+
+1. **The head split is exact, at the entries the engine uses.** Each card's shard of the
+   QSA decode attention is the SAME BITS as that card's rows of the whole run:
+   `kv_gather_step`, `qsa_attend_step`, `qsa_decode_attn_step`, `qsa_decode_attn_batch`
+   (n_q=8, per-query selections) and the gate, at 24 query / 2 KV heads, dim 256, shard
+   12 / 1, permuted page table, 4096 cells, 2051 selected.  0 failures.
+   Mutation-checked: rank 0's shard pointed at rank 1's KV head fails the gather on the
+   first element; comparing rank 1 against rank 0's rows fails every rank-1 check.
+2. **The all-reduce matches its CPU reference bitwise**, 8x2048 fp32 at 21.7 us per
+   collective, 2.89 GiB pushed per rank per second (this box, both cards idle-ish while
+   the server holds VRAM).
+3. **A pair card's session really is smaller, by exactly the QSA part.**
+   `session_bytes(whole) - session_bytes(shard)` equals the QSA state and scratch deltas
+   to within the carve's 256 B rounding, for the whole model and for 24-layer stage
+   ranges; the two cards of a pair carve equal sizes.  At 131072 cells: 3.339 GiB whole,
+   1.837 GiB per card of a pair.
+4. **A shard's weights are the whole layer's bytes.** `gdn_gather_cols` over
+   `qsa_out_cols` gives each card the whole o_proj row at its own heads' columns, for
+   32/64/128/256-column blocks; `gdn_gather_rows` over `qsa_kv_rows` / `qsa_q_rows` the
+   same for K, V and q; a head_dim that will not cut on blocks is refused.  Built and
+   checked under `-fsanitize=address`.
+5. **The split invariant** (`tp2_pair_test`, from run 2) and the CPU label still pass:
+   1 failure out of 64, `expert_multi_test`, this CPU lacking AVX512-VNNI/VBMI.
+   `tools/check_platform_boundary.sh` and `tools/check_stderr_logging.sh`: ok.
+
+### What the code said
+
+- `qsa_decode_attn.cu` hard-codes `G = 12` (query heads per KV head) and asserts
+  `n_head == G * n_head_kv`.  A KV-group shard satisfies it exactly (12 == 12 x 1), which
+  is why the shard needs no kernel change.  A shard that split the query axis instead
+  would trip that assert - the design and the kernel agree, by luck as much as intent.
+- The batch entry wants `q` as `[n_q, n_head, head_dim]`, and its per-query stride is
+  `n_head_kv * G * head_dim`.  A single-query q buffer handed to it makes queries 1..n_q
+  read past the end; that is how the window section first "failed", before any kernel was
+  suspected.  Any q slice for a shard must be packed at the shard's width.
+- `qsa_head_split_test.cpp` existed but was never in `CMakeLists.txt`, so it had never
+  been compiled.  Once built it failed two assertions and, in code I had written earlier
+  in this session, went out of bounds in a `gdn_gather_rows` call.  Unrun tests are not
+  tests.
+- `session_bytes` rounds its total, so an identity between two session figures is exact
+  only to 256 B; the test says so with a named slack rather than a shrug.
+
+### What is NOT tested — the whole list
+
+- **Nothing has ever run a shard.** No session with a shard is constructed by any caller;
+  `qsa_layer` and `qsa_kv_resolve` refuse one (`a65ec93a`).  The plumbing is inert.
+- The `Tp2Pair` device path was exercised only by its own test, on two cards, in one
+  process, in lockstep, with no other load.  It has never been used by the engine, never
+  been used from two threads, never been used while the server held VRAM, and its timeout
+  path has only been provoked by the test stalling a partner on purpose.
+- The parity tests and microbenches that the quality gate wants for a changed kernel were
+  not run as a suite: the live server holds ~15 GiB per card, and `qsa_seg_parity`
+  OOMs here at `HEAD` as well as at this branch (verified by stashing and rebuilding).
+  `qsa_parity`, `qsa_dec_attn_parity`, `qsa_prompt_attn_parity`, `gdn_parity`,
+  `prompt_split_state_test`, `conversation_snapshot_test` do pass individually.
+- No PPL/KLD, no greedy-decode A/B, no profile, no prefill or decode window measurement.
+  AGENTS.md requires those for anything that can alter precision; **the row split
+  (dense/FFN partials summed by the all-reduce) changes reduction order and belongs
+  under that gate.  The head split does not, and the parity test above is its evidence.**
+- M3 (dense/FFN row-split inside the pair) is untouched.  The seams allow it -
+  `native_mmvq` takes `n_out`, and `gdn_gather_rows` already packs row ranges for the GDN
+  split - but its evidence is the numerics gate, which needs the engine.
+- Windows: `tp2_collective.cu` is CUDA-only like its neighbours, no platform seam added,
+  `check_platform_boundary` passes; CI's Windows CPU build has not been run here.
+
+### What must happen before a shard can run
+
+In rough order, with the seam each one is at:
+
+1. Pack the shard's weights at stage setup, reusing `gdn_gather_rows` / `gdn_gather_cols`
+   the way `Verifier::gs_init()` does for the GDN mixer (that function is the precedent
+   end to end: pack, upload to the other card, keep both cards' copies).  Needed:
+   `attn_q` rows `[q0*2*hd, +nq*2*hd)`, `attn_k`/`attn_v` rows `[kv0*hd, +nkv*hd)`,
+   `attn_output` columns `qsa_out_cols()`.  `Verifier::set_peer_experts_only` already
+   keeps stage weights off a partner card; this is where they go back on.
+2. Give the partner card the block input, and the pair's summed output back to the lead.
+   That is the stage handoff in `src/program/generate.cpp` (`bslot_ss`, `set_stage`) plus
+   one `Tp2Pair::all_reduce` after the o_proj.  `qsa_layer` would need to write a PARTIAL
+   for the o_proj rather than the finished block output.
+3. Decide the indexer's fate for real.  Today it stays whole on both cards, which is what
+   buys bitwise equality and costs a redundant 4-head projection and top-k per step.
+4. Then, and only then, lift `qsa_shard_runs`' refusal, add the shard's parity test
+   against the unsplit engine (greedy tokens identical) and the profile line.
+
+### Decisions the reviewer owes this branch
+
+- Whether a shard's `attn_output` partial is summed by `Tp2Pair::all_reduce` (fixed
+  order, this + peer) or by the lead card collecting both partials.  The first is what
+  the helper does; the second is fewer moving parts but serialises.
+- Whether the partner card computes the indexer redundantly (current design, bitwise) or
+  the pair shares one selection through a collective (cheaper, needs a tie policy).
+- The run-2 questions are still open: partner-held expert bytes in `peer_only_bytes`,
+  `hs_init`/`gs_init` on last-stage partners, pipelined-window oversubscription,
+  `--no-pool` with tp2.
+
+### For `TP2PP2-MEASURE.md` (the reviewer's checklist), M2 adds
+
+The restart-window checklist stays the reviewer's.  M2 adds four lines to it:
+
+- [ ] `ctest -R "tp2_allreduce_parity|tp2_head_split_parity" --output-on-failure` with the
+      cards free - both skip (rc 77) rather than fail without peer access, so a silent
+      skip means the topology was wrong, not that the split is fine.
+- [ ] greedy-decode A/B: same prompt, `--tp-size 1` four-card layer split vs `--tp-size 2`
+      stage pairs, tokens identical.  Until a shard is runnable this compares M1's expert
+      split only; it is the regression net for the pair's expert half.
+- [ ] one profile line for the QSA decode attention at the real window, whole vs split,
+      to check the 1.77x measured here on a single card (two half-width attentions against
+      one full one) is paid for by the two cards running at once.
+- [ ] if `Tp2Pair` is ever driven from the engine: the timeout path under load, with the
+      partner stalled by the scheduler rather than by a test.
+
+### Run 4 handoff (reviewer, 05:20 UTC)
+
+Run 3 (revived, 718b7f74) completed M2b (wired head split: b51af240,
+b0dce812, 7a1a512c) and died at its 262k context ceiling mid-M3. Its
+UNCOMMITTED M3 work is in the tree: the native-image block width became
+type-dependent (qsa_native_block_elems, mirrored against
+native_mmvq_weight_bytes with a refuse-on-disagreement cross-check in
+qsa_prepare_one), layer.cpp wired to the check, tests extended. NOT
+verified: build + tp2_shard_weights_test + tp2_head_split_parity. Run 5:
+verify, commit if green, then assess the remaining M3 execution wiring —
+small session, work from this file and the diff, NOT from history.
+
+## Run 5 — M3 verification, one fix, and the remaining-wiring assessment (05:15–05:55 UTC)
+
+Constraints kept: the live server was never touched, nothing restarted, no engine process, no
+`basalt-ctl`, nothing bound on :8000; builds were `cmake --build build -j4` in this worktree's `build/`.
+`tp2_head_split_parity` was run (run 5's task asked for it) and allocates little, so it passed beside the
+running server; it started no engine and touched no port.
+
+### 1. The uncommitted M3 hunk verified, committed as two commits
+
+`d4f9a0ab core: the shard cuts the native image on its type's block width, checked against the kernel`
+is the predecessor's work: `kQsaNativeBlockCols` (a hard 256) replaced by `qsa_native_block_elems(type)`
+- 32 for the legacy forms (2, 6, 7, 8, 20), 64 for Q2_0 as type 42, 256 for the K-quants and the wide IQ
+types, 0 for anything else - with every native figure (block size, span legality, packed byte count, the
+`gdn_gather_cols` stride) going through that one table, and the refusal of an unknown type instead of a
+division by it.
+
+**What it got wrong, found while reviewing the committed diff and fixed in
+`e796f42b core: the pair's native-image cross-check compares the whole image, not one row`.**
+`qsa_prepare_one`'s cross-check multiplied one block's bytes by the block count along the input axis and
+compared that against `qsa_native_bytes` - which is the WHOLE image, `ne1` rows. The two figures are equal
+only when `ne1 == 1`, so the check as written refused every real `attn_output` (4096 rows) with "the
+split's table and the kernel's disagree". It passed the CPU suite because `qsa_prepare_one` is CUDA-only
+and nothing calls it; it would have failed the first time the engine ran a shard. The multiply-up now lives
+in the pure header as `qsa_weight_native_bytes_from_block(w, block_bytes)`, which is also what makes the
+check mean something: the block comes from the kernel's table, the image from the split's, and the two must
+agree. Mutation-checked: dropping the row factor fails 3 checks.
+
+The order is on the record: the hunk was committed after the tests named in the task passed, and the defect
+was caught in the review pass over my own commit, not before it.
+
+### 2. Verification (run 5)
+
+- `cmake --build build -j4`: green. `layer.cpp` also recompiled standalone from its ninja command to be
+  sure the committed hunk really compiled; its only warnings are the file's pre-existing
+  `-Wmisleading-indentation` ones, unchanged in count from HEAD (37 long lines before and after).
+- `tp2_shard_weights_test`, `qsa_head_split_test`, `session_head_shard_test`, `tp2_pair_test`: all ok.
+- `tp2_head_split_parity`: 0 failures, figures unchanged from 7a1a512c (1.77x back-to-back, worst
+  |split - whole| 4.1e-08 against max |y| 0.236, combine bitwise vs `tp2_all_reduce_ref`).
+- `ctest -L cpu`: 66 of 67; the single failure is `expert_multi_test` (this CPU lacks AVX-512-VNNI/VBMI) -
+  the branch's known environment failure, identical at HEAD.
+- `tools/check_platform_boundary.sh`, `tools/check_stderr_logging.sh`: ok.
+
+### 3. M3's remaining execution wiring: assessed, NOT started
+
+Verdict: **larger than the head-split wiring, and blocked on a piece that does not exist at all.** Two
+things have to be true for a split to *execute*; today neither is.
+
+**(a) Nothing in the engine drives a pair - and never has.** Verified by grep, whole tree:
+`Tp2Pair::open` has no caller outside `tests/kernels/*`; `qsa_pair_prepare`, `qsa_pair_bytes` and
+`qsa_pair_free` have no caller outside `src/core/layer.cpp` itself; `QsaBuffers::pair` is set by no one but
+`tests/core/session_head_shard_test.cpp`; `generate.cpp` never names `QsaHeadShard` and every
+`session_bytes`/`session_init`/`prompt_session_bytes` call site (generate.cpp 2123, 2719-2875) leaves the
+`heads` parameter at its default `{}` - the whole layer. `o.tp_size` never reaches `src/core` at all: it
+lives in `options.hpp`, `generate.cpp` and `program/tp2_pair.hpp`. So the head split is *wired at the layer
+entry* (b0dce812) and *inert in the engine*; M3's FFN split would be inert too if written the same way.
+
+**(b) The partner card runs no layer compute.** `GpuStage` (`src/program/engine_local.hpp:144`) carries
+`pair_dev` and a `PeerExperts` tier and nothing else on that card - no `WeightTable`, no `NativeDense`, no
+`SessionState`, no `Verifier`, no stream; `generate.cpp:3605-3656` says so in its own comment. A row split
+needs the partner to hold half the FFN and run it. That is a new executor per stage (weights up, buffers
+carved, per-card non-default streams - the parity test already proved the legacy default stream deadlocks
+the pair), plus the block input reaching it and the summed output coming back: the stage handoff is
+`bslot_ss` (generate.cpp 2780-2850) and `GpuStage::state_in`/`state_back` (`StagedCopy`, 5450). Nothing
+replicates a block input to a second card today. `Verifier::set_peer_experts_only` (verify.cpp:728) is the
+switch that keeps stage weights off the partner; the first thing (b) has to decide is what it now means.
+
+**(c) The FFN row split's own kernel surface does not exist.** `shared_expert`, `shared_expert_multi` and
+`shared_expert_multi_rows` (`include/basalt/kernels/shared_expert.hpp:52-73`) take whole `n_ff` with no row
+offset, and `shared_expert_scratch_bytes(n_ff)` sizes the intermediate for the whole width; `moe_shared`
+(layer.cpp:327) passes `g.n_ff` straight through. So a card's span needs either new row-range parameters on
+those three entries or a per-card packed weight plus a half-width scratch, and `moe_combine_parts`'
+`native_moe_combine` adds `shared` PLAIN, so the partial's arrival changes that addition too. Per AGENTS.md
+each changed kernel then owes a parity test against the current one and a microbench line, and the row split
+reassociates the FFN sum, so it belongs under the PPL/KLD decode gate (`basalt-bench --quality`) plus a
+`docs/precision/` page - neither producible while the server is live. `docs/precision/` has no page for the
+pair split at all today (`gdn-split.md` is the GDN tier split, a different thing); that gap is M2's and this
+branch's, and the reviewer should decide whether it lands with the wiring.
+
+**Why the same row-split view work was NOT added speculatively.** `tp2_shard_weights.hpp`'s cut helpers are
+generic over `WeightRef`, so an FFN's gate/up rows and down columns would in fact cut cleanly today -
+`ffn_down_shexp` is legacy-type with `n_in` 640, which the now-type-dependent block width is what made
+cuttable at all (256 does not divide 640; 32 does). But a view nobody attaches, behind a pair nobody opens,
+on a card that runs nothing, is dead code a reviewer must read and nobody can execute - the reason run 2's
+notes left `tp2_all_reduce` out at the time. Writing it now would also pre-empt two decisions the reviewer
+owes (below).
+
+**What to build, in the order that makes each step testable:**
+
+1. Per-stage pair ownership in `generate.cpp`: one `Tp2Pair` per stage pair (open at start, one byte pool),
+   the shard's packed bytes accounted through `qsa_pair_bytes`, one `QsaPair` per card, `qsa_pair_prepare`
+   called at setup, and `QsaBuffers::pair` attached when the session is carved. Boot log names the pair the
+   way M1's lines do. Testable only on hardware; the CPU side is already covered.
+2. Carve the sessions per card: `session_bytes`/`session_init`/`prompt_session_bytes`/`_carve` take the
+   card's `QsaHeadShard`, and the slot arithmetic in generate.cpp 2780-2880 sizes both cards' carves. The
+   figures are already tested (`session_head_shard_test`); what is new is a caller passing a shard.
+3. The block-input handoff to the partner card and the summed output back to the lead, beside the existing
+   `bslot_ss`/`StagedCopy` seams, on per-card streams.
+4. Only then the FFN row split itself: new row-range entries beside the three `shared_expert*` forms (their
+   parity tests against the current ones), packed views for `ffn_down_shexp`, half-width scratch, one
+   `tp2_all_reduce` after the down projection, and a refusal gate shaped like `qsa_shard_ready`.
+5. Then the reviewer's gate: greedy-decode A/B `--tp-size 1` vs `--tp-size 2`, PPL/KLD, one profile line.
+
+### 4. Decisions the reviewer owes before (c) is written
+
+Unchanged from run 3, plus one:
+
+- Whether the FFN partial is summed by `Tp2Pair::all_reduce` (fixed `this + peer` order) or collected on the
+  lead.
+- Whether the partner card computes the indexer redundantly (current design, bitwise) or the pair shares one
+  selection.
+- What `set_peer_experts_only` means once a partner card holds dense weights.
+- NEW: whether the shared expert is row-split at all, given the routed experts are already split by expert
+  id (M1) but computed on the LEAD card through the peer window. Splitting the shared expert's `n_ff` adds a
+  collective per layer for one of the model's ~10 expert units per layer; splitting the *routed* compute
+  instead (each card computes the experts it holds, on its own card) is the larger win and the larger change,
+  and it is adjacent to the brief's "out of scope: expert weight sharding".
+
+### 5. For the 09:50 UTC test window
+
+Nothing in run 5 changed any executed path: `qsa_pair_prepare` still has no caller, so the shipped
+behaviour at `--tp-size 1` and `--tp-size 2` is byte-for-byte what run 3 left. The two new commits are
+therefore regression-neutral; the CPU suite and `tp2_head_split_parity` above are the evidence. The M1
+expert-split greedy-decode A/B and the pair's boot-log lines stay the reviewer's, exactly as TP2PP2-MEASURE.md
+has them.
+
+## Run 6 — the tp2 boot bug (reviewer's 05:15 log): CUDA1 twice, CUDA3 never
+
+### 1. What the log actually says
+
+```
+tp2/pp2: stages A(layers 0-23)=[CUDA0,CUDA1] B(layers 24-47)=[CUDA2,CUDA3]   <- the topology: right
+layer split: CUDA0 loads the dense weights of layers 0-23 only               <- the leads: right
+layer split: CUDA2 runs layers 24-47, expert cache 2276 slots (5.86 GiB)      <- the leads: right
+tp2: CUDA1 holds 5553 of the 12288 ranked pairs of its stage's layers (14.30 GiB of 14.30 GiB room)
+tp2, CUDA1 partner tier: no room for its half of its stage's experts (0.00 GiB left after the reserve)
+```
+
+CUDA1 is named twice, CUDA3 not at all, and no `basalt load: cuda3` line exists. Stage A's partner tier filled
+CUDA1 to the card, then stage B's partner tier was opened on the same card and found it full.
+
+### 2. The cause
+
+`generate.cpp`'s partner loop took the stage number from the position in `stages` — but `stages` holds only the
+stages after the main card's (CUDA 0 leads stage 0 and is not in the list). So `stages[0]`, which is stage B on
+CUDA2, asked for `pair_partner_dev(0, 2)` = CUDA1 instead of CUDA3. `cudaMemGetInfo` on the already-full CUDA1
+then returned the 0.00 GiB the message quotes.
+
+The reviewer's reading — that CUDA1's 14.3 GiB was the price model's expert-tier fill — is not what happened: the
+`--tp-size 2` branch had already emptied `o.peer_devices`/`o.peer_device`, so the tier path (`open_peer`,
+`spread_experts`) never ran, and CUDA0's 7.4 GiB / CUDA2's 9.0 GiB are the leads' dense weights, sessions and
+expert caches. CUDA1's 14.3 GiB was tp2's own stage-A partner tier. The `gpus:` line calling those cards
+`expert tier` was a genuine bug, but a reporting one: `choose_roles()` did not know about the pairs.
+
+### 3. The fix (two commits)
+
+- `pair_partner_of_lead(lead_dev, tp_size)` in `tp2_pair.hpp`: a stage's partner is the card beside its lead, and
+  a card that leads no stage gets -1. `generate.cpp` asks that, so the list position can no longer be mistaken for
+  a stage number; a card asked for two stages' halves now refuses the boot by name instead of loading until full.
+  `tp2_pair_test.cpp` pins the two spellings against each other and that a run's leads and partners are its cards,
+  each exactly once (14 failures if the partner is `lead + tp_size`).
+- `RoleInputs.tp_size` and `GpuRole::StageLead`/`StagePartner` in `gpu_select.{hpp,cpp}`: with `--tp-size 2` no
+  card is an expert tier, so `gpus:` reads `main, stage partner, stage lead, stage partner`, and `o.peer_devices`
+  is never populated rather than cleared afterwards. A tier card appearing under tp2 now refuses the boot.
+  `gpu_select_test.cpp` pins the role line for 4 cards, with and without peer access, and that `tp_size` 1 still
+  gets the tiers. `max_expert_tiers` no longer says anything about a pair-wide run.
+
+### 4. Validation and what is still the reviewer's
+
+Build green at `-j4`. `tp2_pair_test`, `gpu_select_test`, `multi_gpu_plan_test`, `tp2_shard_weights_test`,
+`qsa_head_split_test`, `session_head_shard_test` ok; `ctest -L cpu` 66/67 with only the known `expert_multi_test`
+AVX-512 environment failure; the platform-boundary and stderr-logging checks ok. Nothing ran on a GPU: the four
+cards' boot under `--tp-size 2` — CUDA1 holding stage A's odd ids, CUDA3 stage B's, both leads' caches unchanged —
+is the reviewer's to confirm, as is the M1 greedy-decode A/B.
+
+## Run 7 — the 05:50 / 06:15 arena OOM was the cards being busy, not a tp2 fill
+
+Both boots died at generate.cpp's first `cudaMalloc` - the 771 MiB weight arena - with "422 MiB of 15888 MiB free".
+Nothing else in the boot allocates before it (the only earlier `cudaMalloc`s are the bandwidth-probe helpers at
+860/913), so the run itself held the context plus the 21.2 MiB embedding rows: the other ~15 GiB of CUDA0 was
+another process. It was the tp1 baseline server (`/tmp/tp1-serve.log`: cuda0 10.2 GiB weights + 4.0 GiB KV) and, for
+the first attempt, a stray parity-test child that survived a pkill of its ctest parent. Two boots differing only in
+`--peer-reserve-mib` giving identical numbers is the signature: the arena's size is pack-derived and no flag enters it.
+
+The fills are not the fault and were left alone. Both are sized from measured free memory AFTER the card's arena,
+session, drafter and head are resident (lead cache 3545, partner tier 3629, both via `stage_room` at 2045, which
+holds back `--vram-reserve-mib` + the prefill ring + the windows), which is the plain split's contract and the reason
+`--peer-reserve-mib` - the expert tier's margin - does not appear there. Reserving the arena and a KV share again on
+top of a free-memory measurement would have doubled them and cut the pair's resident experts by ~6.5 GiB a card.
+
+Only change: when the arena's `cudaMalloc` fails, the engine now warns with the free and total bytes of every card the
+run means to use, so a busy box is visible instead of looking like a leak. `0592828b`.
+
+## MEASURED VERDICT (reviewer, 07:07 UTC, 2026-10-29) — tp2 loses to the plain split
+
+Method: baseline tp1 + BASALT_FORCE_SPLIT served tonight's REAL tinyllb traffic
+(86 requests, 35.43-39.76 ms/window, solo 74-90 t/s, hit 94-96%); tp2 measured on
+the same box, exclusive cards, synthetic 149k-token streams.
+
+tp2 boot 1 (id-parity split): window 38.61 ms/16w, prefill 1049 t/s, hit
+52.8-77.6%, pcie 49-52% of lookups routed over the link.
+Fix 2d3cfb74 (rank split: lead takes the hottest half): pcie 11-22% (the
+structural fix worked), but prefill 1070 t/s (unmoved - prefill touches EVERY
+routed expert, heat does not matter) and clean solo decode (94 windows):
+40.75 ms/window, 45.2 t/s, hit 76.5%.
+
+tp2 vs plain split, every axis: window 40.75 vs 35.43-39.76; solo 45 vs 74-90
+t/s; prefill 1070 vs 3750-3868; hit 76.5 vs 94-96.  The gap decomposes as:
+GPU-reach wait 11.15 vs 7.30 and per-layer host ~4x (pair coordination), against
+an attention+dense TP saving the timing shows is ~2-4 ms - smaller than the pair
+taxes.  Ideas exhausted tonight: rank-split (tried, kept - it is right), L2
+warm-up predictor coverage (sub-ms), per-layer host rework (multi-day), prefill
+locality (intrinsic: any partner-held expert routes when used; the only
+locality-preserving partition degenerates to the plain 4-stage split).
+
+WHY THE PRICE MODEL'S 24.7 IS UNREACHABLE HERE: it prices TP as if experts
+shard cleanly; on PCIe x4 the shard tax (routing or duplicated weights) exceeds
+the TP win on every axis we can measure.  An NVLink box would price differently;
+the head-split + collective infrastructure this branch proved (bitwise-exact
+split, one-push 2-way all-reduce with CPU oracles) is the reusable part.
+
+PRODUCTION RESTORED 07:07 UTC (37.3 GiB VRAM / 26 RAM / 0 spill / verified).
+The branch stands: 12 commits, build green, 66/67 CPU + 90/92 GPU (2 upstream),
+nothing measured beyond this file.
