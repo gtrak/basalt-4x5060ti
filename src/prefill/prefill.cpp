@@ -638,6 +638,7 @@ struct PeerPrefill {
     int64_t cap_rows = 0, T_max = 0;
     cudaStream_t s = nullptr;
     cudaEvent_t ev_in = nullptr;    // on the primary: the activations and the row tables are ready
+    cudaEvent_t ev_act = nullptr;   // on the primary: this half's mixed rows are written
     cudaEvent_t ev_done = nullptr;  // on the peer: its rows have landed in the primary's Dm
     // multi-GPU: the result rows go back group by group on a second stream while the next group computes
     cudaStream_t s_out = nullptr;
@@ -756,6 +757,7 @@ struct PeerPrefill {
         for (cudaEvent_t e : {ev_hx, ev_res}) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : ev_h2d) if (e) cudaEventDestroy(e);
         if (ev_in) cudaEventDestroy(ev_in);
+        if (ev_act) cudaEventDestroy(ev_act);
         if (hx) cudaFreeHost(hx);
         for (float* h : hres) if (h) cudaFreeHost(h);
         cudaSetDevice(prev);
@@ -1786,6 +1788,7 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
     }
     const bool relay = tf > 0 && !pp->p2p;   // the pinned host staging and the streams that drive it
     if (cudaEventCreateWithFlags(&pp->ev_in, cudaEventDisableTiming) != cudaSuccess) { err = "prefill peer: event"; return false; }
+    if (cudaEventCreateWithFlags(&pp->ev_act, cudaEventDisableTiming) != cudaSuccess) { err = "prefill peer: event"; return false; }
     bool ok = true;
     if (relay) {   // the primary's side of the host relay
         int lo = 0, hi = 0;   // the rows' upload at the greatest priority: the layer's end waits for it
@@ -2343,6 +2346,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::vector<PeerEntry> pseq;
         std::vector<size_t> pseq_start;
         std::vector<uint8_t> ram_take;   // n_layers x n_expert, this chunk's decision; empty with the band off
+        // Per layer: the peer could be given one of its experts at all (it holds one, or the band leaves one to
+        // it), so its activations are worth sending. Filled with the stream, on the streamed walk only - which is
+        // what the peer's FP4 share needs (`PeerPrefill::T_fp4`).
+        std::vector<uint8_t> peer_holds;
+        peer_holds.assign((size_t) g.n_layers + 1, 0);   // indexed per layer wherever the peer's share is consulted
         if (stream_all) {
             seq_start.assign((size_t) g.n_layers + 1, 0);
             pseq_start.assign((size_t) g.n_layers + 1, 0);
@@ -2356,7 +2364,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 int64_t rk = 0;
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
-                    if (ppc && ppc->peer && ppc->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
+                    if (ppc && ppc->peer && ppc->peer->has(l, e)) {
+                        peer_holds[(size_t) l] = 1;   // multi-GPU: computed on (or read from) the peer
+                        continue;
+                    }
                     int job = -1;
                     const uint8_t* b = nullptr;
                     if (m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(l, e)) {   // no host copy: from the peer
@@ -2376,6 +2387,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (ram_l && m.src->pinned(l, e) && PeerRamShare::taken(rk++, ppc->ram_num)) {
                             // leave it out of this card's stream entirely: the partner reads it and computes the rows
                             ram_take[(size_t) l * m.g->n_expert + e] = 1;
+                            peer_holds[(size_t) l] = 1;
                             pseq.push_back({(int32_t) l, e, b});
                             continue;
                         }
@@ -2640,6 +2652,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // the attention half reads only the BF16 and FP16 images of the mixed rows
                 up_mix(m.gemm, (const uint16_t*) wu->data, m.lo16, m.gated, m.R, m.grs, (const float*) wn->data,
                        half == 0 ? nullptr : m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
+                // The peer's copy of the FFN half's activations may start here: the router, the readback of the
+                // routing and the row split that decide the peer's share come after, and its link carries nothing
+                // to the peer until then.
+                if (half == 1 && peer_fp4) cudaEventRecord(ppc->ev_act, m.cs);
                 if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err)) return false;
 
                 if (half == 0 && !core::is_qsa_layer(g, l)) {
@@ -2866,6 +2882,39 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                         }
                     } else {
+                        // The layer's activations cross to the peer's card as soon as they exist, rather than after
+                        // this thread has read the routing back and split the rows: the peer's expert phase then
+                        // starts without waiting for the split. Its rows' tables and the products that read them
+                        // are enqueued on the same stream below. Only for a layer the peer can be given an expert
+                        // of at all (`peer_holds`), so a layer it computes nothing of ships no activations.
+                        if (peer_fp4 && use_mmq && fp4_l && peer_holds[(size_t) l]) {
+                            PeerPrefill& P = *ppc;
+                            const int prevd = m.device;
+                            const cudaStream_t ps = P.s;
+                            if (P.p2p) {
+                                cudaSetDevice(P.dev);
+                                cudaStreamWaitEvent(ps, P.ev_act, 0);
+                                m.tm.pmark(tl, ChunkTiming::kPIn, ps);
+                                cudaMemcpyPeerAsync(P.mixed, P.dev, m.mixed, prevd, (size_t) T * N * 4, ps);
+                                m.tm.pmark(tl, ChunkTiming::kPAct, ps);
+                            } else {
+                                cudaStreamWaitEvent(P.x_out, P.ev_act, 0);
+                                if (P.hx_live) cudaStreamWaitEvent(P.x_out, P.ev_hx_free, 0);
+                                cudaMemcpyAsync(P.hx, m.mixed, (size_t) T * N * 4, cudaMemcpyDeviceToHost, P.x_out);
+                                cudaEventRecord(P.ev_hx, P.x_out);
+                                P.hx_live = true;
+                                cudaSetDevice(P.dev);
+                                cudaStreamWaitEvent(ps, P.ev_hx, 0);
+                                m.tm.pmark(tl, ChunkTiming::kPIn, ps);
+                                cudaMemcpyAsync(P.mixed, P.hx, (size_t) T * N * 4, cudaMemcpyHostToDevice, ps);
+                                m.tm.pmark(tl, ChunkTiming::kPAct, ps);
+                                cudaEventRecord(P.ev_hx_free, ps);
+                            }
+                            // the layer's activations as FP4, once per token (the primary's bytes)
+                            fp4::quantize_tokens(P.mixed, T, N, N, P.f_a4x, P.f_gsx, ps);
+                            m.tm.pmark(tl, ChunkTiming::kPQuant, ps);
+                            cudaSetDevice(prevd);
+                        }
                         // group the (token, k) pairs by expert on the host
                         // (the sync below also orders this layer's writes of slot/src/bounds after the previous
                         // layer's kernels that read them)
@@ -3167,36 +3216,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 err = "prefill: the peer's piece table is too small";
                                 return false;
                             }
-                            // the layer's activations to the peer's card: straight across the link, or down to a
-                            // pinned buffer and up again (that buffer is free once the peer's upload of the last
-                            // layer's is done)
+                            // the activations and their FP4 image went to the peer's card above, as soon as they
+                            // were written; only what the split decided is missing, and the products follow
                             const int prevd = m.device;
                             const cudaStream_t ps = P.s;
-                            cudaEventRecord(P.ev_in, m.cs);
-                            if (P.p2p) {
-                                cudaSetDevice(P.dev);
-                                cudaStreamWaitEvent(ps, P.ev_in, 0);
-                                m.tm.pmark(tl, ChunkTiming::kPIn, ps);
-                                cudaMemcpyPeerAsync(P.mixed, P.dev, m.mixed, prevd, (size_t) T * N * 4, ps);
-                                m.tm.pmark(tl, ChunkTiming::kPAct, ps);
-                            } else {
-                                cudaStreamWaitEvent(P.x_out, P.ev_in, 0);
-                                if (P.hx_live) cudaStreamWaitEvent(P.x_out, P.ev_hx_free, 0);
-                                cudaMemcpyAsync(P.hx, m.mixed, (size_t) T * N * 4, cudaMemcpyDeviceToHost, P.x_out);
-                                cudaEventRecord(P.ev_hx, P.x_out);
-                                P.hx_live = true;
-                                cudaSetDevice(P.dev);
-                                cudaStreamWaitEvent(ps, P.ev_hx, 0);
-                                m.tm.pmark(tl, ChunkTiming::kPIn, ps);
-                                cudaMemcpyAsync(P.mixed, P.hx, (size_t) T * N * 4, cudaMemcpyHostToDevice, ps);
-                                m.tm.pmark(tl, ChunkTiming::kPAct, ps);
-                                cudaEventRecord(P.ev_hx_free, ps);
-                            }
+                            cudaSetDevice(P.dev);
                             cudaMemcpyAsync(P.src, src_h + rows_local, (size_t) rows_peer * 4, cudaMemcpyHostToDevice, ps);
                             cudaMemcpyAsync(P.f_rel, P.f_rel_host.data(), P.f_rel_host.size() * 4, cudaMemcpyHostToDevice, ps);
-                            // the layer's activations as FP4, once per token (the primary's bytes)
-                            fp4::quantize_tokens(P.mixed, T, N, N, P.f_a4x, P.f_gsx, ps);
-                            m.tm.pmark(tl, ChunkTiming::kPQuant, ps);
                             m.tm.groups(ngr);
                             const auto& f = lay.fmt[(size_t) l];
                             // The group that reads each of the peer's experts last: a hot expert's rows are cut into
