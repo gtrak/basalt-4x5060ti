@@ -215,7 +215,14 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
 }
 
 const char* gpu_role_name(GpuRole r) {
-    return r == GpuRole::Main ? "main" : r == GpuRole::ExpertTier ? "expert tier" : "idle";
+    switch (r) {
+        case GpuRole::Main: return "main";
+        case GpuRole::ExpertTier: return "expert tier";
+        case GpuRole::StageLead: return "stage lead";       // runs its stage's layers and holds its dense weights
+        case GpuRole::StagePartner: return "stage partner"; // its pair's card, holding the stage's other expert half
+        case GpuRole::Idle: return "idle";
+    }
+    return "idle";
 }
 
 std::vector<GpuRole> choose_roles(const RoleInputs& in) {
@@ -223,6 +230,14 @@ std::vector<GpuRole> choose_roles(const RoleInputs& in) {
     if (r.empty()) return r;
     r[0] = GpuRole::Main;
     if (!in.peer_access) return r;
+    // A pair-wide split replaces the price model's tier plan outright: a card leads the stage its pair belongs to
+    // and its neighbour holds that stage's other half of the experts, so no card may be filled as an expert tier
+    // beside it.  The pair's cards are `tp2_pair.hpp`'s, which this follows.
+    if (in.tp_size > 1) {
+        for (size_t i = 1; i < r.size(); ++i)
+            r[i] = (i % (size_t) in.tp_size == 0) ? GpuRole::StageLead : GpuRole::StagePartner;
+        return r;
+    }
     int tiers = 0;
     for (size_t i = 1; i < r.size() && tiers < in.max_expert_tiers; ++i, ++tiers) r[i] = GpuRole::ExpertTier;
     return r;

@@ -51,11 +51,12 @@ static std::string cards(const GpuChoice& c) {
     return s;
 }
 
-static std::string roles(const std::vector<GpuCard>& v, const GpuChoice& c, bool peer_access, int tiers) {
+static std::string roles(const std::vector<GpuCard>& v, const GpuChoice& c, bool peer_access, int tiers, int tp_size = 1) {
     RoleInputs in;
     for (int i : c.cards) in.cards.push_back(v[(size_t) i]);
     in.peer_access = peer_access;
     in.max_expert_tiers = tiers;
+    in.tp_size = tp_size;
     std::string s;
     for (GpuRole r : choose_roles(in)) s += (s.empty() ? "" : ",") + std::string(gpu_role_name(r));
     return s;
@@ -109,6 +110,20 @@ int main() {
         CHECK_STR(cards(c), "0,1");
         CHECK(c.notes.empty());
         CHECK_STR(roles(v, c, true, 1), "main,expert tier");
+    }
+    // Four equal cards run as a pair-wide split: no card is an expert tier, every card is one stage's lead or its
+    // partner, and the tier knob says nothing about that.
+    {
+        const std::vector<GpuCard> v = {card(0, "RTX 5090", 12, 0, 1792, 32), card(1, "RTX 5090", 12, 0, 1792, 32),
+                                        card(2, "RTX 5090", 12, 0, 1792, 32), card(3, "RTX 5090", 12, 0, 1792, 32)};
+        const GpuChoice c = pick("auto", v);
+        CHECK_STR(cards(c), "0,1,2,3");
+        CHECK_STR(roles(v, c, true, 3, 2), "main,stage partner,stage lead,stage partner");
+        CHECK_STR(roles(v, c, true, 1, 2), "main,stage partner,stage lead,stage partner");
+        // without GPU-to-GPU access a partner card could hold no shared experts; the engine refuses tp2 then
+        CHECK_STR(roles(v, c, false, 3, 2), "main,idle,idle,idle");
+        // tp_size 1 is the price model's plan, tiers and all
+        CHECK_STR(roles(v, c, true, 3), "main,expert tier,expert tier,expert tier");
     }
     // Four mixed cards, one of them not Blackwell.
     {

@@ -53,8 +53,11 @@ struct GpuChoice {
 /// management library and no CUDA_VISIBLE_DEVICES): numbers are then taken as given and `auto` is an error.
 GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, bool known = true);
 
-/// What a chosen card does.
-enum class GpuRole { Main, ExpertTier, Idle };
+/// What a chosen card does.  The two stage roles exist only for a pair-wide split (`--tp-size 2`,
+/// `tp2_pair.hpp`), where the price model's tier plan is replaced outright: a stage's LEAD card runs its layers
+/// and holds its dense weights, session and state, and the PARTNER card holds the other half of that stage's
+/// experts and nothing else.  Neither is an expert tier, and naming one one sends the loader down the tier path.
+enum class GpuRole { Main, ExpertTier, StageLead, StagePartner, Idle };
 const char* gpu_role_name(GpuRole r);
 
 /// The inputs of the role decision: the chosen cards, main first, and what this platform and engine can run.
@@ -62,11 +65,13 @@ struct RoleInputs {
     std::vector<GpuCard> cards;
     bool peer_access = true;        ///< the platform gives a process GPU-to-GPU access (the expert tier needs it)
     int max_expert_tiers = 1;       ///< how many cards the engine can run as expert tiers
+    int tp_size = 1;                ///< 2: every stage is a pair of cards, so no card is an expert tier
 };
 
 /// The role of each card, in order: the cards after the main one are expert tiers, as many as the engine runs, where
 /// the platform allows it, and idle otherwise. The layer split (each card a block of layers) is never picked: it
-/// measured slower than the expert tier and than the main card alone (docs/configuration/gpus.md).
+/// measured slower than the expert tier and than the main card alone (docs/configuration/gpus.md).  With `tp_size`
+/// 2 there are no tiers at all: the cards are the stages' leads and partners, in the pairs `tp2_pair.hpp` assigns.
 std::vector<GpuRole> choose_roles(const RoleInputs& in);
 
 /// One expert tier's room for experts (bytes) and its card's memory bandwidth (0: unknown, counted as equal).
