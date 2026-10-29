@@ -1267,6 +1267,7 @@ int main(int argc, char** argv) {
         for (int i : choice.cards) ri.cards.push_back((size_t) i < visible.size() ? visible[(size_t) i] : bp::GpuCard{});
         ri.peer_access = basalt::platform::gpu_peer_access();
         ri.max_expert_tiers = basalt::kernels::kDmMaxX + 1;   // the device-planned tail's peer windows
+        ri.tp_size = o.tp_size;   // a pair-wide split has no expert tiers to name, only stages' leads and partners
         const std::vector<bp::GpuRole> roles = bp::choose_roles(ri);
         std::string line;
         for (size_t d = 0; d < roles.size(); ++d) {
@@ -1363,8 +1364,13 @@ int main(int argc, char** argv) {
                 return 2;
             }
             o.layer_split = "auto";
-            o.peer_devices.clear();
-            o.peer_device = -1;
+            // Nothing may be placed as an expert tier beside a pair: the roles above already named the cards by their
+            // pair, so a tier card here means a card was placed twice over.
+            if (!o.peer_devices.empty()) {
+                basalt::log::error("basalt generate", "tp2 (--tp-size 2): CUDA%d was picked as an expert tier as well "
+                                     "as a stage's card", o.peer_devices.front());
+                return 2;
+            }
             basalt::log::info("basalt", "tp2: each layer split stage is a pair of cards (the price model picked %s)",
                               basalt::program::mechanism_name(mp.pick));
         } else if ((mp.pick == basalt::program::Mechanism::LayerSplit || (force_split && *force_split == '1')) &&
@@ -3647,9 +3653,23 @@ int main(int argc, char** argv) {
         };
         stage0_pair = std::make_unique<basalt::core::PeerExperts>();
         if (!open_partner(stage0_pair_dev, profile, xcache.resident(), *stage0_pair)) return 1;
-        for (size_t si = 0; si < stages.size(); ++si) {
-            GpuStage& st = *stages[si];
-            st.pair_dev = basalt::program::pair_partner_dev((int) si, o.tp_size);
+        // A stage's partner is the card beside the one that stage leads on.  `stages` holds the stages after CUDA 0's,
+        // so a stage number taken from a position in it names the pair beside the previous stage: two stages then
+        // share one partner card and the other partner card holds nothing.
+        std::vector<int> partners{stage0_pair_dev};
+        for (auto& stp : stages) {
+            GpuStage& st = *stp;
+            st.pair_dev = basalt::program::pair_partner_of_lead(st.dev, o.tp_size);
+            const bool taken = st.pair_dev >= 0 &&
+                               std::find(partners.begin(), partners.end(), st.pair_dev) != partners.end();
+            if (st.pair_dev < 0)
+                basalt::log::error("basalt generate", "tp2: CUDA%d is not a stage's lead card of a %d-wide split", st.dev,
+                                   o.tp_size);
+            else if (taken)
+                basalt::log::error("basalt generate", "tp2: CUDA%d and CUDA%d were both given a stage's expert half",
+                                   st.dev, st.pair_dev);
+            if (st.pair_dev < 0 || taken) return 2;
+            partners.push_back(st.pair_dev);
             st.pair = std::make_unique<basalt::core::PeerExperts>();
             if (!open_partner(st.pair_dev, st.profile, st.cache.resident(), *st.pair)) return 1;
         }

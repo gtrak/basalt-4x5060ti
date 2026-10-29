@@ -15,6 +15,15 @@ inline int pair_lead_dev(int stage, int tp_size) { return stage * tp_size; }
 /// else.  CUDA `s * tp_size + 1`.
 inline int pair_partner_dev(int stage, int tp_size) { return stage * tp_size + 1; }
 
+/// The partner of the stage that leads on `lead_dev`, from the card itself rather than a stage number: a stage's
+/// partner is the card beside its lead.  Asking for a partner with a stage number read off the engine's stage list
+/// (which holds only the stages after the main card's) puts two stages' expert halves on one card and leaves the
+/// other partner card empty, so a place that knows only the card asks here.  -1 when `lead_dev` leads no stage.
+inline int pair_partner_of_lead(int lead_dev, int tp_size) {
+    if (tp_size <= 1 || lead_dev < 0 || lead_dev % tp_size != 0) return -1;
+    return lead_dev + 1;
+}
+
 /// True when the card of `rank` (0 the lead, 1 its partner) of a `tp_size`-wide pair holds `expert`.  The split is by
 /// expert id, so of a pair of cards exactly one holds any expert and the two tiers come out the same depth.  With
 /// `tp_size` 1 the stage's single card holds every expert - the plain layer split - and there is no partner rank.

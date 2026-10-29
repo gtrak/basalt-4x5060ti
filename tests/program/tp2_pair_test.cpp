@@ -44,6 +44,30 @@ void cards() {
     CHECK(!pair_holds(411, 1, 1));   // a stage alone has no partner to hold anything
 }
 
+void partner_follows_the_lead() {
+    // The engine asks a stage's partner by the card the stage leads on, because its stage list holds only the stages
+    // after the main card's: asked by a position in that list, a stage gets the card beside the PREVIOUS stage.
+    CHECK(pair_partner_of_lead(0, 2) == 1);
+    CHECK(pair_partner_of_lead(2, 2) == 3);
+    CHECK(pair_partner_of_lead(6, 2) == 7);
+    CHECK(pair_partner_of_lead(3, 2) == -1);   // a partner card leads no stage, so it has no partner of its own
+    CHECK(pair_partner_of_lead(5, 2) == -1);
+    CHECK(pair_partner_of_lead(-2, 2) == -1);
+    CHECK(pair_partner_of_lead(0, 1) == -1);   // the plain split's stage has no partner
+    for (int s = 0; s < 8; ++s)
+        CHECK(pair_partner_of_lead(pair_lead_dev(s, 2), 2) == pair_partner_dev(s, 2));
+    // a run's stages and partners are its cards, each holding one stage's half: no card twice over, none empty
+    const int stages[] = {0, 1};
+    for (int c = 0; c < 4; ++c) {
+        int uses = 0;
+        for (int s : stages) {
+            if (pair_lead_dev(s, 2) == c) ++uses;
+            if (pair_partner_of_lead(pair_lead_dev(s, 2), 2) == c) ++uses;
+        }
+        CHECK(uses == 1);
+    }
+}
+
 void exactly_one_card_holds_each_expert() {
     for (int32_t e = 0; e < 512; ++e) {
         CHECK((int) pair_holds(e, 2, 0) + (int) pair_holds(e, 2, 1) == 1);
@@ -103,6 +127,7 @@ void an_empty_half_is_empty() {
 
 int main() {
     cards();
+    partner_follows_the_lead();
     exactly_one_card_holds_each_expert();
     halves_cover_and_disjoint();
     halves_balance();
