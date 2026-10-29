@@ -2270,6 +2270,23 @@ int main(int argc, char** argv) {
                              "nvidia-smi / rocm-smi lists them",
                      (unsigned long long) pool_bytes, cudaGetErrorString(ce), (unsigned long long) (free_b >> 20),
                      (unsigned long long) (total_b >> 20));
+        // What the run's other cards have free says whether this card alone is busy or the whole box is, which is
+        // how a second engine holding the cards tells itself apart from a size that is simply too big here.
+        int cur_dev = 0;
+        cudaGetDevice(&cur_dev);
+        const size_t n_cards = chosen_cards.empty() ? 1 : chosen_cards.size();
+        std::string vram;
+        for (size_t d = 0; d < n_cards; ++d) {
+            size_t f2 = 0, t2 = 0;
+            const bool ok = cudaSetDevice((int) d) == cudaSuccess && cudaMemGetInfo(&f2, &t2) == cudaSuccess;
+            vram += (vram.empty() ? "" : ", ") + ("CUDA" + std::to_string(d) + " ") +
+                    (ok ? std::to_string(f2 >> 20) + " MiB free of " + std::to_string(t2 >> 20) + " MiB"
+                        : "unreadable");
+        }
+        cudaSetDevice(cur_dev);
+        cudaGetLastError();   // the probe's own failures are reported as "unreadable", not left pending
+        basalt::log::warn("basalt generate", "VRAM on the run's %zu card%s at the arena: %s", n_cards,
+                          n_cards == 1 ? "" : "s", vram.c_str());
         return 1;
     }
     auto load_t0 = std::chrono::steady_clock::now();
