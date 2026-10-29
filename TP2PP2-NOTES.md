@@ -914,3 +914,96 @@ Build green (`cmake --build build -j4`). `tp2_pair_test`, `qsa_head_split_test`,
 `tp2_shard_weights_test` pass; `ctest -L cpu` 66/67 with only the pre-existing `expert_multi_test` (this CPU lacks
 AVX512-VNNI/VBMI). `tools/check_platform_boundary.sh` and `tools/check_stderr_logging.sh` ok. No engine start, no
 `basalt-ctl`, nothing bound on :8000. **Ready for reviewer measurement.**
+
+## RUN 11 — the pair's partner card was never its prompt peer
+
+Reviewer's log: `--prefill 8192` gave 1384 t/s, a 7607-token chunk sat under the computed crossover of 10 619,
+and still the chunk line said `peer -1`, no peer activation, no peer row visits, and the lead's blob feed ran the
+whole layer (82.8 on the copy stream). The crossover line `set_peer` prints never appeared.
+
+### Diagnosis
+
+`Prefill::set_peer` was never called. It has exactly two callers and both hang off the expert TIER:
+
+    if (peer.valid() && o.peer_prefill_rows != 0) sp.set_peer(&peer, rows, peer_streamed_share, err);
+
+Under `--tp-size 2` a pair-wide split names no tier card (`--peer` is not given, `peer.valid()` is false), so
+neither CUDA0's prompt path nor any stage's ever got a `PeerPrefill`. `ppc` was null in `read_chunk`, the row
+split left every expert local, and the ring pulled every partner-held blob — which is what the log showed. The
+`stage.pair` / `stage0_pair` cards were registered as ring *sources* (`set_ring_remotes`, run 8) but never as
+row-computing peers. The four gates in `peer_fp4_possible` were never reached, so none of them was the blocker,
+and the crossover log could not print.
+
+Two things were missing, both in `src/program/generate.cpp`:
+
+1. **the peer itself** — a stage's partner card holds half its stage's experts and computes nothing in prefill.
+2. **the streaming floor** — `set_stream_all_min()` required `o.peer_device >= 1`, so a tp2 run kept the 6144-token
+   floor while the tier configuration drops it to 2560. Chunks of 2560..6143 tokens ran the routed-only path.
+
+Checked and NOT the cause, for the record: `fp4_every_layer()` is a property of the pack (every layer's
+`gu_type`/`d_type` NVFP4 and `mmq_plan().layer[l]`), cached in a static, so the continuation placement cannot
+break it — the placement only enters through `peer_link` and `peer_fp4_ceiling`, which read `peer->has()` and
+follow it correctly. `fused_ring()` is false for this pack: `fused::native_supported` needs a gu type in
+{IQ2_XXS..IQ4_XS} and a d type in {Q2_0, IQ4_NL}, so NVFP4 layers are not covered and the "every layer" test
+fails. `streamed_share` was the tier's `cards_alike(cards[0], cards[1])` verdict, which is CUDA0's pair only.
+
+### The fix
+
+- `generate.cpp`: a per-pair `pair_streamed_share(lead, partner)` beside the tier's verdict, and
+  `pairs_streamed_share` (every pair alike) for the one global floor; `set_stream_all_min()` now fires for an
+  all-alike `--tp-size 2` run as well as for an alike tier pair. `pair_prompt_bytes()` prices a partner card's
+  peer buffers and `open_partner()` holds that room back when it sizes the partner's expert tier — the same
+  contract `peer_prompt_bytes` has for the tier, since `set_peer` allocates after the tier is filled.
+  `set_peer` is then called on each stage's `sp` with `st.pair` (inside `init_prompt_paths`, so the chunk
+  step-down re-applies it) and on CUDA0's `sp` with `stage0_pair`. A stage that cannot get its peer logs a warn
+  and reads slower; it does not fail the boot.
+- `prefill.cpp`: `peer_fp4_gate()` names the gate that shut and `set_peer`'s one setup line now carries the whole
+  state, so a sweep never has to re-read this file to know what a pair is doing:
+
+      basalt prefill: peer fp4 crossover 10619 tokens: 1440 MiB of activations and rows per 1024 tokens against
+      14934 MiB of partner-held blobs over 24 layers (6144 experts held); the share is on, chunks of 8192 tokens
+      or less, routed chunks to 2559 tokens
+
+  Off cases read `the share is off: the pair's cards are not alike` / `not every layer's experts are NVFP4` /
+  `this pack runs the fused expert kernels` / `the FP4 floor is above the streaming floor` / `the crossover is
+  under the 2560-token streaming floor`, and an unlike partner adds `the routed share derated to 2559 tokens`.
+
+One dead end noted, not touched: `--peer-prefill-rows` no longer bounds anything — `make_peer` clamps `cap_rows`
+to `Tp * K` and `peer_layout` then overwrites it with `Tp * K` ("no row cap"), so the runtime test
+`rows_peer + c > ppc->cap_rows` cannot bind. That is what keeps the stream's unconditional `peer->has` skip safe
+(every partner-held expert's rows must be somewhere), so the flag's help text is what is stale, not the code.
+
+### What it costs
+
+Each partner card now gives `Prefill::peer_bytes()` its share of VRAM before its tier is sized. At the reviewer's
+geometry (`--prefill 8192`, floor 2560) the terms are `mixed` `Tp*N*4` = 80 MiB, `Dm_b[2]` = 50 MiB, `f_a4x`
+= 11 MiB, `GU_g` 12.5 MiB, `Xq_g` 7 MiB, `H_g` 6.2, `Hq_g` 1.7, `src`+`ident` 0.6, plus the MMQ group buffers
+(`grp_gu`, `grp_d`) that scale with the pack's largest blobs — a few hundred MiB in total, call it a hundred slots
+of 2.43 MiB off that card's hot set. Run 10's audit priced the same set for the tier card; the `peer GPU N ... N
+MiB left free on it` line names the bytes on this box. `--peer-prefill-rows 0` turns the prompt peer off entirely
+(and restores the 6144 floor): that is the A/B switch, and the pre-change behaviour.
+
+### The sweep matrix (four alike cards, this pack, `--prefill <chunk>`)
+
+Crossover ~10 619, the FP4 share also capped by `--prefill`, the streaming floor now 2560.
+
+| `--prefill` | regime expected | the chunk line should say |
+|---|---|---|
+| 12288 | past the crossover: no peer leg, the lead streams everything | `no peer` — reproduces run 9/10 |
+| 10240 | just inside: the FP4 leg pays | `peer 1`, `fp4 yes`, peer rows ≈ its experts' half |
+| 8192 | the reviewer's 1384 t/s point, now with the peer | as above; peer rows ≈ 40 k of 81 920 |
+| 6144 | same regime, shorter chunk | as above |
+| 4096 | NEW: streams (was routed-only at the 6144 floor) | as above; compare with `--peer-prefill-rows 0` |
+| 2560 | the shortest chunk that still streams | as above |
+| 2048 | routed-only: no FP4 leg, the peer takes ≤ 2559 rows | `peer 1`, `fp4 no` |
+| 1024 | routed-only, the peer's rows the whole help | `peer 1`, `fp4 no` |
+
+Grep: `peer fp4 crossover` (one line per prompt path, at setup), `peer GPU` (the buffers and the MiB left on the
+partner), then per chunk `peer`/`fp4`/`peer rows`.
+
+### Validated here (GPU untouched: the server is live)
+
+Build green (`cmake --build build -j4`). `tp2_pair_test`, `qsa_head_split_test`, `session_head_shard_test`,
+`tp2_shard_weights_test` pass; `ctest -L cpu` 66/67 with only the pre-existing `expert_multi_test`.
+`tools/check_platform_boundary.sh` and `tools/check_stderr_logging.sh` ok. No engine start, no `basalt-ctl`,
+nothing bound on :8000. **Ready for reviewer measurement.**
