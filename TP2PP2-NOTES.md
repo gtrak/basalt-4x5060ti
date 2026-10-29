@@ -1007,3 +1007,93 @@ Build green (`cmake --build build -j4`). `tp2_pair_test`, `qsa_head_split_test`,
 `tp2_shard_weights_test` pass; `ctest -L cpu` 66/67 with only the pre-existing `expert_multi_test`.
 `tools/check_platform_boundary.sh` and `tools/check_stderr_logging.sh` ok. No engine start, no `basalt-ctl`,
 nothing bound on :8000. **Ready for reviewer measurement.**
+
+## RUN 12 — decode instrumentation: the window's phases, op by op (DECODE-NEXT item 1)
+
+Instrumentation only; no path changed, nothing optimised. Three files: `src/core/verify.cpp`,
+`include/basalt/core/verify.hpp`, `src/program/generate.cpp`. The mould is run 9's `ChunkTiming`:
+markers recorded where work is ISSUED, times read only where the run already waits for the GPU,
+so the measurement adds records and never a wait.
+
+### What the code says first (read this before the numbers)
+
+At this HEAD the decode path runs **no collective and no head split**. `tp2_all_reduce` has exactly
+one caller (`qsa_layer`, the prompt path, which the engine never drives — `QsaBuffers::pair` is set
+by no engine code), and the verifier's QSA decode attention runs whole on the lead card. The
+pair sync of a tp2 decode window is per layer: the partner card computes the routed experts it
+holds in its peer window (one persistent kernel per window, launched in `dm_begin`, synced in
+`dm_end`), and the lead's MoE tail spins on the peer's done word (`dec_moe_wait`) before
+`dec_moe_combine`. DECODE-NEXT item 1's "o_proj combine / tp2_all_reduce spin" hypothesis is
+therefore falsifiable from this line: if the wait grows with rows under concurrency it is the
+peer-row wait of the MoE tail, not a collective spin — decode issues zero collectives.
+
+### The markers
+
+Per stage verifier, created once before the first capture (`wp_ensure`):
+
+- **five CUDA events per layer**, recorded inside the captured window graph (they are graph nodes,
+  re-recorded on every replay, no PDL interaction — unlike `--profile`'s stamp kernels, PDL stays on):
+  1. layer start (top of `pre`), 2. MoE start (after the mixer and its hyper-connections, at the
+  router), 3. final-wait start (before `dec_moe_wait` in the device-planned tail, before the last
+  plan flag wait otherwise; coincident with 4 when there is no final wait), 4. combine start
+  (after the wait), 5. layer end (after the tail write).
+- **one stage-end event** (after the hand-off copies on a middle stage, after the head's argmax on
+  the last).
+- **two events on the partner card's stream** bracketing its window: recorded in `dm_begin` after
+  the peer kernel launches and in `dm_end` after its sync — the partner's push span.
+
+Times are read in `Verifier::decode_phase` at the window's own syncs (each stage's
+`run_slot_segs` already synchronised its stream and its peer window before the batch loop reads).
+A window whose markers were not all reached is reported `not measured`, never guessed. The phases
+are disjoint and sum to the stage's window span: `attn + experts + wait + combine + rest = total`.
+
+### The line
+
+`basalt decode profile`, one line per window every 32 windows (the common case), every window with
+`--exp decode_profile=1`. Gated to multi-GPU runs (a layer split / tp2 pair), as prefill's
+instrumentation is gated to multi-card runs. Nothing is measured single-card.
+
+```
+basalt decode profile: window 32, 2 slots, 24 rows, 18 tokens, concurrent: wall 41.3 ms = run 34.2 + commit 2.1 + emit 0.8 + draft 4.2; GPU-reach wait 12.9 ms;
+; stage 1: 17.1 ms = attn 6.2 + experts 5.1 + wait 4.4 + combine 1.4 + rest 0.0, peer push 33.9; stage 2: 17.0 ms = attn 6.1 + experts 5.2 + wait 4.5 + combine 1.2 + rest 0.0, peer push 34.1
+```
+
+- `wall = run + commit + emit + draft` by construction (host clock around the window).
+- `attn` = the mixer and its hyper-connections to the router (whole on the lead card: there is no
+  partner attention half at this HEAD); `experts` = the lead's own MoE compute, plan waits
+  included; `wait` = the final spin for the peer's rows and the CPU pool's word — the pair-sync
+  number, per layer, summed over the stage's layers; `combine` = the partials' add and the layer's
+  tail; `rest` = everything else of the stage (head, hand-off, in-graph gaps).
+- `peer push` = the partner card's window span (launch to sync of its persistent window): the push
+  side of the pair sync. It overlaps the lead's run; it is not added to the sum.
+- `GPU-reach wait` = the host's per-layer doorbell spin over the whole chain (the
+  9.3 → 12.6-13.8 figure from DECODE-NEXT), for the window.
+- `solo` / `concurrent` is the window's slot count (1 vs 2+). Run the same traffic solo and with
+  two sessions and compare the `wait` and `peer push` columns at the same rows — that is the
+  concurrent pair-sync cost, separate from compute.
+
+### The lines to grep
+
+```
+grep "basalt decode profile" log                 # every 32nd window
+BASALT_TP2=1 ... --exp decode_profile=1          # every window
+```
+
+Match stages across runs by their layer count in the boot lines (`tp2: %d stages of %lld layers
+each`); compare a `--tp-size 2` run against the plain split on the same line — the first phase that
+diverges names the divergence.
+
+### The measurement's own cost
+
+Per window per stage: ~5×layers event records inside the graph (a few ns each on the GPU), ~5×layers
+`cudaEventElapsedTime` reads at the sync the run already performs (a microsecond or two of host
+time each, against a 25-40 ms window). No launch, no wait, no byte changes; PDL stays on. Numerics
+are untouched (event record nodes carry no data), so no quality gate is owed; a greedy-identity
+check against the pre-instrumentation build is the regression net.
+
+### Validated here (GPU untouched: the server is live)
+
+Build green (`cmake --build build -j4`). `ctest -L cpu` 66/67 with only the pre-existing
+`expert_multi_test` (this CPU lacks AVX512-VNNI/VBMI). `tools/check_platform_boundary.sh` and
+`tools/check_stderr_logging.sh` ok. No engine start, no `basalt-ctl`, nothing bound on :8000.
+GPU runs are the reviewer's.

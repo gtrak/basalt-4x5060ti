@@ -1518,6 +1518,14 @@ Verifier::~Verifier() {
         if (kv.second) cudaGraphExecDestroy(kv.second);
     for (auto& kv : commit_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
+    if (wp_peer_[0] || wp_peer_[1]) {   // the partner's span events live on the partner's context
+        int prev = 0;
+        cudaGetDevice(&prev);
+        if (wp_peer_dev_ >= 0) cudaSetDevice(wp_peer_dev_);
+        for (cudaEvent_t& e : wp_peer_) if (e) { cudaEventDestroy(e); e = nullptr; }
+        cudaSetDevice(prev);
+    }
+    for (cudaEvent_t& e : wp_) if (e) cudaEventDestroy(e);
     if (arena_b_) cudaFree(arena_b_);
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     if (row_bias_device_) cudaFree(row_bias_device_);
@@ -1968,6 +1976,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto stamp = [&](int64_t l, int i) {
         if (prof_on_) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
     };
+    // the window's per-phase markers: five per layer (start, moe, wait, combine, end) plus the stage end.  The
+    // events are captured into the window graph and re-recorded on every replay; the read happens at the window's
+    // own sync, where every marker has been reached.
+    auto wp_mark = [&](int64_t l, int m) {
+        if (!wp_on_) return;
+        const int64_t r = l - lb_;
+        if (r < 0 || r >= le_ - lb_) return;
+        const size_t i = (size_t) r * 5 + (size_t) m;
+        if (i < wp_.size() && cudaEventRecord(wp_[i], cs) == cudaSuccess) wp_mask_[(size_t) r] |= (uint8_t) (1u << m);
+    };
+    auto wp_end = [&]() {
+        if (!wp_on_) return;
+        const size_t i = (size_t) (le_ - lb_) * 5;
+        if (i < wp_.size() && cudaEventRecord(wp_[i], cs) == cudaSuccess) wp_mask_[(size_t) (le_ - lb_)] = 1;
+    };
     const int hrow0 = batch_rec_ ? row_base_ : 0;   // a slot group's own hand-off rows
 
     if (prof_on_ && !batch_rec_) gpu_stamp(prof_, (int) (g.n_layers * kProfPer + 2), cs);
@@ -2064,6 +2087,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto pre = [&](int64_t l) -> bool {
         const int n = T;
         stamp(l, 0);
+        wp_mark(l, 0);
         const LayerView v(wt, l);
         const char* pfx[2] = {"hc_attn_", "hc_ffn_"};
         const WeightRef *wn[2], *wd[2], *wu[2], *wi[2];
@@ -2737,6 +2761,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one top-10) instead of 2
         // per token; every row's arithmetic is the single-token call's
+        wp_mark(l, 1);
         if (routed) {
         } else if (router_multi) {
             try {
@@ -2993,13 +3018,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // share is 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
             grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
             stamp(l, 22);
+            wp_mark(l, 2);   // the final wait: the CPU's share (the peer's rows come with it, word 16)
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_, cs);
+                wp_mark(l, 3);
                 copy_or_zero_from_mapped(parts_out, m_ymiss_, (long long) n * K * N,
                                          skip_, ring, cs);
             } else {
                 wait_flag_ge(m_flag_, ring, cs);               // the CPU's share is in the mapped rows
                 stamp(l, 23);
+                wp_mark(l, 3);
                 if (remote_opt_)   // the helper's rows come back reduced; skip them as well
                     remote_opt_->copy_rows(parts_out, m_ymiss_, 0, n, p_dst, p_counts + 1, cs);
                 else   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
@@ -3012,7 +3040,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
             if (ring_fork) cudaStreamWaitEvent(cs, ev_ring_join_, 0);   // the ring's launch
         }
+        if (!dm && ar_on()) { wp_mark(l, 2); wp_mark(l, 3); }   // no final wait: the combine starts here
         if (dm) {
+            wp_mark(l, 2);   // the spin for the peer's rows and the CPU pool's word
             // the combine polls the peers' rows themselves (with further peers always: the wait counts one done word);
             // one peer's done word also ends the poll, but with further peers only a release does (word 60).  Without
             // --wait-stats it also waits for the CPU pool's word itself, with no wait launch before it.
@@ -3023,6 +3053,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 dec_moe_wait(dm_->plan, dm_->m_w + 16, m_flag_, ring, cs, dm_->wstat, (int) l, true, dm_tag);
             }   // true: the combine is the wait's programmatic dependent
             stamp(l, 23);
+            wp_mark(l, 3);
             try {
                 dec_moe_combine(parts_, dm_->m_rows, m_ymiss_, dm_->plan, w_, shared_, bo_, N, K, n, nullptr, nullptr,
                                 ring, cs, !dm_->tags, tag_done, dm_->tags ? m_flag_ : nullptr, dm_->cseen,
@@ -3049,6 +3080,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         } else if (cvec().covers(l)) {
             cvec_apply(Rt(0), l, n, HC * N, bo_, N, inj2_, HC, true, cs);
         }
+        wp_mark(l, 4);
         return true;
     };
 
@@ -3064,6 +3096,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         copy_from_mapped(hout + (size_t) T * HC * N, bo_, (int64_t) T * N, cs);
         copy_from_mapped(hout + (size_t) T * (HC + 1) * N, inj2_, (int64_t) T * HC, cs);
         if (!batch_rec_ && next_ != nullptr && next_->m_flag_ != nullptr) signal_flag(next_->m_flag_ + 12, 1, cs);
+        wp_end();
         return true;
     }
 
@@ -3169,6 +3202,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         sp.temperature = 0.0f;
         sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
     }
+    wp_end();
     stamp(g.n_layers, 1);
     return true;
 }
@@ -3680,6 +3714,79 @@ void Verifier::collect_profile() {
     ++prof_windows_;
 }
 
+// The batch window's per-phase markers, in the prefill ChunkTiming mould: events recorded inside the captured
+// window graph as the layers issue, read where the run already waits for the GPU (the window's stream sync, the
+// peer window's).  A window is counted only when every marker was reached; nothing is measured unless it is made.
+void Verifier::wp_ensure() {
+    if (wp_on_ || wp_broken_) return;
+    const int64_t L = le_ - lb_;
+    if (L <= 0 || L > 64) { wp_broken_ = true; return; }
+    wp_.assign((size_t) L * 5 + 1, nullptr);
+    wp_mask_.assign((size_t) L + 1, 0);
+    bool ok = true;
+    for (cudaEvent_t& e : wp_)
+        if (ok && cudaEventCreate(&e) != cudaSuccess) { e = nullptr; (void) cudaGetLastError(); ok = false; }
+    if (ok && dm_ != nullptr && dm_->pdev >= 0) {   // the partner's span lives on the partner's streams
+        int prev = 0;
+        cudaGetDevice(&prev);
+        if (cudaSetDevice(dm_->pdev) == cudaSuccess && cudaEventCreate(&wp_peer_[0]) == cudaSuccess &&
+            cudaEventCreate(&wp_peer_[1]) == cudaSuccess)
+            wp_peer_dev_ = dm_->pdev;
+        else { (void) cudaGetLastError(); ok = false; }
+        cudaSetDevice(prev);
+    }
+    if (!ok) {
+        for (cudaEvent_t& e : wp_) if (e) cudaEventDestroy(e);
+        if (wp_peer_[0] || wp_peer_[1]) {
+            int prev = 0;
+            cudaGetDevice(&prev);
+            if (dm_ != nullptr && dm_->pdev >= 0) cudaSetDevice(dm_->pdev);
+            for (cudaEvent_t& e : wp_peer_) if (e) { cudaEventDestroy(e); e = nullptr; }
+            cudaSetDevice(prev);
+        }
+        cudaGetLastError();
+        wp_.clear();
+        wp_broken_ = true;
+        return;
+    }
+    wp_on_ = true;
+}
+
+void Verifier::decode_phase(DecodePhase& out) {
+    out = DecodePhase{};
+    if (!wp_on_) return;
+    const int64_t L = le_ - lb_;
+    const size_t end_i = (size_t) L * 5;
+    double attn = 0, experts = 0, wait = 0, combine = 0;
+    for (int64_t l = 0; l < L; ++l) {
+        if (wp_mask_[(size_t) l] != 0x1F) return;   // a phase was never issued here
+        const size_t b = (size_t) l * 5;
+        float ms = 0;
+        if (cudaEventElapsedTime(&ms, wp_[b], wp_[b + 1]) != cudaSuccess) return;
+        attn += ms;
+        if (cudaEventElapsedTime(&ms, wp_[b + 1], wp_[b + 2]) != cudaSuccess) return;
+        experts += ms;
+        if (cudaEventElapsedTime(&ms, wp_[b + 2], wp_[b + 3]) != cudaSuccess) return;
+        wait += ms;
+        if (cudaEventElapsedTime(&ms, wp_[b + 3], wp_[b + 4]) != cudaSuccess) return;
+        combine += ms;
+    }
+    if (wp_mask_[end_i] == 0) return;   // the run never reached the stage's end
+    float tot = 0;
+    if (cudaEventElapsedTime(&tot, wp_[0], wp_[end_i]) != cudaSuccess) return;
+    out.attn = attn;
+    out.experts = experts;
+    out.wait = wait;
+    out.combine = combine;
+    out.total = tot;
+    out.rest = tot - (attn + experts + wait + combine);
+    if (wp_peer_dev_ >= 0 && wp_peer_[0] != nullptr && wp_peer_[1] != nullptr) {
+        float pp = 0;
+        if (cudaEventElapsedTime(&pp, wp_peer_[0], wp_peer_[1]) == cudaSuccess) out.peer_push = pp;
+    }
+    out.ok = true;
+}
+
 // The device-planned tail's window start: residency tables, the flag words, and the peer card's persistent window.
 bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
     if (!dm_sync(err)) return false;
@@ -3717,6 +3824,7 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
             err = "verify: the peer window did not launch";
             return false;
         }
+        if (wp_on_) cudaEventRecord(wp_peer_[0], dm_->ps);
         dm_->peer_live = true;
     }
     for (DecMoe::XPeer& x : dm_->xp) {   // further peers: the same window on their own ring
@@ -3758,6 +3866,7 @@ bool Verifier::dm_end(std::string& err) {
     dm_->peer_live = false;
     const cudaError_t pe = cudaStreamSynchronize(dm_->ps);
     if (pe != cudaSuccess) { err = std::string("verify: the peer window: ") + cudaGetErrorString(pe); return false; }
+    if (wp_on_) cudaEventRecord(wp_peer_[1], dm_->ps);
     const std::string ab = basalt::kernels::dec_moe_peer_diag(dm_->h_w + 32);
     if (!ab.empty()) { err = "verify: the peer window " + ab; return false; }
     return true;
@@ -3785,6 +3894,7 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     using namespace basalt::kernels;
     const OnDevice on_device(device_);
     last_batch_ = false;
+    wp_ensure();   // the window's phase markers, before the first capture records them
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU; restart the engine"; return false; }
     const ModelGeometry& g = *g_;
@@ -4782,6 +4892,7 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     const ModelGeometry& g = *g_;
     if (gs_live_ && !gs_move(false, err)) return false;
     gs_split_ = false;
+    wp_ensure();   // the window's phase markers, before the first capture records them
     if (!stage_batch(rows, lens, S, 0, tokens, pos, err)) return false;
     const int R = last_t_;   // the window's rows
     const bool dm = dm_ != nullptr && batch_dm_;
