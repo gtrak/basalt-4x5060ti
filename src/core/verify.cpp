@@ -577,6 +577,10 @@ void Verifier::diag(std::FILE* f) const {
     if (dm_ != nullptr) std::fprintf(f, "  %s\n", dm_note().c_str() + 2);
 }
 
+// The peer's QSA attention item: the half of the decode head split that runs inside the peer's persistent window.
+// It does not exist yet; TP2PP2-NOTES run 17 carries its spec.  The flag refuses at init until it lands.
+static bool qhs_peer_item() { return false; }
+
 bool Verifier::dm_init(std::string& err) {
     using namespace basalt::kernels;
     const ModelGeometry& g = *g_;
@@ -726,6 +730,17 @@ bool Verifier::dm_init(std::string& err) {
         }
     }
     if (d->pdev >= 0 && !peer_experts_only_) {   // tp2: a partner card holds experts only
+        if (qhs_requested_) {
+            // The lead's shard is wired in the window; the peer's half runs as an item of its persistent window.
+            // That item is not built yet, so the flag refuses instead of running the lead's half alone - half the
+            // attention, no error, plausible tokens.
+            if (!qhs_peer_item()) {
+                err = "verify: --exp decode_headsplit=1 is refused: the peer's QSA attention item is not built "
+                      "(the persistent window has no QSA half; only the lead's shard is wired)";
+                return false;
+            }
+            if (!qhs_init(err)) return false;
+        }
         hs_init();
         gs_init();
     }
@@ -1394,6 +1409,136 @@ void Verifier::gs_free() {
     gs_dev_ = -1;
 }
 
+// The lead's side of the decode head split: its shard's packed attn_output columns, the doorbell's mapped rings
+// and the peer's partial buffer.  The weight cut follows qsa_pair_prepare's (the columns are the only packed
+// piece; the q/k/v row views are pointer offsets the window computes per layer).
+bool Verifier::qhs_init(std::string& err) {
+    const ModelGeometry& g = *g_;
+    const int64_t N = g.n_embd, HD = g.head_dim;
+    const QsaHeadShard h{g.n_head, g.n_head_kv, 0, 2};
+    if (!qsa_shard_runs(h, err)) {
+        err = "verify: " + err;
+        return false;
+    }
+    const QsaHeadRun cols = qsa_out_cols(h, HD);
+    // the global QSA layer index, the same numbering the window's qsa_idx uses
+    std::vector<int64_t> qsa_idx((size_t) g.n_layers, -1);
+    {
+        int64_t qi = 0;
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            if (is_qsa_layer(g, l)) qsa_idx[(size_t) l] = qi++;
+    }
+    qhs_o_cols_.assign((size_t) g.n_qsa_layers(), basalt::core::QsaShardWeight{});
+    qhs_owned_.clear();
+    uint64_t packed_bytes = 0;
+    for (int64_t l = lb_; l < le_; ++l) {
+        if (!is_qsa_layer(g, l)) continue;
+        const LayerView v(*wt_, l);
+        const WeightRef* wo = v.get("attn_output.weight");
+        if (wo == nullptr || !wo->native_data) {
+            err = "verify: the shard's " + v.name("attn_output.weight") + " has no native image to cut";
+            return false;
+        }
+        const WeightRef& w = *wo;
+        const uint64_t nb = basalt::kernels::native_mmvq_weight_bytes(w.native_type, (int) w.ne0, 1) * (uint64_t) w.ne1;
+        // the split's block table against the kernel's, before anything is packed
+        const int64_t be = qsa_native_block_elems(w.native_type);
+        if (be <= 0 || w.ne0 % be != 0) {
+            err = "verify: the shard's attn_output (type " + std::to_string(w.native_type) + ") cannot be cut";
+            return false;
+        }
+        const uint64_t block = basalt::kernels::native_mmvq_weight_bytes(w.native_type, (int) be, 1);
+        const uint64_t check = qsa_weight_native_bytes_from_block(w, block);
+        if (check == 0 || check != nb) {
+            err = "verify: the shard's attn_output image and the kernel's block figure disagree";
+            return false;
+        }
+        const uint64_t want = qsa_weight_cols_bytes(w, cols.start, cols.len, nb);
+        if (want == 0) {
+            err = "verify: the shard's attn_output columns would not pack (layer " + std::to_string(l) + ")";
+            return false;
+        }
+        std::vector<uint8_t> whole((size_t) (w.bytes + nb)), packed((size_t) want);
+        {
+            const OnDevice on(device_);
+            if (cudaMemcpy(whole.data(), w.data, (size_t) w.bytes, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                cudaMemcpy(whole.data() + w.bytes, w.native_data, (size_t) nb, cudaMemcpyDeviceToHost) !=
+                    cudaSuccess) {
+                err = "verify: the shard's attn_output did not come down (layer " + std::to_string(l) + ")";
+                return false;
+            }
+        }
+        WeightRef cut = w;
+        cut.data = whole.data();
+        cut.native_data = (const void*) (whole.data() + w.bytes);
+        basalt::core::QsaShardWeight view = qsa_pack_weight_cols(cut, cols.start, cols.len, nb, packed.data());
+        if (!view.ok || view.codes_bytes + view.scales_bytes + view.offset_bytes + view.native_bytes != want) {
+            err = "verify: the shard's attn_output columns would not pack (layer " + std::to_string(l) + ")";
+            return false;
+        }
+        void* d = nullptr;
+        {
+            const OnDevice on(device_);
+            if (cudaMalloc(&d, (size_t) want) != cudaSuccess ||
+                cudaMemcpy(d, packed.data(), (size_t) want, cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = "verify: the shard's attn_output columns would not go up (layer " + std::to_string(l) + ")";
+                if (d) cudaFree(d);
+                return false;
+            }
+        }
+        const uint8_t* base = (const uint8_t*) d;
+        view.codes = base;
+        view.scales = (const float*) (base + view.codes_bytes);
+        view.offset = view.offset_bytes ? (const float*) (base + view.codes_bytes + view.scales_bytes) : nullptr;
+        view.native = (const void*) (base + view.codes_bytes + view.scales_bytes + view.offset_bytes);
+        qhs_owned_.push_back(d);
+        qhs_o_cols_[(size_t) qsa_idx[(size_t) l]] = view;
+        packed_bytes += want;
+    }
+    bool ok = mapped((size_t) max_t_ * N * 4, (void**) &qhs_h_part_, (void**) &qhs_m_part_) &&
+              mapped((size_t) dm_->rings * dm_->xq_stride, (void**) &qhs_h_xq_, (void**) &qhs_m_xq_) &&
+              mapped((size_t) dm_->rings * dm_->x_stride * 4, (void**) &qhs_h_x_, (void**) &qhs_m_x_);
+    if (ok) {
+        const OnDevice on(device_);
+        ok = mapped((size_t) max_t_ * h.nq() * 4, (void**) &qhs_h_pos_, (void**) &qhs_m_pos_);
+    }
+    if (!ok) {
+        qhs_free();
+        err = "verify: the shard's mapped buffers";
+        return false;
+    }
+    qhs_heads_ = h;
+    qhs_live_ = true;
+    basalt::log::info("basalt verify",
+                      "the QSA decode split is armed on the lead: %lld of %lld query heads, KV head %lld of %lld "
+                      "(%llu MiB packed)",
+                      (long long) h.nq(), (long long) g.n_head, (long long) h.kv0(), (long long) g.n_head_kv,
+                      (unsigned long long) (packed_bytes / 1048576));
+    return true;
+}
+
+void Verifier::qhs_free() {
+    if (qhs_owned_.empty() && qhs_h_part_ == nullptr && qhs_h_xq_ == nullptr && qhs_h_x_ == nullptr) {
+        qhs_live_ = false;
+        return;
+    }
+    {
+        const OnDevice on(device_);
+        for (void* p : qhs_owned_)
+            if (p) cudaFree(p);
+        if (qhs_m_pos_) cudaFree(qhs_m_pos_);
+    }
+    for (void* h : {(void*) qhs_h_part_, (void*) qhs_h_xq_, (void*) qhs_h_x_, (void*) qhs_h_pos_})
+        if (h) cudaFreeHost(h);
+    qhs_o_cols_.clear();
+    qhs_owned_.clear();
+    qhs_h_part_ = qhs_m_part_ = nullptr;
+    qhs_h_xq_ = qhs_m_xq_ = nullptr;
+    qhs_h_x_ = qhs_m_x_ = nullptr;
+    qhs_h_pos_ = qhs_m_pos_ = nullptr;
+    qhs_live_ = false;
+}
+
 bool Verifier::gs_move(bool to_peer, std::string& err) {
     using basalt::core::GdnHeadSlice;
     const ModelGeometry& g = *g_;
@@ -1448,6 +1593,7 @@ void Verifier::dm_free() {
     if (d == nullptr) return;
     hs_free();
     gs_free();
+    qhs_free();
     if (d->warm != nullptr) {
         warm_pool_->idle_stop();
         delete d->warm;
@@ -2206,6 +2352,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // window CUDA0 runs the whole layer and the doorbell only passes
         const bool gs_ring = dm && gs_nk0_ > 0 && !is_qsa_layer(g, l);
         const bool gs_split = gs_ring && !batch_rec_;
+        // the QSA decode head split: CUDA0's KV group's query heads here, the peer's the other group's (its item of
+        // the persistent window); a batch window runs whole, like the GDN split
+        const bool qhs_layer = qhs_live_ && !batch_rec_ && is_qsa_layer(g, l);
         bool mid_ok = false;
         MidChainArgs ma;
         if (dec_hc && read_q8 && router_multi && !is_qsa_layer(g, l) && !prof_on_ && !batch_rec_ && !gs_split &&
@@ -2266,6 +2415,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             const int64_t r = l - lb_;
             dec_moe_mix_publish(xq_, mixed_, n, (int) N, gs_m_xq_ + (size_t) r * dm_->xq_stride,
                                 gs_m_x_ + (size_t) r * dm_->x_stride, dm_->m_w + 48, (uint32_t) (r + 1), gs_split, cs);
+        }
+        if (qhs_layer) {
+            if (!read_q8) native_quantize_q8_1(mixed_, xq_, (int) N, n, cs);
+            const int64_t r = l - lb_;
+            dec_moe_mix_publish(xq_, mixed_, n, (int) N, qhs_m_xq_ + (size_t) r * dm_->xq_stride,
+                                qhs_m_x_ + (size_t) r * dm_->x_stride, dm_->m_w + 48, (uint32_t) (r + 1), true, cs);
         }
         if (lazy_layer(l)) {   // the layer's commit, forked in the previous post
             cudaStreamWaitEvent(cs, lz_join_, 0);
@@ -2456,6 +2611,26 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!native_of(wq, v.name("attn_q.weight"), err) || !native_of(wk, v.name("attn_k.weight"), err) ||
                     !native_of(wv, v.name("attn_v.weight"), err) || !native_of(wo, v.name("attn_output.weight"), err))
                     return false;
+                // the QSA decode head split: CUDA0 runs its KV group - the shard shapes and the attn_q row view;
+                // K/V, the indexer and the appends stay whole, the attention reads the pool at the pool's head
+                // width, and the packed o_proj columns leave the partial the mixer combine adds the peer's into
+                const QsaShapes sh = qhs_layer ? basalt::core::qsa_shard_shapes(s, qhs_heads_) : s;
+                WeightRef wq_s = *wq;
+                if (qhs_layer) {
+                    const uint64_t nb = basalt::kernels::native_mmvq_weight_bytes(wq->native_type, (int) wq->ne0, 1) *
+                                        (uint64_t) wq->ne1;
+                    const QsaHeadRun qr = qsa_q_rows(qhs_heads_, HD);
+                    const basalt::core::QsaShardWeight vq = qsa_weight_rows(*wq, qr.start, qr.len, nb);
+                    if (!vq.ok) {
+                        err = "verify: the shard's attn_q rows would not view (layer " + std::to_string(l) + ")";
+                        return false;
+                    }
+                    wq_s.ne1 = vq.ne1;
+                    wq_s.native_data = vq.native;
+                    // the shard's q positions: the q post reads them flattened over (row, head), so they need one
+                    // copy per running head, not per whole head
+                    copy_i32_from_mapped(qhs_m_pos_, qhs_h_pos_, (int64_t) T * sh.n_head, cs);
+                }
                 auto norm_rope = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos) {
                     native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, EPS, cs);
                     native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), pos, cs);
@@ -2488,7 +2663,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 };
                 auto q_post_args = [&] {
                     QsaDecQPost qp;
-                    qp.q_full = qfull_; qp.qcur = qcur_; qp.pos_q = pos_;
+                    qp.q_full = qfull_; qp.qcur = qcur_; qp.pos_q = qhs_layer ? qhs_m_pos_ : pos_;
                     qp.q_norm = (const float*) wqn->data; qp.q_idx = qidx_; qp.pos_i = pos_i;
                     qp.idx_q_norm = (const float*) wiqn->data; qp.eps = EPS;
                     return qp;
@@ -2542,12 +2717,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     cudaEventRecord(qev_[4], qs_[1]);
                     {
                         PdlScope pq(pdl);   // after the q8_1 kernel
-                        dense_proj(8, wq->native_type, wq->native_data, xq_, qfull_, (int) N,
-                                   (int) (NH * 2 * HD), n, cs);
+                        dense_proj(8, wq_s.native_type, wq_s.native_data, xq_, qfull_, (int) N,
+                                   (int) (sh.n_head * 2 * HD), n, cs);
                     }
                     cudaStreamWaitEvent(cs, qev_[4], 0);
                     for (int i = 7; i <= 9; ++i) stamp(l, i);
-                    qsa_dec_q_post(q_post_args(), n, s, rope_scaling(), cs);
+                    qsa_dec_q_post(q_post_args(), n, sh, rope_scaling(), cs);
                     cudaStreamWaitEvent(cs, qev_[3], 0);
                     cudaStreamWaitEvent(cs, qev_[2], 0);
                 } else {
@@ -2602,8 +2777,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 9);
                 {
                     PdlScope pq(pdl2 && fused_pre && qb);   // PDL2: after the K/V post kernel
-                    dense_proj(8, wq->native_type, wq->native_data, xq_, qfull_, (int) N,
-                               (int) (NH * 2 * HD), n, cs);
+                    dense_proj(8, wq_s.native_type, wq_s.native_data, xq_, qfull_, (int) N,
+                               (int) (sh.n_head * 2 * HD), n, cs);
                     if (fused_pre && qb)
                         bf16_gemv_fp32_mmvf_multi(mixed_, N, (const uint16_t*) wiq->data, qidx_,
                                                   IQ * ID, N, IQ * ID, n, cs);
@@ -2613,28 +2788,29 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     else for (int t = 0; t < T; ++t)
                         bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wiq->data, qidx_ + t * IQ * ID, (int) N,
                                             (int) (IQ * ID), cs);
-                    qsa_dec_q_post(q_post_args(), n, s, rope_scaling(), cs);
-                } else if (qb) {
+                    qsa_dec_q_post(q_post_args(), n, sh, rope_scaling(), cs);
+                } else if (qb && !qhs_layer) {   // the shard's per-head positions are compact, so it takes the per-token arm
                     if (cudaMemcpy2DAsync(qcur_, (size_t) HD * 4, qfull_, (size_t) HD * 2 * 4,
-                                          (size_t) HD * 4, (size_t) (n * NH), cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                                          (size_t) HD * 4, (size_t) (n * sh.n_head), cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
                         err = "verify: the q/gate split failed";
                         return false;
                     }
-                    norm_rope(qcur_, wqn, (int) (n * NH), (int) HD, pos_);
-                    if (st.kv_rot) fwht256_inplace_cuda(qcur_, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
+                    norm_rope(qcur_, wqn, (int) (n * sh.n_head), (int) HD, pos_);
+                    if (st.kv_rot) fwht256_inplace_cuda(qcur_, (int64_t) n * sh.n_head, cs);   // <Hq, Hk> = <q, k>
                     bf16_gemv_fp32_mmvf_multi(mixed_, N, (const uint16_t*) wiq->data, qidx_, IQ * ID,
                                               N, IQ * ID, n, cs);
                     norm_rope(qidx_, wiqn, (int) (n * IQ), (int) ID, pos_i);
                 } else {
                 for (int t = 0; t < T; ++t) {
-                    float* qc = qcur_ + t * NH * HD;
-                    if (cudaMemcpy2DAsync(qc, (size_t) HD * 4, qfull_ + t * NH * 2 * HD, (size_t) HD * 2 * 4,
-                                          (size_t) HD * 4, (size_t) NH, cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                    float* qc = qcur_ + t * sh.n_head * HD;
+                    if (cudaMemcpy2DAsync(qc, (size_t) HD * 4, qfull_ + t * sh.n_head * 2 * HD, (size_t) HD * 2 * 4,
+                                          (size_t) HD * 4, (size_t) sh.n_head, cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
                         err = "verify: the q/gate split failed";
                         return false;
                     }
-                    norm_rope(qc, wqn, (int) NH, (int) HD, pos_ + t * NH);
-                    if (st.kv_rot) fwht256_inplace_cuda(qc, NH, cs);   // <Hq, Hk> = <q, k>
+                    norm_rope(qc, wqn, (int) sh.n_head, (int) HD,
+                              qhs_layer ? qhs_m_pos_ + t * sh.n_head : pos_ + t * NH);
+                    if (st.kv_rot) fwht256_inplace_cuda(qc, sh.n_head, cs);   // <Hq, Hk> = <q, k>
                 }
                 for (int t = 0; t < T; ++t) {
                     float* qx = qidx_ + t * IQ * ID;
@@ -2677,27 +2853,31 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 attn_q8 = fused_gate && !st.kv_rot && !st.kv_hybrid;
                 PdlScope pa(pdl);   // the chunks after the top-k, the merge after them
                 if (fused_gate)
-                    qsa_dec_attn(qcur_, pools, sel_, step_, cap_, s, s.n_head_kv,
+                    qsa_dec_attn(qcur_, pools, sel_, step_, cap_, sh, NKV,
                                  attn_scratch_, attn_, n, cs,
                                  qfull_, attn32_, attn_q8 ? xq_ : nullptr);
                 else
                 qsa_decode_attn_batch(qcur_, pools, sel_, step_, cap_,
-                                      s, s.n_head_kv, attn_scratch_, attn_, n, cs);
+                                      sh, NKV, attn_scratch_, attn_, n, cs);
                 }
                 stamp(l, 13);
-                if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_, (int64_t) n * NH, cs);   // back: H^-1 = H
+                if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_, (int64_t) n * sh.n_head, cs);   // back: H^-1 = H
                 if (fused_gate) {}   // the merge wrote attn32_
                 else if (qb) native_qsa_gate_apply(attn_, qfull_, attn32_,
-                                              (int) (n * NH), (int) HD, cs);
+                                              (int) (n * sh.n_head), (int) HD, cs);
                 else
                 for (int t = 0; t < T; ++t) {
-                    native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD,
-                                          (int) NH, (int) HD, cs);
+                    native_qsa_gate_apply(attn_ + t * sh.n_head * HD, qfull_ + t * sh.n_head * 2 * HD,
+                                          attn32_ + t * sh.n_head * HD, (int) sh.n_head, (int) HD, cs);
                 }
                 stamp(l, 14);
                 PdlScope ps(pdl);   // after the gate kernel
-                if (!attn_q8) native_quantize_q8_1(attn32_, xq_, (int) (NH * HD), n, cs);
-                dense_proj(16, wo->native_type, wo->native_data, xq_, bo_, (int) (NH * HD), (int) N, n, cs);
+                if (!attn_q8) native_quantize_q8_1(attn32_, xq_, (int) (sh.n_head * HD), n, cs);
+                if (qhs_layer)   // the packed columns: a partial, added up by the mixer combine
+                    dense_proj(16, wo->native_type, qhs_o_cols_[(size_t) qi].native, xq_, bo_,
+                               (int) (sh.n_head * HD), (int) N, n, cs);
+                else
+                    dense_proj(16, wo->native_type, wo->native_data, xq_, bo_, (int) (NH * HD), (int) N, n, cs);
             }
         } catch (const std::exception& e) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();
@@ -2705,6 +2885,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         if (gs_split)   // the peer's key heads added after CUDA0's
             dec_moe_mix_combine(dm_->m_w + 52, (uint32_t) (l - lb_ + 1), gs_m_part_, bo_, n * (int) N, cs);
+        else if (qhs_layer)   // the peer's query heads' o_proj partial, the same word the GDN split uses
+            dec_moe_mix_combine(dm_->m_w + 52, (uint32_t) (l - lb_ + 1), qhs_m_part_, bo_, n * (int) N, cs);
         else if (gs_ring)
             dec_moe_mix_wait(dm_->m_w + 52, (uint32_t) (l - lb_ + 1), cs);
         stamp(l, 16);
@@ -3481,6 +3663,11 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
         for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = pos_t;
         for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = pos_t;
         for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = pos_t;
+    }
+    if (qhs_live_) {   // the shard's q positions: one copy per running head
+        const int64_t nq = qhs_heads_.nq();
+        for (int t = 0; t < T; ++t)
+            for (int64_t h = 0; h < nq; ++h) qhs_h_pos_[t * nq + h] = (int32_t) (pos0 + t);
     }
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;

@@ -5733,6 +5733,7 @@ int main(int argc, char** argv) {
             ver.set_peer(stage0_pair.get());
             ver.set_peer_experts_only(true);
         }
+        ver.set_decode_headsplit(basalt::core::exp_flag("decode_headsplit", 0) != 0);
         for (const auto& xpe : xpeers)
             if (xpe->valid()) ver.add_peer(xpe.get());
         ver.set_cpu_warm(drive.d.pool, drive.d.src);
@@ -5746,6 +5747,7 @@ int main(int argc, char** argv) {
             // is read-only to both chains)
             ver_b.set_peer(stage0_pair.get());
             ver_b.set_peer_experts_only(true);
+            ver_b.set_decode_headsplit(basalt::core::exp_flag("decode_headsplit", 0) != 0);
         }
         if (pipe_on && !ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err)) {
             basalt::log::error("basalt serve", "pipelined windows: %s", err.c_str());

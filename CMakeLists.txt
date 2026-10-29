@@ -1010,6 +1010,14 @@ target_link_libraries(qsa_head_split_test PRIVATE warnings)
 basalt_cpu_test(NAME qsa_head_split_test COMMAND qsa_head_split_test)
 set_tests_properties(qsa_head_split_test PROPERTIES TIMEOUT 60)
 
+# the decode side of the split: the shard reads the pool at the pool's width, the partials close to the whole
+# layer in the combine's order, and the compact q positions are the whole layer's
+add_executable(qsa_decode_combine_test tests/core/qsa_decode_combine_test.cpp)
+target_include_directories(qsa_decode_combine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(qsa_decode_combine_test PRIVATE warnings)
+basalt_cpu_test(NAME qsa_decode_combine_test COMMAND qsa_decode_combine_test)
+set_tests_properties(qsa_decode_combine_test PROPERTIES TIMEOUT 60)
+
 add_executable(session_head_shard_test tests/core/session_head_shard_test.cpp)
 target_link_libraries(session_head_shard_test PRIVATE engine)
 basalt_cpu_test(NAME session_head_shard_test COMMAND session_head_shard_test)
