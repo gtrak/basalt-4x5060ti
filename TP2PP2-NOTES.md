@@ -809,3 +809,108 @@ Build green (`cmake --build build -j4`). `tp2_pair_test`, `qsa_head_split_test`,
 `tp2_shard_weights_test` pass; `ctest -L cpu` unchanged except the pre-existing `expert_multi_test`, which
 fails on this host because its CPU lacks AVX512-VNNI/VBMI (it does not link `prefill`).
 `tools/check_platform_boundary.sh` and `tools/check_stderr_logging.sh` ok.
+
+## RUN 10 — the peer's FP4 share's gate is computed from the placement, not a constant
+
+Run 9's prediction measured: at `--prefill 12288` the peer does no row visits and the lead pays for the
+partner-held blobs across the link. Both gates (`T_max`, `T_fp4`) were constants — `kPeerFp4Tokens = 5120` capped
+the FP4 share whatever the placement was. One file, `src/prefill/prefill.cpp`.
+
+### What changed
+
+`kPeerFp4Tokens` is gone. The share's longest chunk (`PeerPrefill::T_fp4`) is now computed at setup from the
+placement, in bytes on the pair's link (`struct PeerLink`, above `Prefill::peer_bytes`):
+
+- **the round trip**, per layer the peer would serve: the chunk's normed activations go to it and its result rows
+  come back. Measured from the code that ships them, not assumed: both legs are FP32 — `cudaMemcpyPeerAsync` of
+  `T * N * 4` of `m.mixed` out (10 240 B a token) and `nr * N * 4` into `m.Dm` back (10 240 B a row). The FP4
+  planes are made on the peer by its own `fp4::quantize_tokens`, so they never cross, and the row tables
+  (`src`, the piece table) are host-to-device on the peer's own PCIe, not the pair's link.
+- **what it spares**, per the same layers: the partner-held blobs the primary's ring leaves out
+  (`peer->has(l, e)` skips them), `held(l) * PeerExperts::slot_bytes(l)`, independent of the chunk.
+
+Rows follow the routing, which setup does not know, so a layer's rows are split in proportion to the experts each
+card holds (a chunk of `stream_all_min()` tokens or more hits every expert — run 9's shape). The crossover is
+`blobs / per_token`, capped by the chunk. `Prefill::set_peer` logs it; `Prefill::peer_bytes` (the tier's reserve,
+taken before the peer is filled) sizes the same buffers for the widest the crossover can reach for this pack
+(`peer_fp4_ceiling`: a whole layer on the peer), so opening the gate never needs a re-size and the allocation
+always fits the reserve.
+
+`kPeerSlowRows = 2559` stays: its caller is the program's `cards_alike` verdict (`peer_streamed_share`,
+`generate.cpp:1388`), so it already applies only to a genuinely unlike pair. On this box (4x RTX 5060 Ti) the
+cards are alike, `streamed_share` is true, and the routed-only share takes `min(chunk, stream_all_min() - 1)` with
+no slow-peer derate.
+
+### The arithmetic, at run 9's geometry
+
+24 layers, 512 experts a layer of 2 548 736 B (`expert_layout`'s NVFP4 blob), N = 2560, K = 10,
+`stream_all_min()` = 2560. Checked by compiling `peer_link`/`peer_fp4_ceiling` as they stand in the file against a
+hand-computed value (transcription check, no device).
+
+| peer holds a layer | round trip per token | partner-held blobs | crossover |
+|---|---|---|---|
+| 256 of 512 (tp2 half) | 1 474 560 B | 14 934 MiB | **10 619 tokens** |
+| 100 of 512 | 725 760 B | 5 834 MiB | 8 428 tokens |
+| 33 of 512 (~85 MiB a layer) | 404 160 B | 1 925 MiB | 4 994 tokens |
+| 4 of 512 | 264 960 B | 233 MiB | 923: below `stream_all_min()`, share off |
+| 0 | — | 0 | 0 |
+
+The 33-expert row is the tier-mode sanity check the brief asked for: a small held share lands the crossover on the
+old flat 5120. The ceiling for this pack is 11 585 tokens, and it bounded every placement over layers 1..24 x held
+0..512.
+
+**So at the production 12 288-token chunk the peer still computes nothing.** The gate is 2.07x wider than the flat
+constant but the chunk is past the crossover: at half-and-half the round trip is 755 MB a layer against 652 MB of
+blobs it spares. To measure the peer legs, run `--prefill 8192` (or 10 240); `--prefill 12288` will still print
+`no peer`, and now says why in its own line.
+
+### Buffer audit: what grows with the wider gate
+
+`peer_layout` sizes the peer's buffers from `Tp = max(T_max, tf)`, so nothing was pinned to the old 5120 — the
+constant was the only pin. What moves when `tf` goes 5 120 -> 11 585 (the reserve's worst case):
+
+| peer buffer | sized from | was | now |
+|---|---|---|---|
+| `mixed` (the activations it receives) | `Tp * N * 4` | 50.0 MiB | 113.1 MiB |
+| `f_a4x` (its token planes) | `fp4::token_bytes(Tp, N)` | 7.03 MiB | 15.91 MiB |
+| `f_gsx`, `f_rel` | `Tp * 4`, `2*(NE + Tp*K/64 + 1)*4` | 20 KiB, 10 KiB | 45 KiB, 18 KiB |
+| `src`, `ident` | `cap_rows * 4` each | 200 KiB (`Tp*K` = 51 200) | 240 KiB (the caller's 61 440) |
+| `Xq_g`, `Hq_g`, `GU_g`, `H_g`, `Dm_b[2]` | `G = T_max` rows (2 559) | unchanged | unchanged |
+
++72.1 MiB on the peer card, which comes out of its expert tier (~30 slots at 2.43 MiB): **pin the tiers when
+comparing decode numbers against run 8/9 builds.** The per-group buffers do not grow because `fp4::cut_pieces`
+caps a piece at `G = T_max` rows regardless of the chunk; `P.bounds` belongs to the routed MMQ share, whose
+`T_max` did not change. Without `p2p` the relay also pins an `hx` of `Tp*N*4` (52 -> 113 MiB) and `kRes` result
+buffers of `G*N*4` (104.9 MiB, unchanged); this box runs with `p2p`, so the relay is not taken here.
+
+### The lines to grep
+
+```
+grep "peer fp4 crossover" log        # the decision, once per stage at setup
+grep "peer GPU" log                  # unchanged: "... computes its experts' rows of each prompt chunk up to N tokens"
+```
+
+`basalt prefill: peer fp4 crossover 10619 tokens: 1440 MiB of activations and rows per 1024 tokens against
+14934 MiB of partner-held blobs over 24 layers (6144 experts held)` — the second field is `per_token * 1024`, the
+third the blobs the share spares across those layers. A crossover above `stream_all_min()` with the second line
+reading `up to 2559 tokens` and no `a streamed one with the primary's FP4 kernels` clause means the FP4 buffers did
+not fit on the peer card and it kept only the routed-only share.
+
+### The one lever left, deliberately not pulled
+
+The outbound leg is the cheap half of the round trip to fix and the only thing between the crossover and the
+production chunk: the peer is handed the FP32 activations and quantizes them itself (`fp4::quantize_tokens(P.mixed,
+...)`), while the lead makes exactly those token planes for its own experts in the same layer
+(`fp4::quantize_tokens(m.mixed, T, N, N, fp.a4x, fp.gsx, m.cs)`, same function, same input, so the same bits). Copy
+the lead's planes instead of its `mixed` and drop the peer's quantize: 1 444 B a token (the codes, the UE4M3 scales,
+the token scale) instead of 10 240, which puts the tp2 crossover at **12 394 tokens**, past 12 288, and the gate
+opens at the production chunk. The lead's quantize would have to be hoisted above the peer's enqueue (it runs after
+it today), so this changes what crosses the link, what the peer launches and in what order - it needs the FP4 parity
+test, a profile and the quality gate: the maintainer's call, not a silent addition to this change.
+
+### Validated here (GPU untouched: the server is live)
+
+Build green (`cmake --build build -j4`). `tp2_pair_test`, `qsa_head_split_test`, `session_head_shard_test`,
+`tp2_shard_weights_test` pass; `ctest -L cpu` 66/67 with only the pre-existing `expert_multi_test` (this CPU lacks
+AVX512-VNNI/VBMI). `tools/check_platform_boundary.sh` and `tools/check_stderr_logging.sh` ok. No engine start, no
+`basalt-ctl`, nothing bound on :8000. **Ready for reviewer measurement.**
