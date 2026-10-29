@@ -224,6 +224,7 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/gdn.cu
                         src/kernels/cuda/qsa.cu
                         src/kernels/cuda/elementwise.cu
+                        src/kernels/cuda/tp2_collective.cu
                         src/kernels/cuda/bf16_gemv.cu
                         src/kernels/cuda/native_mmvq.cu
                         src/kernels/cuda/native_bf16.cu
@@ -761,6 +762,13 @@ add_executable(s_gemv_parity tests/kernels/s_gemv_parity.cpp)
 target_include_directories(s_gemv_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(s_gemv_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME s_gemv_parity COMMAND s_gemv_parity --selftest)
+
+# the 2-way all-reduce vs tp2_all_reduce_ref, bitwise, plus the refusals and a microbench line (two cards)
+add_executable(tp2_allreduce_parity tests/kernels/tp2_allreduce_parity.cpp)
+target_include_directories(tp2_allreduce_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(tp2_allreduce_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME tp2_allreduce_parity COMMAND tp2_allreduce_parity --selftest)
+set_tests_properties(tp2_allreduce_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 
 add_executable(elementwise_parity tests/kernels/elementwise_parity.cpp)
 target_include_directories(elementwise_parity PRIVATE ${_gpu_include_directories})
