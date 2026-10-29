@@ -702,9 +702,25 @@ bool Verifier::dm_init(std::string& err) {
         for (size_t i = 0; i < d->rows_words; ++i) ((volatile uint32_t*) d->h_rows)[i] = basalt::kernels::dec_moe_tag_word();
         if (!ok) { err = "verify: device-planned MoE peer buffers"; return false; }
         d->shadow1.assign((size_t) LE, INT32_MIN);
-        if (!router_ok || !warm_router(rq_h, rs_h, &d->rq, &d->rs))
-            basalt::log::warn("basalt verify", "the peer's L2 warm-up is off (%s)",
-                              router_ok ? "the predictor's buffers could not be placed on the peer" : codes_why.c_str());
+        // --exp l2warm_force=1: the warm-up on despite an uncovered router, when the geometry fits the predictor;
+        // a layer without a covered router predicts from its zero rows (the lowest expert ids)
+        std::string warm_reason;
+        bool warm_ok = router_ok;
+        if (!warm_ok) {
+            warm_reason = codes_why;
+            if (exp_flag("l2warm_force", 0) != 0 && g.n_expert <= basalt::kernels::kDmPredExperts && N % 32 == 0) {
+                warm_ok = true;
+                warm_reason = "forced by --exp l2warm_force=1 despite: " + codes_why;
+            }
+        }
+        if (warm_ok && !warm_router(rq_h, rs_h, &d->rq, &d->rs)) {
+            warm_ok = false;
+            warm_reason = "the predictor's buffers could not be placed on the peer";
+        }
+        if (!warm_ok)
+            basalt::log::warn("basalt verify", "the peer's L2 warm-up is off (%s)", warm_reason.c_str());
+        else if (!router_ok)
+            basalt::log::info("basalt verify", "the peer's L2 warm-up is on, forced despite an uncovered router");
         // further peers: a window, ring and doorbell each; cards that hold several peers split their blocks
         std::vector<int> devs = {d->pdev};
         for (PeerExperts* xpe : xpeers_)
@@ -741,7 +757,7 @@ bool Verifier::dm_init(std::string& err) {
                      cudaMalloc(&x.pscr, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
                      cudaMemset(x.pscr, 0, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
                      cudaMalloc((void**) &x.parr, 64) == cudaSuccess;
-                if (ok && router_ok && d->rq != nullptr) (void) warm_router(rq_h, rs_h, &x.rq, &x.rs);
+                if (ok && d->rq != nullptr) (void) warm_router(rq_h, rs_h, &x.rq, &x.rs);
             }
             x.shadow.assign((size_t) LE, INT32_MIN);
             if (!ok) { err = "verify: device-planned MoE buffers of a further peer"; return false; }
