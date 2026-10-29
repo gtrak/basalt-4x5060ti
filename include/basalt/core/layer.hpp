@@ -32,12 +32,14 @@
 
 #include "basalt/core/layout.hpp"
 #include "basalt/core/qsa_head_split.hpp"
+#include "basalt/core/tp2_shard_weights.hpp"
 #include "basalt/core/weights.hpp"
 
 #include "basalt/kernels/gr.hpp"
 #include "basalt/kernels/kv_stream.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/kernels/ple.hpp"
+#include "basalt/kernels/tp2_collective.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -280,10 +282,11 @@ basalt::kernels::QsaShapes qsa_real_shapes(const ModelGeometry& g);
 /// The same for one card of a head pair: the card's heads, the indexer whole (`qsa_head_split.hpp`).  An empty
 /// shard is the whole layer, which is what every session that is not part of a pair asks for.
 basalt::kernels::QsaShapes qsa_shard_shapes(const ModelGeometry& g, const QsaHeadShard& heads);
-/// Can a state carved for `heads` be RUN, as opposed to sized?  Sizing a shard is landed; running one needs the
-/// `attn_output` column split and the pair's all-reduce around the kernels, and until that exists every executor
-/// (`qsa_layer`, `qsa_kv_resolve`) refuses one.  A shard is never silently wide-read: an oversized head count on a
-/// narrow allocation is a fault, not a wrong number.  Sets `err` and returns false when it refuses.
+/// Can a state carved for `heads` be RUN at all?  A whole shard can; a shard can too now that the pair's
+/// collective and the packed `attn_output` columns exist - but only with a pair attached, which this function
+/// cannot see.  `qsa_shard_ready` is the question a caller asks; this one is the geometry half of it, and it
+/// refuses a shard that is not a well-formed half of a two-way split (three cards, a rank outside the pair, a KV
+/// axis that does not divide).  Sets `err` and returns false when it refuses.
 bool qsa_shard_runs(const QsaHeadShard& heads, std::string& err);
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0,
@@ -369,6 +372,42 @@ void stage_timing_report(int64_t n_layers);
 void stage_mark_begin(int64_t layer, int slot, void* stream);
 void stage_mark_end(int64_t layer, int slot, void* stream);
 
+struct QsaBuffers;   // below; qsa_shard_ready takes it by reference
+
+/// What one card of a stage pair needs to run HALF a QSA layer and finish it: the pair's collective, this card's
+/// place in it, and the `attn_output` columns the card reads (packed, because a column slice of a blocked weight
+/// cannot be a pointer - `tp2_shard_weights.hpp`).
+///
+/// OWNERSHIP: the `Tp2Pair` belongs to the stage (two cards, one pair, opened once at start).  The packed weight
+/// bytes are allocated by `qsa_pair_prepare` on the card that runs the shard and freed by `qsa_pair_free`; they
+/// are copies of the table's `attn_output`, so the table must outlive nothing here beyond the prepare call.
+struct QsaPair {
+    basalt::kernels::Tp2Pair* pair = nullptr;
+    int rank = 0;          ///< 0 the stage's lead card, 1 its partner (`tp2_collective.hpp`)
+    int peer_dev = -1;     ///< the other card's CUDA device
+    int device = -1;       ///< this card's
+    /// One entry per model layer; `ok` only on the QSA layers this card runs.  The pointers are DEVICE.
+    std::vector<QsaShardWeight> o_cols;
+    /// The packed buffers behind `o_cols`, one per entry that owns its memory.
+    std::vector<void*> owned;
+};
+
+/// Pack every QSA layer's `attn_output` columns for `heads` and put them on `dev`.  This is the only weight copy
+/// the head split needs - the q/k/v projections are cut on their output axis and are pointer views.
+/// On failure nothing is left half-built.
+bool qsa_pair_prepare(QsaPair& p, const WeightTable& tables, const ModelGeometry& g, const QsaHeadShard& heads,
+                      basalt::kernels::Tp2Pair& pair, int dev, int peer_dev, std::string& err);
+void qsa_pair_free(QsaPair& p);
+/// The device bytes `qsa_pair_prepare` will allocate: what the caller's arena or budget must cover.
+uint64_t qsa_pair_bytes(const WeightTable& tables, const ModelGeometry& g, const QsaHeadShard& heads);
+
+/// Is this shard runnable HERE?  True when the shard is a well-formed half of a pair AND the buffers carry that
+/// pair: same rank, an open `Tp2Pair`, and a packed `attn_output` for `layer`.  Everything else refuses, loudly -
+/// a session that was never carved for a pair cannot end up running half a layer by accident.  The head split
+/// itself is bitwise-exact (`tests/kernels/tp2_head_split_parity.cpp`); the o_proj column split sums the pair's
+/// two partials, whose ORDER is fixed by `tp2_all_reduce_ref` and is the numerics-gate item the notes carry.
+bool qsa_shard_ready(const QsaState& st, const QsaBuffers& b, int64_t layer, std::string& err);
+
 /// Scratch for one QSA layer.  Every buffer here is overwritten by every token.
 struct QsaBuffers {
     uint8_t* x_q8_0 = nullptr;     ///< n_embd, block_q8_0 - `attn_q` is Q2_0, whose vec_dot_type is Q8_0
@@ -394,6 +433,11 @@ struct QsaBuffers {
     /// The head shard these were carved for; `qsa_buffers_bytes` narrowed the head-following buffers to it and
     /// left the indexer's and the selection's whole (`qsa_head_split.hpp`).
     QsaHeadShard heads;
+    /// The stage pair this session's card belongs to, or null.  THIS POINTER is what makes a shard runnable:
+    /// `qsa_head_split.hpp` lets any caller size a shard, and a session that was not carved for a pair has no
+    /// business running one - it would compute half a layer and never hear from the other half.  Attached by
+    /// `qsa_pair_prepare`'s caller, which is the engine's tp2 setup, and nothing else.
+    QsaPair* pair = nullptr;
 };
 
 uint64_t qsa_buffers_bytes(const ModelGeometry& g, int64_t max_cells, const QsaHeadShard& heads = {});

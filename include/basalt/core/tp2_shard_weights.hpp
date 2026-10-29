@@ -182,8 +182,10 @@ inline QsaShardWeight qsa_weight_rows(const WeightRef& w, int64_t row0, int64_t 
     v.codes_bytes = (uint64_t) rows * (w.codes_bytes / (uint64_t) w.ne1);
     v.scales_bytes = (uint64_t) rows * (w.scales_bytes / (uint64_t) w.ne1);
     v.offset_bytes = w.offset_bytes ? (uint64_t) rows * (w.offset_bytes / (uint64_t) w.ne1) : 0;
-    if (w.native_data && native_row_bytes) {
-        if (native_row_bytes % (uint64_t) w.ne1 != 0) return QsaShardWeight{};
+    if (w.native_data) {
+        // A tensor that HAS a native image must keep using it: dropping to the canonical planes for the shard
+        // would run a different decoder than the whole layer ran, and the two are not bitwise equal.
+        if (native_row_bytes == 0 || native_row_bytes % (uint64_t) w.ne1 != 0) return QsaShardWeight{};
         v.native = (const uint8_t*) w.native_data + (uint64_t) row0 * (native_row_bytes / (uint64_t) w.ne1);
         v.native_bytes = (uint64_t) rows * (native_row_bytes / (uint64_t) w.ne1);
     }

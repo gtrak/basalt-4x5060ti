@@ -163,26 +163,69 @@ void the_shapes_come_from_one_place() {
     CHECK(h.idx_block == w.idx_block);
 }
 
-// A shard can be SIZED, which is what the rest of this file checks.  Running one is a separate question, and the
-// answer so far is no: the kernels around the shard need the o_proj column split and the pair's reduction, and a
-// narrow pool read with the whole layer's head count is a fault rather than a wrong number.  Every executor asks
-// `qsa_shard_runs` first; this is what it must answer until that work lands.
-void a_shard_is_sized_but_not_runnable() {
+// Who is allowed to RUN a shard.  Two questions, and the split between them is the safety property:
+// `qsa_shard_runs` asks whether the shard is a well-formed half of a pair (geometry only), and
+// `qsa_shard_ready` asks whether THIS session may run it - which needs the stage pair attached to the
+// buffers, the same rank on both sides, an open Tp2Pair and a packed attn_output for the layer.  A session
+// that was never carved for the pair under tp2 has no pair pointer, so it cannot run a shard by accident.
+void who_may_run_a_shard() {
     std::string err;
-    CHECK(qsa_shard_runs(QsaHeadShard{}, err));          // the unsplit layer, which is what everyone asks for
+    // ---- the geometry half
+    CHECK(qsa_shard_runs(QsaHeadShard{}, err));           // the unsplit layer, which is what everyone asks for
     CHECK(err.empty());
     CHECK(qsa_shard_runs(QsaHeadShard{g.n_head, g.n_head_kv, 0, 1}, err));
     CHECK(err.empty());
+    CHECK(qsa_shard_runs(shard(0, 2), err));              // a well-formed half of a pair is runnable IN PRINCIPLE
+    CHECK(err.empty());
+    CHECK(qsa_shard_runs(shard(1, 2), err));
     err.clear();
-    CHECK(!qsa_shard_runs(shard(0, 2), err));            // rank 0 of a pair: sized, not runnable
-    CHECK(err.find("head shard") != std::string::npos);
-    CHECK(err.find("not wired") != std::string::npos);
-    CHECK(err.find("rank 0") != std::string::npos && err.find("of 2") != std::string::npos);
+    CHECK(!qsa_shard_runs(QsaHeadShard{g.n_head, g.n_head_kv, 2, 4}, err));   // rank outside the pair
+    CHECK(!err.empty());
     err.clear();
-    CHECK(!qsa_shard_runs(shard(1, 2), err));
-    CHECK(err.find("rank 1") != std::string::npos);
-    // a shard the geometry would refuse is refused here too - the gate does not invent a runnable case
-    CHECK(!qsa_shard_runs(QsaHeadShard{g.n_head, g.n_head_kv, 2, 4}, err));
+    CHECK(!qsa_shard_runs(QsaHeadShard{g.n_head, 3, 0, 3}, err));  // three well-formed pieces: the collective is a pair's
+    CHECK(err.find("two") != std::string::npos);
+    err.clear();
+    CHECK(!qsa_shard_runs(QsaHeadShard{g.n_head, 3, 0, 2}, err));             // 3 KV heads do not cut in two
+    CHECK(err.find("not a well-formed split") != std::string::npos);
+
+    // ---- the "may it run HERE" half: no pair, no shard
+    QsaState st{};
+    QsaBuffers bufs{};
+    st.heads = shard(0, 2);
+    bufs.heads = shard(0, 2);
+    err.clear();
+    CHECK(!qsa_shard_ready(st, bufs, 0, err));            // sized but no pair: the tp2 carve is what's missing
+    CHECK(err.find("no stage pair") != std::string::npos);
+    CHECK(qsa_shard_ready(QsaState{}, QsaBuffers{}, 0, err));   // a whole layer needs nothing
+
+    // a pair whose collective was never opened
+    st.heads = bufs.heads = shard(1, 2);
+    QsaPair link{};
+    link.rank = 1;
+    link.peer_dev = 2;
+    link.device = 3;
+    QsaShardWeight view{};
+    view.ne0 = 12 * 256;
+    view.ne1 = 4096;
+    view.ok = true;
+    link.o_cols.assign((size_t) g.n_layers, QsaShardWeight{});
+    link.o_cols[7] = view;
+    bufs.pair = &link;
+    err.clear();
+    CHECK(!qsa_shard_ready(st, bufs, 7, err));            // valid() is false on an unopened pair
+    CHECK(err.find("not open") != std::string::npos);
+
+    // mismatched shards between the state and its buffers
+    QsaState other{};
+    other.heads = shard(0, 2);
+    err.clear();
+    CHECK(!qsa_shard_ready(other, bufs, 7, err));
+    CHECK(err.find("its buffers for rank") != std::string::npos);
+
+    // a well-formed shard, a matching rank, but the layer was never prepared: only reachable once the pair is
+    // open, so it is checked through the geometry-only half here; `qsa_shard_ready`'s own packed-view branch is
+    // exercised on a real pair by tp2_head_split_parity.
+    CHECK(!link.o_cols[0].ok);
 }
 
 }  // namespace
@@ -195,7 +238,7 @@ int main() {
     a_copy_between_shards_is_refused();
     the_prompt_session_shards_too();
     the_shapes_come_from_one_place();
-    a_shard_is_sized_but_not_runnable();
+    who_may_run_a_shard();
     if (g_fail != 0) { std::printf("session head shard test failed: %d\n", g_fail); return 1; }
     std::printf("session head shard test ok\n");
     return 0;

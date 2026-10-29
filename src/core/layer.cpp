@@ -2,6 +2,7 @@
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "basalt/core/layer.hpp"
 #include "basalt/core/native_head.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/core/kv_arena.hpp"
 #include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
@@ -480,12 +481,191 @@ basalt::kernels::QsaShapes qsa_shard_shapes(const ModelGeometry& g, const QsaHea
 /// and the two cards' partials summed by tp2_all_reduce, the block input has to reach both cards, and the K/V a
 /// card computes must land in its own pool only.  A shard reaching a kernel before that is not a wrong answer, it
 /// is a narrow allocation read wide - so every executor asks here first.
+
+/// The native image's whole bytes, or 0 when the tensor has no native projection.  `native_mmvq_weight_bytes`
+/// gives one row's figure, which is what `tp2_shard_weights.hpp` multiplies up.
+static uint64_t qsa_native_bytes(const WeightRef& w) {
+    if (!w.native_data || w.native_type < 0 || w.ne0 <= 0 || w.ne1 <= 0) return 0;
+    try {
+        return basalt::kernels::native_mmvq_weight_bytes(w.native_type, (int) w.ne0, 1) * (uint64_t) w.ne1;
+    } catch (const std::exception&) {
+        return 0;   // an unsupported native form: the canonical planes still describe the tensor
+    }
+}
+
 bool qsa_shard_runs(const QsaHeadShard& heads, std::string& err) {
     if (heads.whole()) return true;
-    err = "qsa: the head shard (rank " + std::to_string(heads.rank) + " of " + std::to_string(heads.parts) +
-          " heads " + std::to_string(heads.n_head) + "/" + std::to_string(heads.n_head_kv) +
-          ") sizes the state but the o_proj split and the pair's reduction are not wired";
-    return false;
+    if (!heads.ok()) {
+        err = "qsa: the head shard rank " + std::to_string(heads.rank) + " of " + std::to_string(heads.parts) +
+              " heads " + std::to_string(heads.n_head) + "/" + std::to_string(heads.n_head_kv) +
+              " is not a well-formed split (the KV heads must divide the pair's width exactly)";
+        return false;
+    }
+    if (heads.parts != 2) {
+        err = "qsa: the head shard cuts " + std::to_string(heads.parts) +
+              " ways; the engine's tensor-parallel pair is two, and the collective is a pair's";
+        return false;
+    }
+    return true;
+}
+
+bool qsa_shard_ready(const QsaState& st, const QsaBuffers& b, int64_t layer, std::string& err) {
+    if (!qsa_shard_runs(st.heads, err)) return false;
+    if (st.heads.whole()) return true;
+    if (st.heads != b.heads) {
+        err = "qsa: the state is carved for head shard rank " + std::to_string(st.heads.rank) + " of " +
+              std::to_string(st.heads.parts) + ", its buffers for rank " + std::to_string(b.heads.rank) + " of " +
+              std::to_string(b.heads.parts);
+        return false;
+    }
+    const QsaPair* p = b.pair;
+    if (p == nullptr) {
+        err = "qsa: this session carries head shard rank " + std::to_string(st.heads.rank) + " of " +
+              std::to_string(st.heads.parts) + " but no stage pair; only a session carved for the pair under "
+              "tp2 may run a shard";
+        return false;
+    }
+    if (p->pair == nullptr || !p->pair->valid()) {
+        err = "qsa: the head shard's stage pair is not open (rank " + std::to_string(st.heads.rank) + " of " +
+              std::to_string(st.heads.parts) + ")";
+        return false;
+    }
+    if (p->rank != st.heads.rank) {
+        err = "qsa: the buffers say this card is pair rank " + std::to_string(p->rank) +
+              " and the shard says rank " + std::to_string(st.heads.rank);
+        return false;
+    }
+    if (layer < 0 || layer >= (int64_t) p->o_cols.size() || !p->o_cols[(size_t) layer].ok) {
+        err = "qsa: layer " + std::to_string((long long) layer) +
+              " has no packed attn_output columns for this shard; qsa_pair_prepare did not run for it";
+        return false;
+    }
+    return true;
+}
+
+uint64_t qsa_pair_bytes(const WeightTable& tables, const ModelGeometry& g, const QsaHeadShard& heads) {
+    std::string ignore;
+    if (!qsa_shard_runs(heads, ignore) || heads.whole()) return 0;
+    const QsaHeadRun cols = qsa_out_cols(heads, g.head_dim);
+    uint64_t total = 0;
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        if (!is_qsa_layer(g, l)) continue;
+        const WeightRef* w = LayerView(tables, l).get("attn_output.weight");
+        if (w == nullptr) continue;   // qsa_layer reports a missing tensor; sizing stays conservative
+        total += align_up16(qsa_weight_cols_bytes(*w, cols.start, cols.len, qsa_native_bytes(*w)));
+    }
+    return total;
+}
+
+void qsa_pair_free(QsaPair& p) {
+    for (void* d : p.owned) cudaFree(d);
+    p.owned.clear();
+    p.o_cols.clear();
+    p.pair = nullptr;
+    p.rank = 0;
+    p.peer_dev = p.device = -1;
+}
+
+/// One layer's `attn_output` columns: down from the card, cut on the host, up again, described over the copy.
+/// The route `Verifier::gs_init` takes for the GDN mixer's split weights, for the same reason - the planes can
+/// only be sliced as bytes.
+static bool qsa_prepare_one(QsaPair& p, const WeightRef& w, const std::string& name, int64_t col0, int64_t cols,
+                            int64_t layer, int dev, std::string& err) {
+    const uint64_t nb = qsa_native_bytes(w);
+    const uint64_t want = qsa_weight_cols_bytes(w, col0, cols, nb);
+    if (want == 0) {
+        err = name + ": its columns cannot be cut at column " + std::to_string((long long) col0) + " of " +
+              std::to_string((long long) w.ne0) + " (group " + std::to_string(w.group_elems) + ", native " +
+              std::to_string((unsigned long long) nb) + " B)";
+        return false;
+    }
+    std::vector<uint8_t> whole((size_t) (w.bytes + nb)), packed((size_t) want);
+    {
+        const OnDevice on(dev);
+        if (cudaMemcpy(whole.data(), w.data, (size_t) w.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            err = name + ": the planes did not come down";
+            return false;
+        }
+        if (nb && cudaMemcpy(whole.data() + w.bytes, w.native_data, (size_t) nb, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            err = name + ": the native image did not come down";
+            return false;
+        }
+    }
+    WeightRef cut = w;
+    cut.data = whole.data();
+    cut.native_data = nb ? (const void*) (whole.data() + w.bytes) : nullptr;
+    QsaShardWeight view = qsa_pack_weight_cols(cut, col0, cols, nb, packed.data());
+    if (!view.ok) {
+        err = name + ": the shard's columns would not pack";
+        return false;
+    }
+    if (view.codes_bytes + view.scales_bytes + view.offset_bytes + view.native_bytes != want) {
+        err = name + ": the packed views sizes (" + std::to_string((unsigned long long) view.codes_bytes) + "+" +
+              std::to_string((unsigned long long) view.scales_bytes) + "+" +
+              std::to_string((unsigned long long) view.offset_bytes) + "+" +
+              std::to_string((unsigned long long) view.native_bytes) + " B) do not fill the " +
+              std::to_string((unsigned long long) want) + " B that was allocated";
+        return false;
+    }
+    void* d = nullptr;
+    {
+        const OnDevice on(dev);
+        if (cudaMalloc(&d, (size_t) want) != cudaSuccess) { err = name + ": the shard's columns would not fit"; d = nullptr; return false; }
+        if (cudaMemcpy(d, packed.data(), (size_t) want, cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = name + ": the shard's columns would not go up";
+            cudaFree(d);
+            return false;
+        }
+    }
+    // re-describe the view over the DEVICE copy: the sizes are the packer's, the pointers are the card's
+    const uint8_t* base = (const uint8_t*) d;
+    view.codes = base;
+    view.scales = (const float*) (base + view.codes_bytes);
+    view.offset = view.offset_bytes ? (const float*) (base + view.codes_bytes + view.scales_bytes) : nullptr;
+    view.native = nb ? (const void*) (base + view.codes_bytes + view.scales_bytes + view.offset_bytes) : nullptr;
+    p.owned.push_back(d);
+    p.o_cols[(size_t) layer] = view;
+    return true;
+}
+
+bool qsa_pair_prepare(QsaPair& p, const WeightTable& tables, const ModelGeometry& g, const QsaHeadShard& heads,
+                      basalt::kernels::Tp2Pair& pair, int dev, int peer_dev, std::string& err) {
+    qsa_pair_free(p);
+    if (!qsa_shard_runs(heads, err)) return false;
+    if (heads.whole()) { err = "qsa: a whole layer needs no pair; the shard is what the pair is for"; return false; }
+    if (!pair.valid()) { err = "qsa: the stage pair is not open"; return false; }
+    if (dev != pair.device(0) && dev != pair.device(1)) {
+        err = "qsa: CUDA" + std::to_string(dev) + " is not one of the stage pair's cards";
+        return false;
+    }
+    if (heads.rank != (pair.device(0) == dev ? 0 : 1)) {
+        err = "qsa: rank " + std::to_string(heads.rank) + " is not the rank CUDA" + std::to_string(dev) + " is in "
+              "this pair";
+        return false;
+    }
+    const QsaHeadRun cols = qsa_out_cols(heads, g.head_dim);
+    p.o_cols.assign((size_t) g.n_layers, QsaShardWeight{});
+    p.pair = &pair;
+    p.rank = heads.rank;
+    p.device = dev;
+    p.peer_dev = peer_dev;
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        if (!is_qsa_layer(g, l)) continue;
+        const LayerView v(tables, l);
+        const WeightRef* w = v.get("attn_output.weight");
+        if (w == nullptr) {
+            err = v.name("attn_output.weight") + " is missing";
+            qsa_pair_free(p);
+            return false;
+        }
+        if (!qsa_prepare_one(p, *w, v.name("attn_output.weight"), cols.start, cols.len, l, dev, err)) {
+            qsa_pair_free(p);
+            return false;
+        }
+    }
+    basalt::log::info("basalt tp2", "CUDA%d holds rank %d's attn_output columns, %llu MiB over %zu layers", dev,
+            heads.rank, (unsigned long long) (qsa_pair_bytes(tables, g, heads) / 1048576), p.owned.size());
+    return true;
 }
 
 void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0; }
@@ -1000,7 +1180,48 @@ void stage_timing_report(int64_t n_layers) {
 // needs nothing from the layer it is called for beyond its index.
 static void dump_slot(float* dump, const ModelGeometry& g, int64_t layer, const float* src, uint64_t off,
                       uint64_t n, void* stream);
-bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos, int32_t pos_base,               const QsaState& st, const QsaBuffers& b, const float* x, float* out, void* stream,               std::string& err, float* dump) {    using namespace basalt::kernels;    if (!qsa_shard_runs(st.heads, err)) return false;    if (st.heads != b.heads) {        err = "qsa: the state is carved for head shard rank " + std::to_string(st.heads.rank) + " of " +              std::to_string(st.heads.parts) + ", its buffers for rank " + std::to_string(b.heads.rank) + " of " +              std::to_string(b.heads.parts);        return false;    }    const QsaShapes s = qsa_shapes(g);    const LayerView v(tables, layer);    /* P7 audit: RoPE reads cos/sin row pos_base + pos, and the table holds max_cells rows. */    if ((int64_t) pos_base + pos >= st.max_cells || pos_base < 0) {        err = "qsa_layer: position " + std::to_string((long long) pos_base + pos) + " is outside the RoPE table (" + std::to_string((long long) st.max_cells) + " rows)";        return false;    }    const int64_t cap = qsa_selection_width(kTopkMaxCells, s);
+/// Describe a card's rows of a projection as the pair's GEMV entry wants them: a WeightRef whose shape and planes
+/// are the view's, and the three plane pointers.  The form attributes (`code_bits`, `group_elems`, `act_kind`)
+/// stay the whole tensor's - the view cuts the SAME quantized tensor, only fewer of its rows.
+void qsa_shard_describe(WeightRef& out, Planes& planes, const WeightRef& w, const QsaShardWeight& v) {
+    out = w;
+    out.ne0 = v.ne0;
+    out.ne1 = v.ne1;
+    out.data = (void*) v.codes;
+    out.codes_bytes = v.codes_bytes;
+    out.scales_bytes = v.scales_bytes;
+    out.offset_bytes = v.offset_bytes;
+    out.bytes = v.codes_bytes + v.scales_bytes + v.offset_bytes + v.native_bytes;
+    out.native_data = (void*) v.native;
+    planes.codes = v.codes;
+    planes.scales = v.scales;
+    planes.offset = v.offset;
+}
+
+bool qsa_shard_rows(WeightRef& out, Planes& planes, const WeightRef& w, int64_t row0, int64_t rows,
+                    const std::string& name, std::string& err) {
+    const QsaShardWeight v = qsa_weight_rows(w, row0, rows, qsa_native_bytes(w));
+    if (!v.ok) {
+        err = name + ": rows [" + std::to_string((long long) row0) + ", +" + std::to_string((long long) rows) +
+              ") of a " + std::to_string((long long) w.ne1) + "-row tensor are not a view (planes " +
+              std::to_string((unsigned long long) w.codes_bytes) + "/" +
+              std::to_string((unsigned long long) w.scales_bytes) + "/" +
+              std::to_string((unsigned long long) w.offset_bytes) + " B, native " +
+              std::to_string((unsigned long long) qsa_native_bytes(w)) + " B)";
+        return false;
+    }
+    qsa_shard_describe(out, planes, w, v);
+    return true;
+}
+
+/// The packed `attn_output` columns `qsa_pair_prepare` put on this card, described the same way.
+void qsa_shard_cols(WeightRef& out, Planes& planes, const QsaShardWeight& v) {
+    WeightRef w;   // only the form attributes are read from it, and they are the layer's own tensor's
+    w = out;       // `out` arrives as the whole tensor's ref: keep its code_bits/group/act_kind
+    qsa_shard_describe(out, planes, w, v);
+}
+
+bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos, int32_t pos_base,               const QsaState& st, const QsaBuffers& b, const float* x, float* out, void* stream,               std::string& err, float* dump) {    using namespace basalt::kernels;    if (!qsa_shard_ready(st, b, layer, err)) return false;    const bool shard = !st.heads.whole();    if (shard && dump != nullptr) {        /* The dump buffer's slots are laid out for the WHOLE layer's widths; a shard would write its            half into slots named for the whole, and the harness would compare misaligned figures. The            quality harness runs unsharded, so refuse rather than mislabel. */        err = "qsa: a head shard does not produce a whole-layer dump";        return false;    }    const QsaShapes s = qsa_shapes(g, st.heads);    const LayerView v(tables, layer);    /* P7 audit: RoPE reads cos/sin row pos_base + pos, and the table holds max_cells rows. */    if ((int64_t) pos_base + pos >= st.max_cells || pos_base < 0) {        err = "qsa_layer: position " + std::to_string((long long) pos_base + pos) + " is outside the RoPE table (" + std::to_string((long long) st.max_cells) + " rows)";        return false;    }    const int64_t cap = qsa_selection_width(kTopkMaxCells, s);
 const auto normalize_rotate = [&](float* data, const WeightRef* norm, int rows, int cols) {
     try {
         native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, RMS_EPS, stream);
@@ -1029,23 +1250,36 @@ if (!w_attnk->native_data || !w_attnv->native_data || !w_attnq->native_data) {
 // local vector here would be captured as a dangling POINTER and replayed as garbage - see the note in
 // `layer.hpp`.  That is a silent failure, not a fault: the copy succeeds, the counts are wrong, and the
 // token that comes out is plausible.
-{        qsa_step_fill(st.host_step, pos, s);        for (int64_t h = 0; h < g.n_head; ++h) st.host_pos[h] = (int32_t) (pos_base + pos);
+{        qsa_step_fill(st.host_step, pos, s);        for (int64_t h = 0; h < s.n_head; ++h) st.host_pos[h] = (int32_t) (pos_base + pos);
         int32_t* m_step = nullptr;
         int32_t* m_pos = nullptr;
         if (cudaHostGetDevicePointer((void**) &m_step, st.host_step, 0) == cudaSuccess &&
             cudaHostGetDevicePointer((void**) &m_pos, st.host_pos, 0) == cudaSuccess) {
             basalt::kernels::copy_i32_from_mapped(st.step, m_step, basalt::kernels::kStepCount, stream);
-            basalt::kernels::copy_i32_from_mapped(st.pos_dev, m_pos, g.n_head, stream);
+            basalt::kernels::copy_i32_from_mapped(st.pos_dev, m_pos, s.n_head, stream);
         } else
-        if (cudaMemcpyAsync(st.step, st.host_step, qsa_step_bytes(), cudaMemcpyHostToDevice,                            (cudaStream_t) stream) != cudaSuccess ||            cudaMemcpyAsync(st.pos_dev, st.host_pos, (size_t) g.n_head * 4, cudaMemcpyHostToDevice,                            (cudaStream_t) stream) != cudaSuccess) {            err = "qsa_layer: the step-state upload failed";            return false;        }    }
+        if (cudaMemcpyAsync(st.step, st.host_step, qsa_step_bytes(), cudaMemcpyHostToDevice,                            (cudaStream_t) stream) != cudaSuccess ||            cudaMemcpyAsync(st.pos_dev, st.host_pos, (size_t) s.n_head * 4, cudaMemcpyHostToDevice,                            (cudaStream_t) stream) != cudaSuccess) {            err = "qsa_layer: the step-state upload failed";            return false;        }    }
 // ---- 3. the indexer's RAW key: appended before any norm, pooled later once per block
 project_bf16(x, (const uint16_t*) w_idxk->data, b.idx_raw, g.n_embd, g.idx_key_dim, stream);
 // ---- 4. K and V, in Q8_K, then norm and rotate K only
 SForm f_k, f_v, f_o, f_q;    if (!sform_of(*w_attnk, f_k, v.name("attn_k.weight"), err)) return false;    if (!sform_of(*w_attnv, f_v, v.name("attn_v.weight"), err)) return false;    if (!sform_of(*w_attno, f_o, v.name("attn_output.weight"), err)) return false;    if (!sform_of(*w_attnq, f_q, v.name("attn_q.weight"), err)) return false;    Planes p_k, p_v, p_o, p_q;    if (!plane_ptrs(*w_attnk, v.name("attn_k.weight"), p_k, err)) return false;    if (!plane_ptrs(*w_attnv, v.name("attn_v.weight"), p_v, err)) return false;    if (!plane_ptrs(*w_attno, v.name("attn_output.weight"), p_o, err)) return false;    if (!plane_ptrs(*w_attnq, v.name("attn_q.weight"), p_q, err)) return false;
+// THE SHARD'S WEIGHTS.  `attn_q`/`attn_k`/`attn_v` are cut on their OUTPUT axis, so this card's rows are
+// contiguous in every plane and the view is three pointer offsets (`qsa_weight_rows`).  `attn_output` is cut on
+// its INPUT axis and was packed onto this card at setup; that view is the pair's, and `qsa_shard_ready` checked
+// it exists.  An unsharded session keeps the originals: the whole-layer path is what it always was.
+WeightRef wq = *w_attnq, wk = *w_attnk, wv = *w_attnv, wo = *w_attno;
+Planes pq = p_q, pk = p_k, pv = p_v, po = p_o;
+if (shard) {
+    const QsaHeadRun qr = qsa_q_rows(st.heads, g.head_dim), kr = qsa_kv_rows(st.heads, g.head_dim);
+    if (!qsa_shard_rows(wq, pq, *w_attnq, qr.start, qr.len, v.name("attn_q.weight"), err)) return false;
+    if (!qsa_shard_rows(wk, pk, *w_attnk, kr.start, kr.len, v.name("attn_k.weight"), err)) return false;
+    if (!qsa_shard_rows(wv, pv, *w_attnv, kr.start, kr.len, v.name("attn_v.weight"), err)) return false;
+    qsa_shard_cols(wo, po, b.pair->o_cols[(size_t) layer]);
+}
 // k and v, with the activation THIS layer's tensors ask for.  Both are K-quants in every QSA layer of this
 // artifact, but the dispatch is here for the same reason it is in `gdn_layer`: the pack decides per tensor,
 // and "it happens to be uniform here" is the assumption that was wrong for `attn_q`.
-if (!gemv_quantized(*w_attnk, p_k, f_k, b.x_q8_0, b.x_q8k, b.kcur, g.n_embd, g.n_head_kv * g.head_dim,                        v.name("attn_k.weight"), stream, err, x)) return false;    if (!gemv_quantized(*w_attnv, p_v, f_v, b.x_q8_0, b.x_q8k, b.vcur, g.n_embd, g.n_head_kv * g.head_dim,                        v.name("attn_v.weight"), stream, err, x, w_attnk->native_data && w_attnv->native_data)) return false;    dump_slot(dump, g, layer, b.vcur,                            (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim,                            (uint64_t) g.n_head_kv * g.head_dim, stream);    if (!normalize_rotate(b.kcur, w_kn, (int) g.n_head_kv, (int) g.head_dim)) return false;
+if (!gemv_quantized(wk, pk, f_k, b.x_q8_0, b.x_q8k, b.kcur, g.n_embd, s.n_head_kv * s.head_dim,                        v.name("attn_k.weight"), stream, err, x)) return false;    if (!gemv_quantized(wv, pv, f_v, b.x_q8_0, b.x_q8k, b.vcur, g.n_embd, s.n_head_kv * s.head_dim,                        v.name("attn_v.weight"), stream, err, x, wv.native_data && wv.native_data)) return false;    dump_slot(dump, g, layer, b.vcur,                            (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim,                            (uint64_t) g.n_head_kv * g.head_dim, stream);    if (!normalize_rotate(b.kcur, w_kn, (int) s.n_head_kv, (int) s.head_dim)) return false;
 // ---- 5. into the cache, and the indexer's append (which pools AND rotates on a block completion).
 // EVERY ENTRY POINT FROM HERE ON IS THE CAPTURABLE ONE: the per-token counts come from `st.step` and every
 // launch is sized from a capacity in `st`/`b`, so this sequence can be captured and replayed.  The
@@ -1054,17 +1288,17 @@ if (st.kv_hybrid) {
     // K8V4: only V is rotated (kv_q4.hpp's H); the scores pair unrotated q with unrotated INT8 K, and the
     // output - a mix of rotated values - is rotated back after attention. Each append/gather call folds the
     // unused half's lanes onto the used pool (a bit-identical duplicate write), so no kernel variants exist.
-    basalt::kernels::fwht256_inplace_cuda(b.vcur, g.n_head_kv, stream);
+    basalt::kernels::fwht256_inplace_cuda(b.vcur, s.n_head_kv, stream);
     kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, st.step, b.kcur, b.kcur, s, stream, nullptr);   // mode 0: no host mirror
     basalt::kernels::kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, st.step, b.vcur, b.vcur, s, stream, nullptr);
 } else {
 if (st.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0
-    basalt::kernels::fwht256_inplace_cuda(b.kcur, g.n_head_kv, stream);
-    basalt::kernels::fwht256_inplace_cuda(b.vcur, g.n_head_kv, stream);
+    basalt::kernels::fwht256_inplace_cuda(b.kcur, s.n_head_kv, stream);
+    basalt::kernels::fwht256_inplace_cuda(b.vcur, s.n_head_kv, stream);
 }
 if (st.kv_q4) {
     basalt::kernels::kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);
-} else if (st.kv_int8) kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    else kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host); } /* not K8V4 */    {        const uint64_t nvk = (uint64_t) g.n_head_kv * g.head_dim;        const uint64_t base = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim + 2 * nvk + 8;        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.k_pool, base, nvk / 2, stream);        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.v_pool, base + nvk / 2, nvk / 2, stream);        dump_slot(dump, g, layer, b.vcur, base + nvk, nvk, stream);        dump_slot(dump, g, layer, b.kcur, base + 2 * nvk, nvk, stream);    }    {        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};        try {
+} else if (st.kv_int8) kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    else kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host); } /* not K8V4 */    {        const uint64_t nvk = (uint64_t) s.n_head_kv * s.head_dim;        const uint64_t base = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) s.n_head * s.head_dim + 2 * nvk + 8;        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.k_pool, base, nvk / 2, stream);        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.v_pool, base + nvk / 2, nvk / 2, stream);        dump_slot(dump, g, layer, b.vcur, base + nvk, nvk, stream);        dump_slot(dump, g, layer, b.kcur, base + 2 * nvk, nvk, stream);    }    {        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};        try {
             native_qsa_indexer_append(b.idx_raw, st.step + kStepPos, pos_base,
                 (const float*) w_ikn->data, RMS_EPS, ib, s, st.max_cells, rope_scaling(), stream);
         } catch (const std::exception& error) { err = v.name("native_indexer") + ": " + error.what(); return false; }
@@ -1074,11 +1308,11 @@ if (st.kv_q4) {
 // **`attn_q` IS *NOT* ALWAYS Q2_0.**  It is Q2_0 on two of the twelve QSA layers, Q3_K on six and IQ4_XS on four, so the
 // projection must be chosen by the tensor's own form: an S4 code plane read with a Q8_0 activation would still produce
 // a plausible vector, off by a percent.
-if (!gemv_quantized(*w_attnq, p_q, f_q, b.x_q8_0, b.x_q8k, b.q_full, g.n_embd, g.n_head * 2 * g.head_dim,                        v.name("attn_q.weight"), stream, err, x, w_attnv->native_data && w_attnq->native_data)) return false;
+if (!gemv_quantized(wq, pq, f_q, b.x_q8_0, b.x_q8k, b.q_full, g.n_embd, s.n_head * 2 * s.head_dim,                        v.name("attn_q.weight"), stream, err, x, wv.native_data && wq.native_data)) return false;
 // `per_head[:, :head_dim]` - the FIRST half of each head's 2*head_dim block, copied out contiguously so
 // the norm and the rotation see whole rows.  A 2-D copy is a memcpy node, which captures (`pinned_capture`
 // case A) and needs no kernel.
-if (cudaMemcpy2DAsync(b.qcur, (size_t) g.head_dim * 4, b.q_full, (size_t) g.head_dim * 2 * 4,                          (size_t) g.head_dim * 4, (size_t) g.n_head, cudaMemcpyDeviceToDevice,                          (cudaStream_t) stream) != cudaSuccess) {        err = "qsa_layer: the q/gate split failed";        return false;    }    if (!normalize_rotate(b.qcur, w_qn, (int) g.n_head, (int) g.head_dim)) return false;
+if (cudaMemcpy2DAsync(b.qcur, (size_t) g.head_dim * 4, b.q_full, (size_t) g.head_dim * 2 * 4,                          (size_t) s.head_dim * 4, (size_t) s.n_head, cudaMemcpyDeviceToDevice,                          (cudaStream_t) stream) != cudaSuccess) {        err = "qsa_layer: the q/gate split failed";        return false;    }    if (!normalize_rotate(b.qcur, w_qn, (int) s.n_head, (int) s.head_dim)) return false;
 // ---- 7. the indexer's query: BF16, then norm and rotate
 project_bf16(x, (const uint16_t*) w_idxq->data, b.q_idx, g.n_embd, g.idx_q_heads * g.idx_key_dim, stream);
 if (!normalize_rotate(b.q_idx, w_iqn, (int) g.idx_q_heads, (int) g.idx_key_dim)) return false;
@@ -1091,7 +1325,7 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
     qsa_block_topk(b.cell_scores, st.step, 1, max_blocks, cap, s, b.ids, stream);
     // KV streaming: every block the selection names is made resident before anything reads it
     qsa_kv_resolve(st, g, b.ids, st.step, 1, cap, stream);
-    if (st.kv_rot) basalt::kernels::fwht256_inplace_cuda(b.qcur, g.n_head, stream);   // <Hq, Hk> = <q, k>
+    if (st.kv_rot) basalt::kernels::fwht256_inplace_cuda(b.qcur, s.n_head, stream);   // <Hq, Hk> = <q, k>
     if (dump == nullptr) {
         const basalt::kernels::QsaAttnPools pools = qsa_attn_pools(st);
         basalt::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s, b.attn_scratch, b.attn, stream);
@@ -1105,21 +1339,38 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
     else if (st.kv_q4) basalt::kernels::kv_gather_q4_step(st.k_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
     else if (st.kv_int8) kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, b.ids, st.step, cap, s,                                 b.k_scratch, b.v_scratch, stream);    else kv_gather_step(st.k_pool, st.v_pool, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch,                   stream);    qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream);
     }
-    if (st.kv_rot || st.kv_hybrid) basalt::kernels::fwht256_inplace_cuda(b.attn, g.n_head, stream);   // the output back: H is self-inverse
+    if (st.kv_rot || st.kv_hybrid) basalt::kernels::fwht256_inplace_cuda(b.attn, s.n_head, stream);   // the output back: H is self-inverse
     dump_slot(dump, g, layer, b.attn, (uint64_t) 2 * g.n_embd + 2 * g.hc,                            (uint64_t) g.n_head * g.head_dim, stream);    {        const uint64_t vs = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim +                            (uint64_t) 2 * g.n_head_kv * g.head_dim;        dump_slot(dump, g, layer, (const float*) b.v_scratch, vs,                            (uint64_t) g.n_head_kv * g.head_dim / 2, stream);        dump_slot(dump, g, layer, (const float*) b.ids, vs + (uint64_t) g.n_head_kv * g.head_dim / 2, 4, stream);        dump_slot(dump, g, layer, (const float*) st.step,                            vs + (uint64_t) g.n_head_kv * g.head_dim / 2 + 4, 4, stream);    }
 // ---- 9. Gate the attention output before its projection. Native CUDA keeps F32
 // sigmoid/multiply arithmetic and uses Q8_1 for the native quantized projection.
 // The canonical fallback retains its prior FP64 gate and Q8_K projection.
 try {
-    native_qsa_gate_apply(b.attn, b.q_full, b.attn32, (int) g.n_head, (int) g.head_dim, stream);
+    native_qsa_gate_apply(b.attn, b.q_full, b.attn32, (int) s.n_head, (int) s.head_dim, stream);
 } catch (const std::exception& error) { err = v.name("qsa_gate") + ": " + error.what(); return false; }
-    if (!w_attno->native_data) quantize_q8_K(b.attn32, b.attn_q8k, g.n_head * g.head_dim, stream);    if (w_attno->native_data) {
-    if (!gemv_quantized(*w_attno, p_o, f_o, nullptr, b.attn_q8k, out,
-        g.n_head * g.head_dim, g.n_embd, v.name("attn_output.weight"), stream, err, b.attn32)) return false;
+    if (!wo.native_data) quantize_q8_K(b.attn32, b.attn_q8k, s.n_head * s.head_dim, stream);    if (wo.native_data) {
+    if (!gemv_quantized(wo, po, f_o, nullptr, b.attn_q8k, out,
+        s.n_head * s.head_dim, g.n_embd, v.name("attn_output.weight"), stream, err, b.attn32)) return false;
 } else {
-    s_gemv_q8k_split(b.attn_q8k, p_o.codes, p_o.scales, p_o.offset, out,
-                    g.n_head * g.head_dim, g.n_embd, f_o, stream);
-}    return true;}
+    s_gemv_q8k_split(b.attn_q8k, po.codes, po.scales, po.offset, out,
+                    s.n_head * s.head_dim, g.n_embd, f_o, stream);
+}
+// THE PAIR PUTS THE LAYER BACK TOGETHER.  Each card summed its own heads' columns of `attn_output`, so `out`
+// holds a PARTIAL; one collective leaves both cards holding the same sum, in the order `this rank + peer rank`
+// that `tp2_all_reduce_ref` fixes.  That order is why the head split is bitwise-exact through the attention and
+// NOT through here: the o_proj sum is reassociated, which is the numerics-gate item the branch's notes carry.
+// A null stream is refused rather than let both ranks share the legacy default stream, where a pair waits on
+// itself until the timeout.
+if (shard) {
+    if (stream == nullptr) {
+        err = "qsa: the pair's all-reduce needs its own stream, not the default one";
+        return false;
+    }
+    if (!tp2_all_reduce(*b.pair->pair, out, 1, g.n_embd, stream, b.pair->peer_dev, b.pair->rank, err)) {
+        err = "qsa: the pair's all-reduce of the o_proj partial failed: " + err;
+        return false;
+    }
+}
+return true;}
 // ================================ THE DOORBELL ================================
 namespace {}
 // namespace
