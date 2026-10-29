@@ -692,6 +692,10 @@ struct PeerPrefill {
                                             // its own compute, and a slot is 2.4 MiB of the peer's VRAM
     int span = 0;                           // extra slots, for an expert with more rows than one group holds
     static constexpr int kSpan = 16;        // ... re-read on demand by the group that needs it again
+    static_assert(kRing >= 2 * fp4::kMaxExperts,   // held at once: a group's experts plus the ones whose pieces run
+                  "the peer's ring must outlive two groups' blobs");   // over into it - and a group's span reads
+    static_assert(kSpan >= fp4::kMaxExperts,       // one span slot per expert a group reads, taken in turn
+                  "a group must not reuse a span slot it still reads");
     cudaStream_t copy = nullptr;            // this card's own host->device copy stream
     cudaStream_t span_copy = nullptr;       // ... and the stream the re-reads take, so they queue behind nothing
     std::vector<uint8_t*> stage;            // [ring + span] blob slots on this card
