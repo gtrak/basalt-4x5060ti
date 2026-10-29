@@ -656,3 +656,5 @@ Build green at `-j4` (CUDA 13.2, sm_120).  `tp2_pair_test`, `tp2_shard_weights_t
 6. Risk left: nothing here can tell whether the DMA really used the peer path rather than driver
    staging - `cudaDeviceCanAccessPeer` says the pair can, not that access was enabled.  The boot's
    `peer access: N of M ordered pairs enabled` line plus the prefill t/s is the evidence.
+7. There is deliberately no flag for the transport: `p2p` follows the pair's peer access, so an A/B
+   against the relay is `git checkout bd95c276^` for the prefill run, not a switch.
