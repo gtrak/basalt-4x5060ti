@@ -280,6 +280,11 @@ basalt::kernels::QsaShapes qsa_real_shapes(const ModelGeometry& g);
 /// The same for one card of a head pair: the card's heads, the indexer whole (`qsa_head_split.hpp`).  An empty
 /// shard is the whole layer, which is what every session that is not part of a pair asks for.
 basalt::kernels::QsaShapes qsa_shard_shapes(const ModelGeometry& g, const QsaHeadShard& heads);
+/// Can a state carved for `heads` be RUN, as opposed to sized?  Sizing a shard is landed; running one needs the
+/// `attn_output` column split and the pair's all-reduce around the kernels, and until that exists every executor
+/// (`qsa_layer`, `qsa_kv_resolve`) refuses one.  A shard is never silently wide-read: an oversized head count on a
+/// narrow allocation is a fault, not a wrong number.  Sets `err` and returns false when it refuses.
+bool qsa_shard_runs(const QsaHeadShard& heads, std::string& err);
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0,
                          const QsaHeadShard& heads = {});

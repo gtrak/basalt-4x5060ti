@@ -163,6 +163,28 @@ void the_shapes_come_from_one_place() {
     CHECK(h.idx_block == w.idx_block);
 }
 
+// A shard can be SIZED, which is what the rest of this file checks.  Running one is a separate question, and the
+// answer so far is no: the kernels around the shard need the o_proj column split and the pair's reduction, and a
+// narrow pool read with the whole layer's head count is a fault rather than a wrong number.  Every executor asks
+// `qsa_shard_runs` first; this is what it must answer until that work lands.
+void a_shard_is_sized_but_not_runnable() {
+    std::string err;
+    CHECK(qsa_shard_runs(QsaHeadShard{}, err));          // the unsplit layer, which is what everyone asks for
+    CHECK(err.empty());
+    CHECK(qsa_shard_runs(QsaHeadShard{g.n_head, g.n_head_kv, 0, 1}, err));
+    CHECK(err.empty());
+    err.clear();
+    CHECK(!qsa_shard_runs(shard(0, 2), err));            // rank 0 of a pair: sized, not runnable
+    CHECK(err.find("head shard") != std::string::npos);
+    CHECK(err.find("not wired") != std::string::npos);
+    CHECK(err.find("rank 0") != std::string::npos && err.find("of 2") != std::string::npos);
+    err.clear();
+    CHECK(!qsa_shard_runs(shard(1, 2), err));
+    CHECK(err.find("rank 1") != std::string::npos);
+    // a shard the geometry would refuse is refused here too - the gate does not invent a runnable case
+    CHECK(!qsa_shard_runs(QsaHeadShard{g.n_head, g.n_head_kv, 2, 4}, err));
+}
+
 }  // namespace
 
 int main() {
@@ -173,6 +195,7 @@ int main() {
     a_copy_between_shards_is_refused();
     the_prompt_session_shards_too();
     the_shapes_come_from_one_place();
+    a_shard_is_sized_but_not_runnable();
     if (g_fail != 0) { std::printf("session head shard test failed: %d\n", g_fail); return 1; }
     std::printf("session head shard test ok\n");
     return 0;

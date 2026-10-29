@@ -473,6 +473,21 @@ basalt::kernels::QsaShapes qsa_shard_shapes(const ModelGeometry& g, const QsaHea
     return basalt::core::qsa_shard_shapes(qsa_real_shapes(g), heads);
 }
 
+/// Can a state carved for one card's heads be RUN yet?  The kernels can: with a shard's shapes they compute that
+/// card's heads and nothing else, bitwise the same as the whole layer's rows for them
+/// (tests/kernels/tp2_head_split_parity.cpp), and the pools are sized to match (session_head_shard_test).
+/// What is not wired is the layer AROUND them: `attn_output` needs its input columns sliced to the card's heads
+/// and the two cards' partials summed by tp2_all_reduce, the block input has to reach both cards, and the K/V a
+/// card computes must land in its own pool only.  A shard reaching a kernel before that is not a wrong answer, it
+/// is a narrow allocation read wide - so every executor asks here first.
+bool qsa_shard_runs(const QsaHeadShard& heads, std::string& err) {
+    if (heads.whole()) return true;
+    err = "qsa: the head shard (rank " + std::to_string(heads.rank) + " of " + std::to_string(heads.parts) +
+          " heads " + std::to_string(heads.n_head) + "/" + std::to_string(heads.n_head_kv) +
+          ") sizes the state but the o_proj split and the pair's reduction are not wired";
+    return false;
+}
+
 void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0; }
 int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
@@ -869,6 +884,11 @@ basalt::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,
                     int64_t cap, void* stream) {
     if (st.kv_mode != 1) return;
+    std::string err;
+    if (!qsa_shard_runs(st.heads, err)) {
+        basalt::log::error("basalt qsa", "kv resolve: %s", err.c_str());
+        return;
+    }
     basalt::kernels::kv_stream_resolve(st.map, qsa_attn_pools(st), st.host, qsa_kv_format(st), ids, steps, n_q, cap,
                                        qsa_shapes(g, st.heads), stream);
 }
@@ -980,7 +1000,7 @@ void stage_timing_report(int64_t n_layers) {
 // needs nothing from the layer it is called for beyond its index.
 static void dump_slot(float* dump, const ModelGeometry& g, int64_t layer, const float* src, uint64_t off,
                       uint64_t n, void* stream);
-bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos, int32_t pos_base,               const QsaState& st, const QsaBuffers& b, const float* x, float* out, void* stream,               std::string& err, float* dump) {    using namespace basalt::kernels;    const QsaShapes s = qsa_shapes(g);    const LayerView v(tables, layer);    /* P7 audit: RoPE reads cos/sin row pos_base + pos, and the table holds max_cells rows. */    if ((int64_t) pos_base + pos >= st.max_cells || pos_base < 0) {        err = "qsa_layer: position " + std::to_string((long long) pos_base + pos) + " is outside the RoPE table (" + std::to_string((long long) st.max_cells) + " rows)";        return false;    }    const int64_t cap = qsa_selection_width(kTopkMaxCells, s);
+bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos, int32_t pos_base,               const QsaState& st, const QsaBuffers& b, const float* x, float* out, void* stream,               std::string& err, float* dump) {    using namespace basalt::kernels;    if (!qsa_shard_runs(st.heads, err)) return false;    if (st.heads != b.heads) {        err = "qsa: the state is carved for head shard rank " + std::to_string(st.heads.rank) + " of " +              std::to_string(st.heads.parts) + ", its buffers for rank " + std::to_string(b.heads.rank) + " of " +              std::to_string(b.heads.parts);        return false;    }    const QsaShapes s = qsa_shapes(g);    const LayerView v(tables, layer);    /* P7 audit: RoPE reads cos/sin row pos_base + pos, and the table holds max_cells rows. */    if ((int64_t) pos_base + pos >= st.max_cells || pos_base < 0) {        err = "qsa_layer: position " + std::to_string((long long) pos_base + pos) + " is outside the RoPE table (" + std::to_string((long long) st.max_cells) + " rows)";        return false;    }    const int64_t cap = qsa_selection_width(kTopkMaxCells, s);
 const auto normalize_rotate = [&](float* data, const WeightRef* norm, int rows, int cols) {
     try {
         native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, RMS_EPS, stream);
