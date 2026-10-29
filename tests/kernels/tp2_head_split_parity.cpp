@@ -16,14 +16,19 @@
 // the step are shared, because the indexer does not split (core/qsa_head_split.hpp).
 //   tp2_head_split_parity [max_cells]
 #include "basalt/core/qsa_head_split.hpp"
+#include "basalt/core/tp2_shard_weights.hpp"
 #include "basalt/kernels/native_qsa.hpp"
 #include "basalt/kernels/qsa.hpp"
 #include "basalt/kernels/qsa_dec_attn.hpp"
 #include "basalt/kernels/qsa_decode_attn.hpp"
+#include "basalt/kernels/quantize_act.hpp"
+#include "basalt/kernels/s_gemv.hpp"
+#include "basalt/kernels/tp2_collective.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,6 +40,10 @@ using basalt::core::QsaHeadShard;
 
 namespace {
 int g_fail = 0;
+#define CHECK(...)                                                                                          \
+    do {                                                                                                    \
+        if (!(__VA_ARGS__)) { std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #__VA_ARGS__); ++g_fail; } \
+    } while (0)
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); std::exit(2); }
 }
@@ -333,6 +342,302 @@ int main(int argc, char** argv) {
                 whole_ms > 0 ? pair_ms / whole_ms : 0.0);
         cudaEventDestroy(a);
         cudaEventDestroy(b);
+    }
+
+    // ---- 7. the WIRED combine.  Everything above is what a card computes for its own heads; this is what the
+    // engine does with it: each card's gated attention goes through ITS columns of `attn_output` (the packed
+    // view of `tp2_shard_weights.hpp`, driven here through the same GEMV entry the layer calls) and the pair's
+    // all-reduce sums the two partials.  Step and batch forms, because the layer uses both.
+    //
+    // The comparison is a tolerance, not bitwise, and that is the branch's honest position: the column split
+    // reassociates the o_proj sum (`tp2_all_reduce_ref` fixes the order, the whole-layer GEMV does not have it).
+    // The COMBINE itself is checked bitwise against that reference, which is the part that must not drift.
+    {
+        const int64_t n_out = 64;                    // n_embd stand-in: this section is about the split, not the size
+        const int64_t n_in = NH * D;                 // the o_proj's input axis, the head axis
+        const int64_t group = 32, bits = 4;
+        basalt::kernels::SForm form;
+        form.code_bits = (int) bits;
+        form.code_bias = -8;
+        form.group_elems = (int) group;
+        form.has_offset = true;
+        form.codebook = basalt::kernels::Codebook::Affine;
+        form.act_kind = 1;   // Q8_K, as every K-quant attn_output is
+
+        const uint64_t codes_bytes = (uint64_t) n_out * (n_in * bits / 8);
+        const uint64_t scales_bytes = (uint64_t) n_out * (n_in / group) * 4;
+        std::vector<uint8_t> codes((size_t) codes_bytes), pc0, pc1;
+        std::vector<float> scales((size_t) n_out * (n_in / group)), offsets((size_t) n_out * (n_in / group));
+        std::mt19937 rw(99);
+        std::uniform_int_distribution<int> cd(0, 255);
+        for (auto& c : codes) c = (uint8_t) cd(rw);
+        std::uniform_real_distribution<float> sd(0.004f, 0.05f);
+        for (auto& x : scales) x = sd(rw);
+        for (auto& x : offsets) x = (float) (int) (rw() % 16) * 0.001f;
+
+        basalt::core::WeightRef w;
+        w.ne0 = n_in;
+        w.ne1 = n_out;
+        w.code_bits = (int) bits;
+        w.code_bias = -8;
+        w.group_elems = (int) group;
+        w.has_offset = true;
+        w.codes_bytes = codes_bytes;
+        w.scales_bytes = scales_bytes;
+        w.offset_bytes = scales_bytes;
+        w.bytes = codes_bytes + 2 * scales_bytes;
+        // the packer reads bytes, so it gets a host tensor: the planes are laid out as the loader lays them
+        std::vector<uint8_t> host_plane((size_t) w.bytes);
+        memcpy(host_plane.data(), codes.data(), (size_t) codes_bytes);
+        memcpy(host_plane.data() + codes_bytes, scales.data(), (size_t) scales_bytes);
+        memcpy(host_plane.data() + codes_bytes + scales_bytes, offsets.data(), (size_t) scales_bytes);
+        w.data = host_plane.data();
+
+        const basalt::core::QsaHeadRun c0 = basalt::core::qsa_out_cols(r0, D),
+            c1 = basalt::core::qsa_out_cols(r1, D);
+        const uint64_t want0 = basalt::core::qsa_weight_cols_bytes(w, c0.start, c0.len, 0);
+        CHECK(want0 > 0 && want0 == basalt::core::qsa_weight_cols_bytes(w, c1.start, c1.len, 0));
+        pc0.resize((size_t) want0);
+        pc1.resize((size_t) want0);
+        const basalt::core::QsaShardWeight v0 =
+            basalt::core::qsa_pack_weight_cols(w, c0.start, c0.len, 0, pc0.data());
+        const basalt::core::QsaShardWeight v1 =
+            basalt::core::qsa_pack_weight_cols(w, c1.start, c1.len, 0, pc1.data());
+        CHECK(v0.ok && v1.ok && v0.ne0 == c0.len && v1.ne0 == c1.len && v0.ne1 == n_out);
+
+        // device copies: the whole planes for the reference GEMV, the packed ones for each card
+        auto upload = [](const void* p, size_t n) {
+            void* d = nullptr;
+            ck(cudaMalloc(&d, n + 256), "gemv malloc");
+            ck(cudaMemset(d, 0, n + 256), "gemv memset");
+            ck(cudaMemcpy(d, p, n, cudaMemcpyHostToDevice), "gemv up");
+            return d;
+        };
+        void* cw = upload(host_plane.data(), (size_t) w.bytes);
+        const uint8_t* cc = (const uint8_t*) cw;
+        const float* cs = (const float*) (cw + (size_t) codes_bytes);
+        const float* co = (const float*) (cw + (size_t) (codes_bytes + scales_bytes));
+        const basalt::core::QsaShardWeight vw0 = [&] {
+            void* d = upload(pc0.data(), (size_t) want0);
+            basalt::core::QsaShardWeight v = v0;
+            v.codes = (const uint8_t*) d;
+            v.scales = (const float*) ((uint8_t*) d + v.codes_bytes);
+            v.offset = (const float*) ((uint8_t*) d + v.codes_bytes + v.scales_bytes);
+            return v;
+        }();
+        const basalt::core::QsaShardWeight vw1 = [&] {
+            void* d = upload(pc1.data(), (size_t) want0);
+            basalt::core::QsaShardWeight v = v1;
+            v.codes = (const uint8_t*) d;
+            v.scales = (const float*) ((uint8_t*) d + v.codes_bytes);
+            v.offset = (const float*) ((uint8_t*) d + v.codes_bytes + v.scales_bytes);
+            return v;
+        }();
+
+        // the gated attention outputs, which is what the layer feeds the o_proj
+        float *g_full_d = dalloc<float>((size_t) NH * D), *g_a = dalloc<float>((size_t) s0.n_head * D),
+              *g_b = dalloc<float>((size_t) s1.n_head * D);
+        {
+            cudaStream_t st = nullptr;
+            ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "gate stream");
+            std::vector<float> qgate((size_t) NH * 2 * D);
+            for (auto& x : qgate) x = nd(rng);
+            float* qg_d = dalloc<float>(qgate.size());
+            up(qg_d, qgate);
+            std::vector<float> qg0((size_t) s0.n_head * 2 * D), qg1((size_t) s1.n_head * 2 * D);
+            for (size_t i = 0; i < qg0.size(); ++i) qg0[i] = qgate[(size_t) r0.q0() * 2 * D + i];
+            for (size_t i = 0; i < qg1.size(); ++i) qg1[i] = qgate[(size_t) r1.q0() * 2 * D + i];
+            float* qg0_d = dalloc<float>(qg0.size());
+            float* qg1_d = dalloc<float>(qg1.size());
+            up(qg0_d, qg0);
+            up(qg1_d, qg1);
+            // the attention outputs of sections 2-4 are still on the device; gate them exactly as the layer does
+            k::native_qsa_gate_apply(attn_f, qg_d, g_full_d, (int) NH, (int) D, st);
+            k::native_qsa_gate_apply(attn0, qg0_d, g_a, (int) s0.n_head, (int) D, st);
+            k::native_qsa_gate_apply(attn1, qg1_d, g_b, (int) s1.n_head, (int) D, st);
+            ck(cudaStreamSynchronize(st), "gate wait");
+            cudaStreamDestroy(st);
+            cudaFree(qg_d); cudaFree(qg0_d); cudaFree(qg1_d);
+        }
+        uint8_t *xk_f = dalloc<uint8_t>((size_t) n_in * 34 + 256), *xk_a = dalloc<uint8_t>((size_t) n_in * 34 + 256),
+                *xk_b = dalloc<uint8_t>((size_t) n_in * 34 + 256);
+        k::quantize_q8_K(g_full_d, xk_f, n_in, nullptr);
+        // each card quantizes only its own heads' columns: the same bytes of the same vector, half as long
+        k::quantize_q8_K(g_a, xk_a, c0.len, nullptr);
+        k::quantize_q8_K(g_b, xk_b, c1.len, nullptr);
+        float *y_f = dalloc<float>(n_out), *y_a = dalloc<float>(n_out), *y_b = dalloc<float>(n_out);
+        k::s_gemv_q8k_split(xk_f, cc, cs, co, y_f, n_in, n_out, form, nullptr);
+        k::s_gemv_q8k_split(xk_a, vw0.codes, vw0.scales, vw0.offset, y_a, c0.len, n_out, form, nullptr);
+        k::s_gemv_q8k_split(xk_b, vw1.codes, vw1.scales, vw1.offset, y_b, c1.len, n_out, form, nullptr);
+        std::vector<float> wy = down(y_f, n_out), pa = down(y_a, n_out), pb = down(y_b, n_out);
+        double maxabs = 0.0;
+        for (float v : wy) maxabs = std::max(maxabs, (double) std::fabs(v));
+        // a GEMV that produced nothing would make every comparison below vacuously true
+        CHECK(maxabs > 1e-3);
+        double worst = 0.0;
+        for (int64_t i = 0; i < n_out; ++i)
+            worst = std::max(worst, std::fabs((double) pa[i] + (double) pb[i] - (double) wy[i]));
+        if (!(worst <= 1e-4 * std::max(1.0, maxabs))) {
+            std::printf("FAIL the packed column views do not reproduce the whole o_proj: worst %.3g, max |y| %.3g\n",
+                    worst, maxabs);
+            ++g_fail;
+        }
+        std::printf("  o_proj through the packed column views: worst |split - whole| %.3g, max |y| %.3g\n", worst,
+                maxabs);
+
+        // ---- the combine itself, on TWO cards, against `tp2_all_reduce_ref`: bitwise, because the order is the
+        // contract.  A wrong offset or a wrong rank here shows up as a differing bit, not a tolerance.
+        basalt::kernels::Tp2Pair pair;
+        std::string perr;
+        const int dev0 = 0, dev1 = 1;
+        bool can = false;
+        {
+            int peer01 = 0;
+            cudaDeviceCanAccessPeer(&peer01, dev0, dev1);
+            can = peer01 == 1;
+        }
+        if (!can || !pair.open(dev0, dev1, 4096, perr)) {
+            std::printf("  the combine needs two peer-accessible cards; skipped (%s)\n", perr.c_str());
+        } else {
+            // One stream PER CARD, which is the pair's stated condition: on the legacy default stream rank 0's
+            // waiting kernel would block rank 1's push, and the collective would only end at the timeout.
+            float* buf[2] = {nullptr, nullptr};
+            cudaStream_t str[2] = {nullptr, nullptr};
+            for (int r = 0; r < 2; ++r) {
+                ck(cudaSetDevice(r), "set dev");
+                ck(cudaMalloc((void**) &buf[r], (size_t) n_out * 4 + 256), "pair buf");
+                ck(cudaMemset(buf[r], 0, (size_t) n_out * 4 + 256), "pair zero");
+                ck(cudaMemcpy(buf[r], (r == 0 ? pa : pb).data(), (size_t) n_out * 4, cudaMemcpyHostToDevice), "pair up");
+                ck(cudaStreamCreateWithFlags(&str[r], cudaStreamNonBlocking), "pair stream");
+            }
+            std::string e;
+            CHECK(pair.all_reduce(buf[0], 1, n_out, str[0], dev1, 0, e));
+            CHECK(pair.all_reduce(buf[1], 1, n_out, str[1], dev0, 1, e));
+            for (int r = 0; r < 2; ++r) {
+                ck(cudaSetDevice(r), "set dev for the wait");
+                ck(cudaStreamSynchronize(str[r]), "pair wait");
+            }
+            std::vector<float> got0, got1;
+            ck(cudaSetDevice(dev0), "down 0");
+            got0 = down(buf[0], n_out);
+            ck(cudaSetDevice(dev1), "down 1");
+            got1 = down(buf[1], n_out);
+            ck(cudaSetDevice(dev0), "back");
+            cudaStreamDestroy(str[0]);
+            cudaStreamDestroy(str[1]);
+            std::vector<float> ref((size_t) n_out);
+            basalt::kernels::tp2_all_reduce_ref(ref.data(), pa.data(), pb.data(), 1, n_out);
+            for (int i = 0; i < n_out; ++i) {
+                if (memcmp(&got0[i], &ref[i], 4) || memcmp(&got1[i], &ref[i], 4)) {
+                    std::printf("FAIL the pair's sum is not tp2_all_reduce_ref at %d\n", i);
+                    ++g_fail;
+                    break;
+                }
+            }
+            // both cards end with the SAME sum: that is what the residual add downstream depends on
+            CHECK(got0 == got1);
+            CHECK(pair.issued(0) == 1 && pair.issued(1) == 1);
+            CHECK(pair.pushed_bytes(0) == basalt::kernels::tp2_all_reduce_bytes(1, n_out));
+            CHECK(!pair.timed_out());
+
+            // ---- the batch (verify-window) form at the SAME combine point: `rows` partials per card, one
+            // collective, each partial built from this card's columns of the weight.  This is the shape a verify
+            // window hands the layer, and the one a pitch or stride bug would survive unnoticed.
+            const int64_t rows = 8;
+            const int64_t per[2] = {c0.len, c1.len};
+            std::vector<std::vector<float>> xrow((size_t) rows, std::vector<float>((size_t) n_in));
+            std::mt19937 rb(4242);
+            std::normal_distribution<float> nx(0.f, 1.f);
+            for (int64_t q = 0; q < rows; ++q)
+                for (int64_t i = 0; i < n_in; ++i) xrow[q][(size_t) i] = nx(rb);
+            float* bb[2] = {nullptr, nullptr};
+            float* xin[2] = {nullptr, nullptr};
+            uint8_t* xk[2] = {nullptr, nullptr};
+            cudaStream_t bstr[2] = {nullptr, nullptr};
+            for (int r = 0; r < 2; ++r) {
+                ck(cudaSetDevice(r), "batch set dev");
+                ck(cudaMalloc((void**) &bb[r], (size_t) rows * n_out * 4 + 256), "batch buf");
+                ck(cudaMemset(bb[r], 0, (size_t) rows * n_out * 4 + 256), "batch zero");
+                ck(cudaMalloc((void**) &xin[r], (size_t) rows * per[r] * 4 + 256), "batch in");
+                ck(cudaMalloc((void**) &xk[r], (size_t) rows * per[r] * 34 + 256), "batch q8k");
+                ck(cudaStreamCreateWithFlags(&bstr[r], cudaStreamNonBlocking), "batch stream");
+                // card r holds the SAME window's columns for its heads: card 0 the first `per`, card 1 the last
+                for (int64_t q = 0; q < rows; ++q)
+                    ck(cudaMemcpy(xin[r] + (size_t) q * per[r], xrow[q].data() + (size_t) r * per[r],
+                                  (size_t) per[r] * 4, cudaMemcpyHostToDevice), "batch in up");
+            }
+            for (int r = 0; r < 2; ++r) {
+                ck(cudaSetDevice(r), "batch gemv dev");
+                const basalt::core::QsaShardWeight& v = r == 0 ? vw0 : vw1;
+                for (int64_t q = 0; q < rows; ++q) {
+                    // one GEMV per row: the entry is a mat-vec, so a window is `rows` of them, each with its own
+                    // quantized activation image - the same thing the layer does per token
+                    k::quantize_q8_K(xin[r] + (size_t) q * per[r], xk[r] + (size_t) q * per[r] * 34, per[r], bstr[r]);
+                    k::s_gemv_q8k_split(xk[r] + (size_t) q * per[r] * 34, v.codes, v.scales, v.offset,
+                                        bb[r] + (size_t) q * n_out, per[r], n_out, form, bstr[r]);
+                }
+            }
+            std::string be;
+            CHECK(pair.all_reduce(bb[0], rows, n_out, bstr[0], dev1, 0, be));
+            CHECK(pair.all_reduce(bb[1], rows, n_out, bstr[1], dev0, 1, be));
+            for (int r = 0; r < 2; ++r) {
+                ck(cudaSetDevice(r), "batch wait dev");
+                ck(cudaStreamSynchronize(bstr[r]), "batch wait");
+            }
+            std::vector<float> b0, b1;
+            ck(cudaSetDevice(dev0), "batch down 0");
+            b0 = down(bb[0], rows * n_out);
+            ck(cudaSetDevice(dev1), "batch down 1");
+            b1 = down(bb[1], rows * n_out);
+            ck(cudaSetDevice(dev0), "back from batch");
+            CHECK(b0 == b1);                                  // both cards, every row of the window
+            CHECK(pair.issued(0) == 2 && pair.issued(1) == 2);  // one issue per collective, whatever the shape
+            CHECK(pair.pushed_bytes(0) == basalt::kernels::tp2_all_reduce_bytes(1, n_out) +
+                                                basalt::kernels::tp2_all_reduce_bytes(rows, n_out));
+            CHECK(!pair.timed_out());
+            std::printf("  the pair's combine, step and %lld-row window: bitwise vs tp2_all_reduce_ref, both cards"
+                        " equal, %llu B pushed per rank\n",
+                    (long long) rows, (unsigned long long) pair.pushed_bytes(0));
+            for (int64_t q = 0; q < rows; ++q) {
+                // the whole layer's GEMV for that window row, on one card, one activation of the full width
+                float* xs = nullptr;
+                uint8_t* xsq = nullptr;
+                float* yq = nullptr;
+                ck(cudaMalloc((void**) &xs, (size_t) n_in * 4 + 256), "row x");
+                ck(cudaMalloc((void**) &xsq, (size_t) n_in * 34 + 256), "row q8k");
+                ck(cudaMalloc((void**) &yq, (size_t) n_out * 4 + 256), "row y");
+                ck(cudaMemcpy(xs, xrow[q].data(), (size_t) n_in * 4, cudaMemcpyHostToDevice), "row x up");
+                k::quantize_q8_K(xs, xsq, n_in, nullptr);
+                k::s_gemv_q8k_split(xsq, cc, cs, co, yq, n_in, n_out, form, nullptr);
+                const std::vector<float> whole_row = down(yq, n_out);
+                double m = 0.0;
+                for (float v : whole_row) m = std::max(m, (double) std::fabs(v));
+                CHECK(m > 1e-3);   // a row of nothing would make the comparison below vacuous
+                for (int64_t i = 0; i < n_out; ++i) {
+                    const double d = std::fabs((double) b0[(size_t) q * n_out + i] - (double) whole_row[i]);
+                    if (!(d <= 1e-4 * std::max(1.0, m))) {
+                        std::printf("FAIL batch combine row %lld col %lld: %.9g vs %.9g\n", (long long) q,
+                                (long long) i, b0[(size_t) q * n_out + i], whole_row[i]);
+                        ++g_fail;
+                        break;
+                    }
+                }
+                cudaFree(xs); cudaFree(xsq); cudaFree(yq);
+            }
+            for (int r = 0; r < 2; ++r) {
+                ck(cudaSetDevice(r), "batch free dev");
+                cudaFree(bb[r]); cudaFree(xin[r]); cudaFree(xk[r]);
+                cudaStreamDestroy(bstr[r]);
+            }
+            ck(cudaSetDevice(dev0), "back after batch free");
+            cudaFree(buf[0]);
+            cudaFree(buf[1]);
+            pair.close();
+        }
+        cudaFree(g_full_d); cudaFree(g_a); cudaFree(g_b);
+        cudaFree(xk_f); cudaFree(xk_a); cudaFree(xk_b);
+        cudaFree(y_f); cudaFree(y_a); cudaFree(y_b);
+        cudaFree(cw);
     }
 
     std::printf("\ntp2 head split parity: %d failures\n", g_fail);
