@@ -1503,6 +1503,9 @@ against the Q8_0 base) twice, same box, same power limit, tiers pinned (`--adapt
 
 ### Reviewer checklist
 
+- [ ] Boot this build: the process on `:8000` predates these commits, and the return leg's format is decided
+      at `set_peer`, so an old process keeps FP32 rows. Same flags otherwise (`--prefill 8192
+      --peer-ram-rows --tp-size 2 --gpu 0,1,2,3`).
 - [ ] Both stages' `peer fp4 crossover` lines: share, layers, the two lanes, `rows cross as BF16`.
 - [ ] Stage A and B chunk lines: `rows ms`, `peer-wait`, `comp`, `blobs`, both with the default and with
       `--peer-rows-fp32` (predictions 1, 2, 3, 5).
