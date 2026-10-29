@@ -169,9 +169,9 @@ bool run(int fmt) {
         ck(cudaMemcpy(ids, hids.data(), hids.size() * 4, cudaMemcpyHostToDevice), "ids");
         ck(cudaMemcpy(steps, hst.data(), hst.size() * 4, cudaMemcpyHostToDevice), "steps");
         ck(cudaMemcpy(q, hq.data(), hq.size() * 4, cudaMemcpyHostToDevice), "q");
-        k::qsa_decode_attn_batch(q, ref.attn(ident), ids, steps, cap, s, scratch, out_ref, n_q, nullptr);
+        k::qsa_decode_attn_batch(q, ref.attn(ident), ids, steps, cap, s, s.n_head_kv, scratch, out_ref, n_q, nullptr);
         k::kv_stream_resolve(m, slots.attn(m.page_table), host.p, fmt, ids, steps, n_q, cap, s, nullptr);
-        k::qsa_decode_attn_batch(q, slots.attn(m.page_table), ids, steps, cap, s, scratch, out_str, n_q, nullptr);
+        k::qsa_decode_attn_batch(q, slots.attn(m.page_table), ids, steps, cap, s, s.n_head_kv, scratch, out_str, n_q, nullptr);
         ck(cudaDeviceSynchronize(), "batch");
         ck(cudaMemcpy(a.data(), out_ref, (size_t) n_q * NH * D * 4, cudaMemcpyDeviceToHost), "a");
         ck(cudaMemcpy(b2.data(), out_str, (size_t) n_q * NH * D * 4, cudaMemcpyDeviceToHost), "b");
@@ -212,8 +212,8 @@ bool run(int fmt) {
         for (int64_t i = 0; i < width; ++i) hids[i] = (int32_t) (N - width + i);   // the window's last cells
         ck(cudaMemcpy(ids, hids.data(), hids.size() * 4, cudaMemcpyHostToDevice), "ids");
         ck(cudaMemcpy(steps, hst.data(), 16, cudaMemcpyHostToDevice), "steps");
-        k::qsa_decode_attn_batch(q, ref.attn(ident), ids, steps, cap, s, scratch, out_ref, 1, nullptr);
-        k::qsa_decode_attn_batch(q, ring.attn(rt), ids, steps, cap, s, scratch, out_str, 1, nullptr);
+        k::qsa_decode_attn_batch(q, ref.attn(ident), ids, steps, cap, s, s.n_head_kv, scratch, out_ref, 1, nullptr);
+        k::qsa_decode_attn_batch(q, ring.attn(rt), ids, steps, cap, s, s.n_head_kv, scratch, out_str, 1, nullptr);
         ck(cudaDeviceSynchronize(), "ring");
         ck(cudaMemcpy(a.data(), out_ref, (size_t) NH * D * 4, cudaMemcpyDeviceToHost), "a");
         ck(cudaMemcpy(b2.data(), out_str, (size_t) NH * D * 4, cudaMemcpyDeviceToHost), "b");

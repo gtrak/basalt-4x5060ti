@@ -212,7 +212,7 @@ int main() {
     pools.k_q = d_kq; pools.k_scale = d_ks; pools.v_q4 = d_v4; pools.page_table = d_table;
     float* d_scr = dalloc<float>(k::qsa_decode_attn_scratch_floats(cells, s) + 16);
     float* d_attn = dalloc<float>((size_t) QH * D);
-    k::qsa_decode_attn_step(d_q, pools, d_ids, d_step, cells, s, d_scr, d_attn, nullptr);
+    k::qsa_decode_attn_step(d_q, pools, d_ids, d_step, cells, s, s.n_head_kv, d_scr, d_attn, nullptr);
     k::fwht256_inplace_cuda(d_attn, QH, nullptr);   // the engine's inverse rotation of the output
     ck(cudaDeviceSynchronize(), "attn sync");
     std::vector<float> h_attn((size_t) QH * D);
@@ -275,7 +275,7 @@ int main() {
         }
         float* d_scr2 = dalloc<float>(k::qsa_decode_attn_scratch_floats(cells, s) * nq + 64);
         float* d_at2 = dalloc<float>((size_t) nq * QH * D);
-        k::qsa_decode_attn_batch(d_q2, pools, d_ids2, d_steps2, cells, s, d_scr2, d_at2, nq, nullptr);
+        k::qsa_decode_attn_batch(d_q2, pools, d_ids2, d_steps2, cells, s, s.n_head_kv, d_scr2, d_at2, nq, nullptr);
         k::fwht256_inplace_cuda(d_at2, (int64_t) nq * QH, nullptr);
         ck(cudaDeviceSynchronize(), "attn2 sync");
         std::vector<float> h_at2((size_t) nq * QH * D);

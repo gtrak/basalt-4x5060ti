@@ -216,9 +216,9 @@ int main(int argc, char** argv) {
     }
 
     // ---- 3. the fused pools path (what a captured layer runs)
-    k::qsa_decode_attn_step(qf_d, pools_of(kf_d, vf_d, table_d), ids_d, step_d, cap, full, scr_f, attn_f, nullptr);
-    k::qsa_decode_attn_step(q0_d, pools_of(k0_d, v0_d, table_d), ids_d, step_d, cap, s0, scr0, attn0, nullptr);
-    k::qsa_decode_attn_step(q1_d, pools_of(k1_d, v1_d, table_d), ids_d, step_d, cap, s1, scr1, attn1, nullptr);
+    k::qsa_decode_attn_step(qf_d, pools_of(kf_d, vf_d, table_d), ids_d, step_d, cap, full, full.n_head_kv, scr_f, attn_f, nullptr);
+    k::qsa_decode_attn_step(q0_d, pools_of(k0_d, v0_d, table_d), ids_d, step_d, cap, s0, s0.n_head_kv, scr0, attn0, nullptr);
+    k::qsa_decode_attn_step(q1_d, pools_of(k1_d, v1_d, table_d), ids_d, step_d, cap, s1, s1.n_head_kv, scr1, attn1, nullptr);
     {
         const std::vector<float> w = down(attn_f, (size_t) NH * D);
         const std::vector<float> a0 = down(attn0, (size_t) s0.n_head * D);
@@ -262,9 +262,9 @@ int main(int argc, char** argv) {
         float* af = dalloc<float>((size_t) n_q * NH * D);
         float* a0 = dalloc<float>((size_t) n_q * s0.n_head * D);
         float* a1 = dalloc<float>((size_t) n_q * s1.n_head * D);
-        k::qsa_decode_attn_batch(qw_d, pools_of(kf_d, vf_d, table_d), qids_d, steps_d, cap, full, sq_f, af, n_q, nullptr);
-        k::qsa_decode_attn_batch(wh0_d, pools_of(k0_d, v0_d, table_d), qids_d, steps_d, cap, s0, sq_0, a0, n_q, nullptr);
-        k::qsa_decode_attn_batch(wh1_d, pools_of(k1_d, v1_d, table_d), qids_d, steps_d, cap, s1, sq_1, a1, n_q, nullptr);
+        k::qsa_decode_attn_batch(qw_d, pools_of(kf_d, vf_d, table_d), qids_d, steps_d, cap, full, full.n_head_kv, sq_f, af, n_q, nullptr);
+        k::qsa_decode_attn_batch(wh0_d, pools_of(k0_d, v0_d, table_d), qids_d, steps_d, cap, s0, s0.n_head_kv, sq_0, a0, n_q, nullptr);
+        k::qsa_decode_attn_batch(wh1_d, pools_of(k1_d, v1_d, table_d), qids_d, steps_d, cap, s1, s1.n_head_kv, sq_1, a1, n_q, nullptr);
         const std::vector<float> w = down(af, (size_t) n_q * NH * D);
         const std::vector<float> h0 = down(a0, (size_t) n_q * s0.n_head * D);
         const std::vector<float> h1 = down(a1, (size_t) n_q * s1.n_head * D);
@@ -322,15 +322,15 @@ int main(int argc, char** argv) {
         const int reps = 200;
         cudaEventRecord(a);
         for (int i = 0; i < reps; ++i)
-            k::qsa_decode_attn_step(qf_d, pools_of(kf_d, vf_d, table_d), ids_d, step_d, cap, full, scr_f, attn_f, nullptr);
+            k::qsa_decode_attn_step(qf_d, pools_of(kf_d, vf_d, table_d), ids_d, step_d, cap, full, full.n_head_kv, scr_f, attn_f, nullptr);
         cudaEventRecord(b);
         cudaStreamSynchronize(nullptr);
         float whole_ms = 0.f;
         cudaEventElapsedTime(&whole_ms, a, b);
         cudaEventRecord(a);
         for (int i = 0; i < reps; ++i) {
-            k::qsa_decode_attn_step(q0_d, pools_of(k0_d, v0_d, table_d), ids_d, step_d, cap, s0, scr0, attn0, nullptr);
-            k::qsa_decode_attn_step(q1_d, pools_of(k1_d, v1_d, table_d), ids_d, step_d, cap, s1, scr1, attn1, nullptr);
+            k::qsa_decode_attn_step(q0_d, pools_of(k0_d, v0_d, table_d), ids_d, step_d, cap, s0, s0.n_head_kv, scr0, attn0, nullptr);
+            k::qsa_decode_attn_step(q1_d, pools_of(k1_d, v1_d, table_d), ids_d, step_d, cap, s1, s1.n_head_kv, scr1, attn1, nullptr);
         }
         cudaEventRecord(b);
         cudaStreamSynchronize(nullptr);

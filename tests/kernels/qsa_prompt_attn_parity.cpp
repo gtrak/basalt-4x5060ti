@@ -151,7 +151,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     auto old_run = [&]() {
         for (int64_t t0 = 0; t0 < nq; t0 += batch)
             k::qsa_decode_attn_batch(d_q + t0 * NH * HD, pl, d_ids + t0 * cap, d_steps + t0 * k::kStepCount, cap, s,
-                                     scratch, d_old + t0 * NH * HD, std::min(batch, nq - t0), nullptr);
+                                     s.n_head_kv, scratch, d_old + t0 * NH * HD, std::min(batch, nq - t0), nullptr);
     };
     auto new_run = [&]() {
         if (!k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, nullptr)) {

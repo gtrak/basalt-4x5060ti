@@ -2677,12 +2677,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 attn_q8 = fused_gate && !st.kv_rot && !st.kv_hybrid;
                 PdlScope pa(pdl);   // the chunks after the top-k, the merge after them
                 if (fused_gate)
-                    qsa_dec_attn(qcur_, pools, sel_, step_, cap_, s,
+                    qsa_dec_attn(qcur_, pools, sel_, step_, cap_, s, s.n_head_kv,
                                  attn_scratch_, attn_, n, cs,
                                  qfull_, attn32_, attn_q8 ? xq_ : nullptr);
                 else
                 qsa_decode_attn_batch(qcur_, pools, sel_, step_, cap_,
-                                      s, attn_scratch_, attn_, n, cs);
+                                      s, s.n_head_kv, attn_scratch_, attn_, n, cs);
                 }
                 stamp(l, 13);
                 if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_, (int64_t) n * NH, cs);   // back: H^-1 = H

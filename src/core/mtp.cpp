@@ -856,9 +856,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         bool aq_done = false;
         if (!st_.kv_rot && qsa_dec_attn_supported(pools, s)) {   // the gate in the merge writes the q8_1 rows
             aq_done = true;
-            qsa_dec_attn(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs, qfull_, attn32_, (void*) xq_);
+            qsa_dec_attn(qcur_, pools, ident_, step, cap_, s, s.n_head_kv, attn_scratch_, attn_, T, cs, qfull_, attn32_, (void*) xq_);
         } else {
-            qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
+            qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, s.n_head_kv, attn_scratch_, attn_, T, cs);
             if (st_.kv_rot) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
             for (int t = 0; t < T; ++t)
                 native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD, (int) NH,

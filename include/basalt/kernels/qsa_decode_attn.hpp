@@ -35,12 +35,18 @@ struct QsaAttnPools {
 /// Scratch floats for `cap` selected cells: partial accumulators, maxima and sums.
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s);
 
+// Both entries take `pool_kv`, the pool's KV-head count: the cell stride of the [page][kv_head] layout.  A card
+// that runs its own carved pool passes `s.n_head_kv`; a card that runs a head shard (core/qsa_head_split.hpp) over
+// a WIDER pool - the decode lead reading KV head 0 of the whole two-head pool - passes the pool's count.  The
+// running heads stay `s.n_head_kv`: head h reads pool head h, so a shard never crosses into the other card's rows.
+
 void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* step,
-                          int64_t cap, const QsaShapes& s, float* scratch, float* attn, void* stream);
+                          int64_t cap, const QsaShapes& s, int64_t pool_kv, float* scratch, float* attn, void* stream);
 
 /// Plan v0.3 P5: `n_q` queries at once, each with its own selection: q [n_q, n_head, 256], ids [n_q, cap], steps
 /// [n_q, kStepCount], attn [n_q, n_head, 256]; scratch is `n_q` times the single-query size.
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
-                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
+                           int64_t cap, const QsaShapes& s, int64_t pool_kv, float* scratch, float* attn, int64_t n_q,
+                           void* stream);
 
 }  // namespace basalt::kernels

@@ -104,7 +104,7 @@ struct AttnArgs {
     QsaSegTable tab;           // SEG: each query's pools come from its slot
     const int32_t* ids;
     const int32_t* steps;
-    int n_kv_heads, page_size, n_chunks, cap;
+    int n_kv_heads, pool_kv_heads, page_size, n_chunks, cap;
     int chunk = CHUNK;         // cells per partial: CHUNK, or 0 for the draft kernel's (draft_tpc of the width)
     long long stride;          // scratch floats per query
     float scale;
@@ -178,7 +178,7 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
         long long r = -1;
         if (t < n_here) {
             const long long page = (long long) pools.page_table[cell / a.page_size];
-            if (page >= 0) r = (page * a.n_kv_heads + kvh) * a.page_size + (cell % a.page_size);
+            if (page >= 0) r = (page * a.pool_kv_heads + kvh) * a.page_size + (cell % a.page_size);
         }
         sm.row[t] = r;
     }
@@ -481,7 +481,7 @@ __global__ void __launch_bounds__(DTHREADS) draft_attn_chunk(AttnArgs a) {
         if (i < n_here) {
             const int cell = ids[c0 + i];
             const long long page = (long long) pools.page_table[cell / a.page_size];
-            if (page >= 0) r = (int) ((page * a.n_kv_heads + kvh) * a.page_size + (cell % a.page_size));
+            if (page >= 0) r = (int) ((page * a.pool_kv_heads + kvh) * a.page_size + (cell % a.page_size));
         }
         sm.row[i] = r;
     }
@@ -746,17 +746,18 @@ bool qsa_dec_attn_supported(const QsaAttnPools& pools, const QsaShapes& s) {
 }
 
 void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-                  const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream, const float* q_full,
-                  float* attn_gated, void* xq) {
+                  const QsaShapes& s, int64_t pool_kv, float* scratch, float* attn, int64_t n_q, void* stream,
+                  const float* q_full, float* attn_gated, void* xq) {
     if (n_q <= 0) return;
-    if (!qsa_dec_attn_supported(pools, s) || cap <= 0 || !scratch || !ids || !steps || n_q > 65535) {
+    if (!qsa_dec_attn_supported(pools, s) || cap <= 0 || !scratch || !ids || !steps || n_q > 65535 ||
+        pool_kv < s.n_head_kv) {
         basalt::log::error("basalt", "qsa_dec_attn: unsupported geometry, pools or buffers");
         std::exit(1);
     }
     const int mode = kv_mode_of(pools);
     AttnArgs a;
     a.q = q; a.p = pools; a.ids = ids; a.steps = steps;
-    a.n_kv_heads = (int) s.n_head_kv; a.page_size = (int) s.page_size;
+    a.n_kv_heads = (int) s.n_head_kv; a.pool_kv_heads = (int) pool_kv; a.page_size = (int) s.page_size;
     a.n_chunks = (int) ((cap + CHUNK - 1) / CHUNK); a.cap = (int) cap;
     a.stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
     a.scale = 1.0f / sqrtf((float) HD);
@@ -808,7 +809,8 @@ void qsa_dec_attn_seg(const float* q, const QsaSegTable& t, bool int8, const int
     }
     AttnArgs a;
     a.q = q; a.tab = t; a.ids = ids; a.steps = steps;
-    a.n_kv_heads = (int) s.n_head_kv; a.page_size = (int) s.page_size;
+    a.n_kv_heads = (int) s.n_head_kv; a.pool_kv_heads = (int) s.n_head_kv;   // the slots' pools are carved uniformly
+    a.page_size = (int) s.page_size;
     a.n_chunks = (int) ((cap + CHUNK - 1) / CHUNK); a.cap = (int) cap;
     a.stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
     a.scale = 1.0f / sqrtf((float) HD);

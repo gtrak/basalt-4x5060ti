@@ -85,7 +85,8 @@ template <int KV_MODE>
 __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __restrict__ q, QsaAttnPools p,
                                                              const int32_t* __restrict__ ids,
                                                              const int32_t* __restrict__ step, int n_kv_heads,
-                                                             int page_size, float scale, float* __restrict__ part_acc,
+                                                             int pool_kv_heads, int page_size, float scale,
+                                                             float* __restrict__ part_acc,
                                                              float* __restrict__ part_m, float* __restrict__ part_l,
                                                              int n_chunks, int cap = 0, long long scratch_stride = 0) {
     // batched form: query blockIdx.z, with its own q row, selection, step and scratch
@@ -116,7 +117,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
             const long long page = (long long) p.page_table[cell / page_size];
             // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
             // (score -FLT_MAX, weight 0) instead of being read from before the pool.
-            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            if (page >= 0) r = (page * pool_kv_heads + kvh) * page_size + (cell % page_size);
         }
         srow[t] = r;
     }
@@ -212,10 +213,11 @@ __global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict_
 }  // namespace
 
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
-                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
+                           int64_t cap, const QsaShapes& s, int64_t pool_kv, float* scratch, float* attn, int64_t n_q,
+                           void* stream) {
     if (n_q <= 0) return;
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
-        !pools.page_table || n_q > 65535) {
+        !pools.page_table || n_q > 65535 || pool_kv < s.n_head_kv) {
         basalt::log::error("basalt", "qsa_decode_attn_batch: unsupported geometry or missing buffers");
         std::exit(1);
     }
@@ -231,17 +233,21 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
     cudaStream_t st = (cudaStream_t) stream;
     if (kv_mode == 3)
-        ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
-                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+        ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) pool_kv,
+                                                        (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks,
+                                                        (int) cap, stride);
     else if (kv_mode == 2)
-        ATTN_CHUNK(2)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
-                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+        ATTN_CHUNK(2)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) pool_kv,
+                                                        (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks,
+                                                        (int) cap, stride);
     else if (kv_mode == 1)
-        ATTN_CHUNK(1)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
-                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+        ATTN_CHUNK(1)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) pool_kv,
+                                                        (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks,
+                                                        (int) cap, stride);
     else
-        ATTN_CHUNK(0)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
-                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+        ATTN_CHUNK(0)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) pool_kv,
+                                                        (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks,
+                                                        (int) cap, stride);
     attn_merge_kernel<<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, st>>>(part_acc, part_m, part_l, n_chunks,
                                                                                   attn, stride);
     const cudaError_t e = cudaGetLastError();
@@ -257,9 +263,9 @@ uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s) {
 }
 
 void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* step,
-                          int64_t cap, const QsaShapes& s, float* scratch, float* attn, void* stream) {
+                          int64_t cap, const QsaShapes& s, int64_t pool_kv, float* scratch, float* attn, void* stream) {
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !step ||
-        !pools.page_table) {
+        !pools.page_table || pool_kv < s.n_head_kv) {
         basalt::log::error("basalt", "qsa_decode_attn: unsupported geometry or missing buffers");
         std::exit(1);
     }
@@ -279,17 +285,21 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv);
     cudaStream_t st = (cudaStream_t) stream;
     if (kv_mode == 3)
-        ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
-                                                        scale, part_acc, part_m, part_l, n_chunks, 0, 0);
+        ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) pool_kv,
+                                                        (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks,
+                                                        0, 0);
     else if (kv_mode == 2)
-        ATTN_CHUNK(2)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
-                                                        scale, part_acc, part_m, part_l, n_chunks, 0, 0);
+        ATTN_CHUNK(2)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) pool_kv,
+                                                        (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks,
+                                                        0, 0);
     else if (kv_mode == 1)
-        ATTN_CHUNK(1)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
-                                                        scale, part_acc, part_m, part_l, n_chunks, 0, 0);
+        ATTN_CHUNK(1)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) pool_kv,
+                                                        (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks,
+                                                        0, 0);
     else
-        ATTN_CHUNK(0)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
-                                                        scale, part_acc, part_m, part_l, n_chunks, 0, 0);
+        ATTN_CHUNK(0)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) pool_kv,
+                                                        (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks,
+                                                        0, 0);
     attn_merge_kernel<<<(unsigned) s.n_head, HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, attn);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {

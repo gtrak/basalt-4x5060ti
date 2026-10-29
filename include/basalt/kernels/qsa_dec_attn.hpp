@@ -17,11 +17,13 @@ namespace basalt::kernels {
 /// The pools this kernel reads: FP16 or INT8 (not Q4_0, not hybrid); false sends the caller to qsa_decode_attn_batch.
 bool qsa_dec_attn_supported(const QsaAttnPools& pools, const QsaShapes& s);
 
-/// qsa_decode_attn_batch's contract and scratch (qsa_decode_attn_scratch_floats(cap, s) floats per query).
+/// qsa_decode_attn_batch's contract and scratch (qsa_decode_attn_scratch_floats(cap, s) floats per query), and its
+/// `pool_kv`: the pool's KV-head count, `s.n_head_kv` for a card's own pool, the wider pool's count when the card
+/// runs a head shard over it.
 /// q_full / attn_gated non-null: also attn_gated = attn * sigmoid(gate half of q_full) per head.
 /// xq non-null (with the gated rows): the merge also writes the gated rows' q8_1 blocks (native_quantize_q8_1's).
 void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-                  const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream,
+                  const QsaShapes& s, int64_t pool_kv, float* scratch, float* attn, int64_t n_q, void* stream,
                   const float* q_full = nullptr, float* attn_gated = nullptr, void* xq = nullptr);
 
 }  // namespace basalt::kernels
