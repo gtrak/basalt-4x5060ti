@@ -695,3 +695,106 @@ granularity x append interaction that turns misaligned appends into 11-15 s
 TTFT at the routed prefill rate; needs its own investigation.
 
 Live config: tp2 continuation + P2P + short-read 512, serving on :8000.
+
+## RUN 9 — prefill instrumentation: the three experiments, and the prediction written first
+
+Instrumentation only; no path changed, nothing optimised. One file, `src/prefill/prefill.cpp`.
+
+### What is measured
+
+`struct ChunkTiming` puts CUDA event markers on the primary's compute stream and, when the peer takes
+rows, on the peer's compute stream (`PeerPrefill::s`) and on the stream its rows come home on (`s_out`),
+plus a bracket on the blob copy stream (`m.copy`). Markers are *recorded* as the layers issue; their times
+are read where the run already waits for the GPU (the per-layer host sync that reads the routing, the
+chunk's hand-off sync), so the measurement adds records and never a wait. A layer the run never caught up
+with is counted in `skipped`, never guessed. Markers exist only when the run shares its cards with another
+card, so a plain single-card run measures nothing.
+
+Phases (primary, disjoint, they sum to the layer): `attn` (attention, QSA, norms, hyper-connections),
+`router` (router + shared expert + the drain that reads the routing), `quant` (activation quantize, row
+tables), `peer-enqueue` (host-side enqueue of the peer leg), `lead-experts` (the lead's own grouped GEMMs
+and its waits on streamed blobs), `peer-wait` (the stream blocked on the peer's `ev_done`/`ev_res`),
+`merge` (`moe_combine`), `tail` (the hyper-connection write). Peer side: `act` (activations across),
+`quant` (its token quantize), `comp` (its compute), `rows` (its rows home). Grouped MMQ/FP4 groups are
+timed per group (count, mean, max).
+
+### Prediction, written before any measurement (session-2 geometry: chunk 12288, 24 layers,
+### 1051-1076 t/s = 11.7 s/chunk = 487 ms/layer; power limit as in the session-2 table)
+
+Arithmetic first, per MoE layer at 12288 tokens: rows = T*K = 122 880, ~all 512 experts hit, mean 240
+rows/expert, 32 groups of 16; expert FLOPs 122 880 x 9.83 MFLOP = **1.21 TFLOP**; the layer's FP4 blobs
+**~1.3 GB**, so ~32 GB of expert weights move per chunk. At 11.7 s/chunk that is **2.8 GB/s**; the plain
+split's 262 ms/chunk-layer is the same 32 GB in ~3.2 s = **9.9 GB/s**. The pair moves the same bytes at
+28% of the plain split's rate, which is exactly the 487/262 ratio. So the wall is predicted to be the
+**weight feed**, not the round trip and not the GEMMs.
+
+| phase | predicted ms/layer | % of 487 |
+|---|---|---|
+| attn | 70 | 14 |
+| router | 8 | 2 |
+| quant + peer-enqueue (host launch gaps) | 20 | 4 |
+| lead-experts (its own GEMMs + its waits on blobs) | 320 | 66 |
+| peer-wait (`ev_done`/`ev_res`) | 12 | 2.5 |
+| merge (`moe_combine`) | 25 | 5 |
+| tail (hc write) | 12 | 2.5 |
+| unattributed queue | 20 | 4 |
+
+Bucketed, as asked: attention 16%, experts 71%, transport 62% (the `blobs on the copy stream` column,
+which overlaps `lead-experts`), sync 7%. The two are two views of the same disjoint row set.
+
+**Experiment 1 - where the profiles diverge.** Predicted: `attn`, `router`, `merge`, `tail` come out within
+about 10% of the plain split at the same chunk size; the first op that diverges is `lead-experts`, together
+with `blobs on the copy stream`. `lead-experts` 320 ms (pair) vs ~120 ms (plain split).
+
+**Experiment 2 - expert GEMM efficiency.** Predicted `rows/expert` min ~90, mean ~240, max ~400 and
+**the same on both runs**: a row belongs to one expert and one card, so the rank split does not halve rows
+per expert - that hypothesis is predicted FALSE. What the split does change is the group count: ~32 groups
+per layer for the plain split, ~16 lead + ~16 peer for the pair, each group still 16 experts and <= P.G
+rows. If `groups mean` comes back ~4-8 ms the GEMMs are running; if it comes back far above that with a
+small `max`, the path is per-group fixed-cost bound (gather + quantize + launches), not GEMM bound. The
+read line's GB/s per card is the discriminator: ~10 GB/s (plain split) vs ~3 GB/s (pair lead) is predicted.
+
+**Experiment 3 - collective and sync share.** There is no `tp2_all_reduce` in this path: the pair exchanges
+expert *rows*, not partial sums, so the "collectives serialise the split" hypothesis is measured by
+`peer-wait` + `rows` + `act`. Predicted ~35 ms/layer together, i.e. sync cannot explain 225 ms.
+
+**The prediction that decides the shape of the answer.** `ppc` (the peer leg) is only taken when
+`T <= PeerPrefill::T_max` or the chunk is a streamed one of at most `T_fp4` tokens. The serve path sets
+`stream_all_min()` to 2560 (4096 with `--peer-exclusive`) whenever the peer takes prompt rows
+(`generate.cpp:1404`), and `make_peer` then gives `T_max = min(chunk, stream_all_min()-1) = 2559` and
+`T_fp4 = min(chunk, kPeerFp4Tokens) = 5120`. At the production `--prefill 12288`
+both fail, so the chunk line is predicted to print **`no peer`**: at 12288-token chunks the peer computes
+nothing in prefill and the pair's whole prefill cost is pulling the partner's half of the experts over the
+link while the lead streams the rest. If it prints `no peer`, every round-trip explanation of the prefill
+regression is dead and the weight feed is the only suspect. The peer legs need `--prefill 5120` (FP4, with
+`stream_all_min() <= 5120`) or `--prefill 2559` (routed MMQ) to run at all.
+
+### The lines to grep (both are `info`, tag `basalt prefill`)
+
+```
+grep "peer chunk at token" log
+grep "peer read layers" log
+```
+
+`peer chunk at token <p0> (<T> tokens, <timed>/<stage layers>, <fp4|mmq|no><|p2p|/host> peer <dev>/<prim>):
+layer <ms> ms = attn .. router .. quant .. peer-enqueue .. lead-experts .. peer-wait .. merge .. tail ..;
+blobs on the copy stream ..; peer act .. quant .. comp .. rows .. ms; groups <n> mean .. max .. ms (<timed>
+timed), skipped <n>` - one line per chunk per stage.
+
+`peer read layers <LB>-<LE>: <chunks> chunks, <tokens> tokens, <timed layers> timed layers; expert shape
+gate/up 1280x2560 + down 2560x640, 512 experts of the layer, 10 rows per token; row-visits per layer all
+.. lead .. peer ..; expert-visits lead .. peer ..; groups per layer lead .. peer ..; rows/expert min .. mean
+.. max ..; lead <GiB> GiB <TFLOP> TFLOP = <GB/s> GB/s <TFLOP/s> TFLOP/s; peer ...` - one line per read per
+stage. Bytes are the layer's expert blobs times the experts that card was given; FLOPs are
+`2*(1280*2560 + 2560*640)` per row per expert; the rate divides by the time that card's own phases spent
+(`lead-experts` for the lead, `rows A->B` for the peer).
+
+Compare the two runs on the same stage: match `peer read layers a-b`, and read the phases from
+`peer chunk at token` lines with the same `<T> tokens`.
+
+### Validated here (GPU untouched: the server is live)
+
+Build green (`cmake --build build -j4`). `tp2_pair_test`, `qsa_head_split_test`, `session_head_shard_test`,
+`tp2_shard_weights_test` pass; `ctest -L cpu` unchanged except the pre-existing `expert_multi_test`, which
+fails on this host because its CPU lacks AVX512-VNNI/VBMI (it does not link `prefill`).
+`tools/check_platform_boundary.sh` and `tools/check_stderr_logging.sh` ok.
