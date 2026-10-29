@@ -578,14 +578,18 @@ struct ChunkTiming {
         basalt::log::info("basalt prefill",
                           "peer read layers %lld-%lld: %lld chunks, %lld tokens, %lld timed layers; expert shape "
                           "gate/up 1280x%lld + down %lldx640, %lld experts of the layer, %lld rows per token; "
-                          "rows lead %lld peer %lld; experts lead %lld peer %lld; groups lead %lld peer %lld "
-                          "(%.1f per layer); rows/expert min %lld mean %.1f max %lld; "
+                          "row-visits per layer all %.1f lead %.1f peer %.1f; expert-visits lead %lld peer %lld; "
+                          "groups per layer lead %.1f peer %.1f; "
+                          "rows/expert min %lld mean %.1f max %lld; "
                           "lead %.2f GiB %.2f TFLOP = %.0f GB/s %.1f TFLOP/s; "
                           "peer %.2f GiB %.2f TFLOP = %.0f GB/s %.1f TFLOP/s",
                           (long long) lb, (long long) le, (long long) rd_chunks, (long long) rd_tokens,
                           (long long) rd_layers, (long long) N, (long long) N, (long long) NE, (long long) K,
-                          (long long) rows_lead, (long long) rows_peer,
-                          (long long) exp_lead, (long long) exp_peer, (long long) grp_lead, (long long) grp_peer,
+                          rd_layers ? (double) rows / (double) rd_layers : 0.0,
+                          rd_layers ? (double) rows_lead / (double) rd_layers : 0.0,
+                          rd_layers ? (double) rows_peer / (double) rd_layers : 0.0,
+                          (long long) exp_lead, (long long) exp_peer,
+                          rd_layers ? (double) grp_lead / (double) rd_layers : 0.0,
                           rd_layers ? (double) grp_peer / (double) rd_layers : 0.0,
                           (long long) rpe_min, rpe_n ? rpe_sum / (double) rpe_n : 0.0, (long long) rpe_max,
                           bytes_lead / (1u << 30), flop_lead / tf,
