@@ -7466,6 +7466,9 @@ int main(int argc, char** argv) {
         const bool bdigest = basalt::core::exp_flag("concur5_digest", 0) != 0;
         // concur9_logit_hash: a hash of the head logits of every accepted row, on stderr (solo and batch alike)
         const bool logit_hash = basalt::core::exp_flag("concur9_logit_hash", 0) != 0;
+        // batch_lines=0: the per-window token lines (BT/BDONE/BDIG) and their flush stay off, for a host-cost A/B;
+        // the tokens and the profile line are computed either way
+        const bool batch_lines = basalt::core::exp_flag("batch_lines", 1) != 0;
         std::vector<float> lh_buf;
         auto row_hash = [&](int t) -> uint64_t {
             lh_buf.resize((size_t) n_vocab);
@@ -8093,12 +8096,12 @@ int main(int argc, char** argv) {
                 const int b = rows[sg];
                 BSlot& sl = bs[(size_t) b];
                 const int k = n_keep[sg];
-                std::printf("BT %d", b);   // one line per slot and window: every token it kept
+                if (batch_lines) std::printf("BT %d", b);   // one line per slot and window: every token it kept
                 for (int e = 0; e < k; ++e) {
                     sl.ids.push_back(tok[r0s[sg] + e]);    // the window fed it: the slot's sessions hold it now
-                    std::printf(" %d", (int) outb[r0s[sg] + e]);
+                    if (batch_lines) std::printf(" %d", (int) outb[r0s[sg] + e]);
                 }
-                std::printf("\n");
+                if (batch_lines) std::printf("\n");
                 sl.produced += k;
                 if (real) {   // the window's verdict on its drafts: the draft-length rule, the lookup history, the policy
                     const int a = k - 1, Tw = lens[sg];
@@ -8116,7 +8119,7 @@ int main(int argc, char** argv) {
                     bt_dr_acc += a;
                     p0s[sg] = sl.p;
                 }
-                if (bdigest) {
+                if (bdigest && batch_lines) {
                     uint64_t part[10] = {};
                     slot_digest(b, sl.p + k, part);
                     std::printf("BDIG %d %lld", b, (long long) (sl.p + k));
@@ -8125,8 +8128,9 @@ int main(int argc, char** argv) {
                 }
                 if (fin_of[sg] != nullptr) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                    std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin_of[sg], ms,
-                                (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
+                    if (batch_lines)
+                        std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin_of[sg], ms,
+                                    (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
                     sl.active = false;
                     sl.cached = o.prompt_cache > 0;   // its sessions hold sl.ids for the next turn
                     sl.guard.reset();
@@ -8135,7 +8139,7 @@ int main(int argc, char** argv) {
                     sl.p += k;
                 }
             }
-            std::fflush(stdout);
+            if (batch_lines) std::fflush(stdout);
             const Clock::time_point w3 = Clock::now();
             bt_emit += msd(w2, w3);
             if (real) {
