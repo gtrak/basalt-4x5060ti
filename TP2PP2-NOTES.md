@@ -1243,3 +1243,81 @@ AVX512-VNNI/VBMI on this CPU); `tp2_pair_test`, `qsa_head_split_test`, `session_
 compiler warnings (the two the file prints, `StreamEntry::pdev_dev` and `cs`, are the ones the file printed
 before). `peer_ram_share` compiled against stubs, matching an independent script; its eighths, `take` and `top`
 are in the table above.
+## RUN 15 — host dispatch of the decode window: what the 28.9 ms run actually was, and the two gates
+
+The decode profile lines now measure (d3bd5cd0). Reviewer measurement: concurrent (2 slots, 5 rows)
+wall 37.4 ms = run 28.9 + commit 0.6 + emit 0.0 + draft 7.8; stage GPU spans 13.7 / 14.5. Solo:
+wall 22.2 = run 20.1 + draft 1.8, GPU 10.4. This run reads the loop to find where the host time is,
+then ships two gated reductions. No path changed by default.
+
+### What the 28.9 ms of run is (profile by reading)
+
+`run_slot_segs` (verify.cpp) launches the whole window as ONE `cudaGraphLaunch`, then serves the
+layers: per layer it (1) busy-spins on the mapped doorbell word `h_seq_` (`_mm_pause`, no usleep,
+no blocking; a `cudaStreamQuery` liveness check every ~2 ms), (2) runs the layer's CPU pool
+callback, (3) writes the flag words. In the device-planned tail (the tp2 path, active here) the
+plan is device-side, so the pool computes only the CPU's share: activation quant of the miss rows
+plus the CPU experts themselves. **Nothing launches per layer from the host** — the window is one
+graph, the peer card one persistent window per window, the commit one graph. Candidate (b)
+(launch overhead) has nothing left to cut per layer.
+
+Candidate (a) (batch the waits) is not available without a protocol change: the per-layer flag is
+the CPU pool's publication, and the GPU's MoE tail of layer k spins on it; the pool of layer k can
+only start at layer k's doorbell (the routing ids and miss rows are written by the GPU mid-layer).
+A pre-raised flag for fully-VRAM-resident layers would be safe in the device-planned path but
+saves microseconds (such a layer's pool call is already microseconds; the GPU-reach wait is spent
+on the layers with CPU work), so it is not worth the flag-protocol risk.
+
+So: run = Σ_layers (GPU arrival → doorbell — the "GPU-reach wait", which includes the GPU-side
+flag and peer spins — + the host pool) + the tail (final stream sync, peer window sync, sampling).
+The solo delta (run 20.1 vs GPU 10.4) is ~0.4 ms/layer of CPU-tier expert compute — real work,
+doorbell-gated, neither batchable nor pre-runnable. The reducible host time is in the per-window
+bookkeeping and the draft phase.
+
+### What changed (both off by default)
+
+- `--exp batch_lines=0`: the per-window token lines (BT/BDONE/BDIG) and their `fflush` are skipped
+  (the emit phase, currently 0.0 ms). Tokens and the profile line are computed either way.
+- `--exp mtp_preswap=1`: the drafter's store swap for the NEXT window's lead slot (predicted as the
+  slot drafted first this window) is enqueued at the end of the draft phase, right after the
+  phase's stream drain. The D2D page copy then runs beside the next window's run graph on the
+  drafter's (idle during the run) stream instead of inside the next window's draft phase.
+
+### What the 7.8 ms of draft is (profile by reading)
+
+Per slot: `flush` (deferred rows' prefill, ends in a stream sync), `use_store` (working↔slot draft
+K/V page swap, D2D), row staging (two D2D copies), then `draft_rows`: one chain-graph launch, then
+per draft step a mapped-word spin on `h_out_` (GPU-bound on the draft chain) and a PLE n-gram
+prefetch (issues a ticket, no read). The draft depends on the run window's final rows and the
+slot's committed picks; the NEXT window's run graph depends on the drafts (its rows are the
+drafts) — "launch the next run while the drafter runs" is impossible, the rows do not exist yet.
+What CAN overlap the next run is exactly the store swap: `mtp_preswap`.
+
+### Predictions (the reviewer grades these)
+
+- `batch_lines=0`: the profile line unchanged except the `emit` term (already ~0.0); wall drops by
+  the per-window flush/printf cost (tens of µs). The BT/BDONE lines are absent — host-cost A/B
+  only; token identity is checked at the default.
+- `mtp_preswap=1`: the `draft` term drops by the swap cost. Concurrent draft 7.8 vs 2×1.8 solo
+  leaves ~4.2 ms/window of swap + deferred prefill; the swap share moves out (draft toward
+  2×1.8 + prefill). `run` unchanged or +<0.5 ms (the copy engine shares the card during the run).
+  Tokens identical: the draft content is unchanged, only the store moves earlier. The stage
+  phases (attn/experts/wait/combine/peer push) must not move; if `wait` or `experts` grow, the
+  swap copy is contending the card — read it as +run. `basalt batch spec`'s draft ms/window drops
+  by the same amount.
+
+### Reviewer's checklist
+
+1. Concurrent 2-session traffic, `--exp decode_profile=1`; grep `basalt decode profile`.
+2. Three boots (the flags are per-boot): default, `--exp batch_lines=0`, `--exp mtp_preswap=1`;
+   a fourth with both. Compare the run/commit/emit/draft terms; the stage phases must be flat.
+3. Token identity: default flags, same traffic, BT lines identical to the d3bd5cd0 binary
+   (greedy decode is untouched by both gates).
+4. Solo: `draft` term should be unchanged by `mtp_preswap` (one slot: the swap is a no-op when the
+   store already belongs to the slot).
+
+### Validated here (GPU untouched)
+
+Build green (`cmake --build build -j4`). `ctest -L cpu` 66/67 with only the pre-existing
+`expert_multi_test` (this CPU lacks AVX512-VNNI/VBMI). No engine start, no `basalt-ctl`, nothing
+bound on :8000. GPU runs are the reviewer's.
