@@ -754,9 +754,12 @@ rows. If `groups mean` comes back ~4-8 ms the GEMMs are running; if it comes bac
 small `max`, the path is per-group fixed-cost bound (gather + quantize + launches), not GEMM bound. The
 read line's GB/s per card is the discriminator: ~10 GB/s (plain split) vs ~3 GB/s (pair lead) is predicted.
 
-**Experiment 3 - collective and sync share.** There is no `tp2_all_reduce` in this path: the pair exchanges
-expert *rows*, not partial sums, so the "collectives serialise the split" hypothesis is measured by
-`peer-wait` + `rows` + `act`. Predicted ~35 ms/layer together, i.e. sync cannot explain 225 ms.
+**Experiment 3 - collective and sync share.** Prefill runs no collective: its attention is
+`qsa_prompt_attn_batch` plus one whole `attn_output.weight` projection on the lead; the head split and its
+`tp2_all_reduce` live in `core/layer.cpp`, which the
+prompt path never enters. So the pair exchanges expert *rows*, not partial sums, and the "collectives
+serialise the split" hypothesis is measured by `peer-wait` + `rows` + `act`. Predicted ~35 ms/layer
+together, i.e. sync cannot explain 225 ms.
 
 **The prediction that decides the shape of the answer.** `ppc` (the peer leg) is only taken when
 `T <= PeerPrefill::T_max` or the chunk is a streamed one of at most `T_fp4` tokens. The serve path sets
@@ -791,6 +794,14 @@ stage. Bytes are the layer's expert blobs times the experts that card was given;
 
 Compare the two runs on the same stage: match `peer read layers a-b`, and read the phases from
 `peer chunk at token` lines with the same `<T> tokens`.
+
+### The measurement's own cost
+
+Per layer the run gains ~20 event records on streams it already uses, ~2 on the copy stream and two per
+timed peer group, plus the queries and elapsed reads at the sync the run already performs. Each costs the
+host a microsecond or two: a few tenths of a millisecond per layer against 487 ms, about 0.1%. It
+changes no launch, no wait, no byte: every marker is a record, and the reads happen only where the code
+already synchronised.
 
 ### Validated here (GPU untouched: the server is live)
 
