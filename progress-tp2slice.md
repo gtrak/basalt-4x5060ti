@@ -34,34 +34,21 @@
 
 ## Status of this milestone
 
-**Landed this step** — the ruled refusals and the gate, default-off and byte-identical:
+**The gate is open at 1.** `--exp tp_prompt_attn=1` arms the prompt-attention slice at `Prefill::set_peer`; 0
+(the default) leaves the path byte-identical — the flag is read once, on the peer arm's setup, and no other code
+observes it. It is the prompt path's only flag: `qhs_peer_item()` in `src/core/verify.cpp` still returns false
+(decode's window item, RUN 17's spec, still unbuilt; `--exp decode_headsplit=1` still refuses), so the two seams
+cannot be confused — the seam the RUN 24 brief pointed at for the prompt gate was decode's.
 
-- `--exp tp_prompt_attn` now exists and **refuses at init** at its ruled seam, `Prefill::set_peer`
-  (`src/prefill/prefill.cpp`), naming the four pieces that are missing. The flag is the prompt
-  path's only: it cannot arm the decode head split, and nothing in `Verifier` reads it. Off (the
-  default) the path is byte-identical — the flag is read once, on the peer arm's setup, and no
-  other code observes it.
-- `src/core/verify.cpp` `qhs_peer_item()`'s comment now states what it always was: the **decode**
-  window's peer item (RUN 17's spec), still unbuilt, `--exp decode_headsplit=1` still refusing.
-  The comment names the failure arming it alone would cause (`dec_moe_mix_combine` waiting a
-  done-word nothing raises; RUN 24 review #5 verdict 2, decode collective-free) and says the
-  prompt gate is a different seam, so the two are never confused again — which is what the brief's
-  item 3 conflated.
+Gates, current: build green under `-j4`; `ctest -L cpu` **68/69** with the count verified at 69 — only the
+pre-existing `expert_multi_test` (this CPU lacks AVX512-VNNI/VBMI); boundary and stderr-logging checks ok.
+`:8000` never contacted, no engine started, decode paths untouched. GPU numbers below stay
+**TODO-for-the-window**.
 
-**Seam correction, recorded for the next reader:** task item 3 pointed at `verify.cpp:598
-qhs_peer_item()` for the prompt gate. That predicate is decode's and stays false. The prompt gate
-lives entirely in the prefill path, and its refusal is in `Prefill::set_peer`.
-
-Gates, current: build green under `-j4`; `ctest -L cpu` **68/69** — only the pre-existing
-`expert_multi_test` (this CPU lacks AVX512-VNNI/VBMI); `tools/check_platform_boundary.sh` ok;
-`tools/check_stderr_logging.sh` ok. `:8000` never contacted, no engine started. GPU numbers below
-stay **TODO-for-the-window**.
-
-**Built since that step** — see `progress-tp2slice-kernels.md` for the detail: the arm's container
-and its sizing walk, the resident projections and the partner's own `Gemm`, the shard-width
-kernels (`split_q_span`, `gate_attn_span`) and the shard-aware cache writer (`kv_append_nkv`), the
-packed `attn_output` column funding and the pack's GGUF types, and **`peer_qsa_layer()`** — the
-partner's QSA block, through the gate. It has no caller yet.
+**Built along the way** — detail in `progress-tp2slice-kernels.md`: the arm's container and its sizing walk, the
+resident projections and the partner's own `Gemm`, the shard-width kernels (`split_q_span`, `gate_attn_span`) and
+the shard-aware cache writer (`kv_append_nkv`), the packed `attn_output` column funding and the pack's GGUF types,
+and `peer_qsa_layer()` — the partner's QSA block, through the gate.
 
 **Landed since**: `span_valid` with its catch-up, invalidation sites and the `kv_span_import` gather (case 11);
 the **(c) tier reserve** (pinned symmetric cut, `set_peer` refuses a wider split by naming both figures); the
@@ -69,30 +56,56 @@ the **(c) tier reserve** (pinned symmetric cut, `set_peer` refuses a wider split
 the stage's two cards sized for a PROMPT partial (`chunk x n_embd`, not the decode shard's `1 x n_embd`) and packs
 `attn_output` columns on BOTH cards, refusing if either card's set is missing on any QSA layer of the stage.
 
-**The three pieces left to a runnable serialized mode** — the reduce is NOT one of them, it is the fourth:
-- **(a) the lead-side per-layer publisher.** Nothing writes `qs.mixed_h[wire]`, `qs.q_idx[wire]` or
-  `qs.idx_raw[wire]`; they appear only in the walk that allocates them and in the arm that reads them. `qs.ev_in`
-  is never recorded and never waited on. The 104.9 MB/QSA-layer of activations the arm consumes has no code
-  shipping it. Until this exists the arm reads uninitialised scratch — plausible tokens, no error.
-- **(b) the driver.** `peer_qsa_layer()` has no caller. It must be called per QSA layer of the stage, from the
-  lead's thread, in the lead's layer order, with the wire set index alternating.
-- **(d) the reduce itself**, two-sided in one commit: the partner's o_proj product over `qs.peer_cols` into
-  `part_f32`, BF16 into `part_out`; the lead's own product over `qs.lead_cols`; and ONE `tp2_all_reduce()` per
-  rank per QSA layer on both `m.cs` and `qs.s`. `qsa_pair_prepare` is now run by the engine, `qsa_shard_ready`
-  still is not.
-Also outstanding: the call handing the partner the lead's `QsaState*` (`set_peer_qsa_lead` is never called, so
-catch-up refuses rather than degrading), the gate unstick, and the pipelined `=2`.
+**LANDED (`b4cc1f70`, `e786401c`): the serialized slice runs.** (a) `peer_qsa_publish()` ships the lead's
+`mixed_h` / `q_idx` / `idx_raw` — and the chunk's step counts once — into the wire set on the LEAD's compute
+stream and records `qs.ev_in`; (b) the lead drives `peer_qsa_layer()` per QSA layer of the stage, at the stage's
+ordinal, wire set alternating, with the partner's card current for its products (cuBLAS wants its own handle's
+card, which nothing had needed to discover while the arm had no caller); (d) `peer_qsa_finish()` multiplies each
+card's gated rows by its OWN packed columns and issues one `tp2_all_reduce()` per rank, on two streams. The gate
+lifts for `--exp tp_prompt_attn=1` and refuses any other value rather than running it as 1. A chunk wider than
+the arm's buffers is not sliced at all, decided once per layer so no layer can half-slice.
+Funding: `Prefill::lead_qsa_bytes()` prices what the slice takes on the LEAD's card (its side of the pair's
+staging, its packed columns), `generate.cpp` holds it back from each stage lead's tier, and `set_peer` refuses a
+split whose lead side exceeds the pinned symmetric cut by naming both figures. `fits_within` still guards the
+partner's side.
 
-**Why the reduce waits for (a)+(b)**: `tp2_add_wait` spins, gives up, and returns leaving the buffer a HALF sum
-while the collective still reported success. With no publisher and no driver, a lead-side reduce would add the
-lead's heads alone and call it the model's output. That is RUN 17's class, and it is now caught at the wrapper
-(`b34904ba`) — but caught late, so it must not be built ahead of the pieces that make the peer's push exist.
+**Two events, because the collective has no back-pressure.** `Tp2Pair` counts its collectives, it does not credit
+the staging back, so a rank a layer ahead can overwrite the peer's staging — or republish a wire set — while the
+peer is still reading it. The lead's stream now waits on `ev_out` (the partner's layer is done) before the next
+publish, and the partner's stream waits on `ev_red` (the lead's add is done) before its next push; every wait is
+on work enqueued in an earlier layer, so the chain cannot cycle. That is what *serialized* means here, and why
+only 1 is accepted: the pipelined gate needs a free-ness protocol the reduce currently supplies by sitting in the
+lead's stream.
+
+**Three findings the window must read rather than inherit:**
+
+- **The reduce leg crosses as FP32, not the ledger's BF16.** `tp2_all_reduce()` pushes `rows x stride` FLOATS, so
+  the return leg is **83.9 MB a QSA layer each way** at an 8192-token chunk, not the 41.9 MB §2a files; nothing
+  writes `qs.part_out`. The pair's real traffic is ~190 MB a QSA layer, and the gates must be graded against that
+  — or a BF16 push lands first (a new kernel: parity test plus a microbench line, per AGENTS.md).
+- **The lead's attention is NOT halved by this leg.** Ruling B keeps the lead's pools whole, and the prompt-
+  attention kernel derives a pool row from the head count it is handed (`(page * n_head_kv + kvh) * page_size`),
+  so a 12-head lead run would read the wrong KV rows. The lead keeps every head's attention and gives up half an
+  o_proj while the partner's attention is redundant — which is what the filed -2/-4 prediction was for, and the
+  reason option (a) is the slice-success contingency rather than a free extra.
+- **`span_valid` now advances with the prompt** (to `p0 + T`, after a fully sliced chunk's reduce was proved
+  whole), and `set_peer_qsa_lead` finally has a call site, so a second prompt on a session that decoded imports
+  its gap instead of refusing. Neither has been executed.
+
+**The boot lines that say the slice is on** (`--exp tp_prompt_attn=1`; both must print, or the boot is not it):
+
+    grep "peer prompt-attention pair CUDA"     # pair open, staging floats, columns on both cards, N QSA layers
+    grep "peer prompt-attention arm, lead card" # the lead's reserve, the split, and the chunk ceiling
+
+**Why the reduce was never allowed ahead of (a)+(b)**: `tp2_add_wait` spins, gives up, and returns leaving the
+buffer a HALF sum while the collective still reported success. With no publisher and no driver, a lead-side reduce
+would add the lead's heads alone and call it the model's output — RUN 17's class, caught at the wrapper
+(`b34904ba`) but only late, which is why the pieces that make the peer's push exist had to land with it.
 
 ## 0. Rulings taken mid-run (the supervisor's, applied to this file)
 **Branch doctrine (supervisor):** *cases unrun are cases that have not passed.* A GPU-labelled test that
 has never executed is not evidence. Adopted after the first execution of `tp2_head_split_parity`
 invalidated a kernel the head-split audit had explicitly cleared — one run, one real bug.
-
 
 The peer keeps its own KV span, so it can be stale: it only ever sees the chunks it is handed.
 Every cell the LEAD appends while the peer is out of the loop — decode's appends (decode stays
@@ -103,11 +116,10 @@ its indexer pooled table describing cells it never wrote. The selection covers `
 stale span is not a crash: it is plausible tokens from garbage, the RUN 17 class this branch
 refuses everywhere else. Ruled:
 
-- **P1 approved.** Per stage, track `span_valid` = the cell count the peer's pools and indexer
-  pooled table provably hold. At a prompt run's start, P2P-copy the peer's KV-head slice and its
-  indexer pooled rows for `[span_valid, p0)` from the lead's pools, on the peer's own copy stream;
-  the peer then appends `[p0, p0+T)` itself. The figures publish on the boot and chunk lines — the
-  copy must be measurable, not assumed.
+- **P1 approved.** Per stage, track `span_valid` = the cell count the peer's pools and indexer pooled table
+  provably hold. At a prompt run's start, P2P-copy the peer's KV-head slice and its indexer pooled rows for
+  `[span_valid, p0)` from the lead's pools, on the peer's own copy stream; the peer then appends `[p0, p0+T)`
+  itself. The figures publish on the boot and chunk lines — the copy must be measurable, not assumed.
 - **P2 approved.** Invalidate `span_valid` to the true value at every lead-side mutation the peer
   cannot see: both `session_copy_state` sites, `prompt_session_clear`, `Prefill::set_session`,
   park/resume, and each decode window's end. Only has to be right under the gate; off stays
@@ -119,9 +131,6 @@ refuses everywhere else. Ruled:
   orders outside — so q-from-planes fails parity the same class as a stale span. The planes stay
   the expert leg's input only (RUN 19 unchanged). See §2a for the mix that survives this.
 
-## Earlier landings
-
-Moved to `progress-tp2slice-ledger.md` §5 to keep this file under the project cap.
 ## 2a. The mix, re-filed under the parity invariant
 
 The ruled invariant decides the mix: **the peer's attention must consume the same q/k/v sources as
@@ -131,7 +140,7 @@ the lead's, within the kernel's 2e-3 relative tolerance.** Applying it to the tw
   (`prefill.cpp:2849`, the `native_proj` input), not BF16 and not the FP4 planes. BF16 has an 8-bit
   mantissa (~2e-3 relative), which sits exactly *on* the bound; the lead's own FP16 image has 11
   bits (~5e-4) and, shipped as the same bits the lead read, makes the peer's q *its own half of the
-  lead's q bitwise* — not a tolerance argument. Same 41.9 MB a layer, strictly better parity.
+  lead's q bitwise*. Same 41.9 MB a layer, strictly better parity.
 - **The K/V-shipping substitution is declined, on arithmetic.** Shipping the lead's `m.Kc`/`m.Vc`
   slice for the peer's KV head (8.4 MB) and deleting the peer's `attn_k`/`attn_v` residency looks
   cheaper, but only if nothing else is on the wire. q parity already forces the 41.9 MB of mixed
@@ -158,8 +167,9 @@ rather than the peer recomputing those, so the selection stays the lead's.
 `Prefill::PeerQsaSpan` (`include/basalt/prefill/prefill.hpp`, implemented beside `Prefill::peer_bytes`) prices
 what the partner's card must hold resident for its half of the attention. One `Alloc` count walk produces both
 the reserve and, later, the carve, so the tier cannot be sized for a different amount than `set_peer`
-allocates. `peer_bytes` takes an optional `const PeerQsaSpan*`; the call sites are unwired until the arm
-exists, because reserving tier for an arm that refuses would tax the partner for nothing.
+allocates. `peer_bytes` takes an optional `const PeerQsaSpan*` and the call sites now pass one
+(`peer_prompt_bytes` / `pair_prompt_bytes`, generate.cpp), so the partner's tier leaves the room; the lead card's
+side of the same arithmetic is `Prefill::lead_qsa_bytes`, held back from each stage lead's tier beside the windows.
 
 Pinned by `tests/cuda/peer_qsa_span_test.cpp` (CPU-labelled, no device touched), which prints what it measures:
 
@@ -188,9 +198,6 @@ Also checked, because the share flags make it live: an uneven cut (`qsa_lead_hea
 2.61 / 0.98 ratio puts 16 heads on the partner) is still priced, its scratch grows with its heads, and a
 cut straddling a KV group is *priced* but refused for the kernels by `qsa_shard_whole_groups` -- sizing is not
 where a bad ratio gets silently dropped.
-
-**Not yet done for item (1):** the call sites (`peer_prompt_bytes` / `pair_prompt_bytes`, generate.cpp:3104 and
-:3111) do not pass a span yet, so `stage_room` leaves no room. Wiring them belongs with the arm that fills it.
 
 ## 2b. The span catch-up, priced per TURN (P3, with the correction applied)
 
@@ -239,31 +246,22 @@ not the escape — it is ~50 GB a chunk (cap 2048 x 256 dim x 2 B x 8192 queries
 
 ## Item (2) so far: the arm's container, allocated by the sizing walk itself
 
-`PeerPrefill::Qsa` now exists: the partner's per-QSA-layer `QsaState` array, two wire sets, its shard-width
-scratch, its resident projection pointers, its **own** `Gemm` (ruled: `Gemm::native` dequantizes on the device
-the product runs on, so the lead's scratch and cuBLAS workspace cannot cross the link), and its own stream with
-an `ev_in`/`ev_out` pair — the event-not-sync shape the ruling asked for, matching RUN 19's early transport.
+`PeerPrefill::Qsa`: the partner's per-QSA-layer `QsaState` array, two wire sets, its shard-width scratch, its
+resident projection pointers, its **own** `Gemm` (ruled: `Gemm::native` dequantizes on the device the product runs
+on, so the lead's scratch and cuBLAS workspace cannot cross the link), and its own stream with an `ev_in`/
+`ev_out` pair — the event-not-sync shape the ruling asked for, matching RUN 19's early transport.
 
 **The anti-drift property, which is the point of this unit:** the buffers are laid out by ONE function,
 `peer_qsa_layout`, and both callers drive it with a different `take` — `make_peer` with `cudaMalloc`, and
 `Prefill::PeerQsaSpan::bytes()` with a counting no-op. The tier's reserve and the allocation are therefore the
-same code, not two ledgers kept in step by hand. The states are carved with `qsa_prompt_state_carve` over an
-allocation of `qsa_prompt_state_bytes`, so the pools cannot come out a different width than the tier was shrunk
-by. `bytes()` no longer computes wire/scratch/weights/gemm itself; it reads them out of that walk.
+same code, not two ledgers kept in step by hand, and the states are carved with `qsa_prompt_state_carve` over an
+allocation of `qsa_prompt_state_bytes`, so the pools cannot come out a different width than the tier was shrunk by.
 
-Still missing, and the gate still refuses at `Prefill::set_peer` with the message updated to name exactly these
-(the old message claimed the span and Gemm were absent; they are not):
-
-- the per-layer QSA compute on the partner (item 2 proper, mirroring `prefill.cpp:2844-2953`),
-- `span_valid` + the per-turn catch-up + its invalidation sites (item 3),
-- the `o_proj` reduce-to-lead via `qsa_pair_prepare` + `Tp2Pair` SM push (item 4),
-- the tier's call sites (`generate.cpp:3104/3111`) still pass no span, so `stage_room` leaves no room yet.
-
-## The arm's status
-
-`peer_qsa_layer()` exists, compiles, and refuses rather than approximating; it has **no caller** (piece (b)).
-Its o_proj product waits for the reduce, since both need the packed columns the pair bring-up now builds. The
-head-split audit is closed: `split_q`, `gate_attn`, `kv_append` fixed; the three selection kernels cleared.
+**The arm today:** `peer_qsa_layer()` has its caller (the lead, per QSA layer) and waits on the publish before it
+reads the wire; its o_proj product lives in `peer_qsa_finish()`, beside the pair's collective, since both need the
+packed columns. The head-split audit is closed: `split_q`, `gate_attn`, `kv_append` fixed; the selection kernels
+cleared. Still unexecuted: the pair opening across two physical GPUs, the publish landing, the reduce summing and
+the chunk-line verdicts — **TODO-for-the-window**, refused rather than degraded.
 
 ## Building this tree after a reboot
 
@@ -283,17 +281,20 @@ A suite of zero passes exactly as well as a suite of sixty-nine.
 
 The byte ledger, funding, catch-up pricing and filed predictions are in **`progress-tp2slice-ledger.md`**; the
 kernel side — every hardcoded head count found, fixed and parity-tested — in **`progress-tp2slice-kernels.md`**.
-Split to stay under the 300-line cap. Headline figures, restated so this file stands alone:
+Headline figures, restated so this file stands alone:
 
-    wire traffic   104.9 MB a QSA layer        both modes; what the +10/+20 gates grade
+    wire traffic   104.9 MB in a QSA layer    what the +10/+20 gates grade; the RETURN leg is FP32 today
+                                              (83.9 MB, not the filed 41.9 BF16) -- see the findings above
     tier reserve   1.89 GiB int8               span 0.96 + wire 0.20 + scratch 0.64 + weights 0.05 + gemm 0.09
     span copy      <= 0.96 GiB per TURN        zero on a fresh prompt; ~254 ms worst case
     predictions    serialized -2/-4 ms         pipelined +18/+15 ms as an UPPER BOUND (no-extra-eviction)
 
 ## 4. What stays closed
 
-`--exp tp_prompt_attn` **refuses at init** at `Prefill::set_peer` until (a), (b) and (d) above land — refusing
-is what keeps a half-built slice from running the lead's heads alone and reporting them as the pair's.
+`--exp tp_prompt_attn` accepts **1 (serialized) only**; any other value is refused at `Prefill::set_peer` rather
+than run as 1, because the operator would read the resulting number as the pipelined one. The pipelined `=2` is
+the next commit and needs the free-ness protocol the reduce currently supplies by being in the lead's stream.
 `qhs_peer_item()` (`src/core/verify.cpp`) still returns false: that is decode's window item, supposed to stay
-false for this milestone, and `--exp decode_headsplit=1` still refuses. Nothing here is measurable until the
-full chain runs; every timing figure in these files is `TODO-for-the-window`.
+false for this milestone, and `--exp decode_headsplit=1` still refuses. Decode's paths — `qhs_peer_item`, the
+peer window, `dm_peer_kernel` — are untouched by this slice. Every timing figure in these files is
+**TODO-for-the-window**; none of the slice has been executed on a card.
