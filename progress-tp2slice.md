@@ -2,16 +2,13 @@
 
 ## Supervisor rulings on record (this run)
 
-- **Ruling B: (b) now, (a) as the funded follow-up.** For this milestone the partner gains its KV
-  span and the LEAD's pools stay whole; the resulting expert-tier shrink is sized at **1.2 GiB
-  (~7.6%)** under the shipped `--kv int8`, not 1.61 GiB. Decode stays untouched — that constraint
-  outranks the tier cost, because decode is the campaign's working win and option (a) would touch
-  session carving, the prompt cache, KV streaming and decode's pools.
-  Option (a) — narrowing the lead's pools to its shard, freeing ~1.5 GiB to restore the partner's
-  tier — is **filed as the slice-success contingency**, not rejected and not scope creep: it is
-  funded only if the slice clears its ship bar, and dies with the slice if it does not.
-- **Erratum to the delegating brief: the 0.6 GB / 3-QSA-layer figure was wrong; the 6-layer
-  1.5 GiB fp16 / 1.2 GiB int8 figure above supersedes it.**
+- **Ruling B: (b) now, (a) as the funded follow-up.** For this milestone the partner gains its KV span and the
+  LEAD's pools stay whole. Decode stays untouched — that constraint outranks the tier cost, because decode is the
+  campaign's working win and option (a) would touch session carving, the prompt cache, KV streaming and decode's
+  pools. Option (a) — narrowing the lead's pools to its shard, freeing ~1.5 GiB to restore the partner's tier — is
+  **filed as the slice-success contingency**, funded only if the slice clears its ship bar. (The 1.2 GiB / 7.6%
+  shrink this ruling was struck against, and the 0.6 GB / 3-layer figure in the delegating brief before it, are
+  both superseded by the sizer: see the tier table in ledger §2e.)
 - **Decode-window end does NOT invalidate the span — ruled, with the invariant it rests on.** Decode appends
   monotonically past everything a prompt attended over, so `[0, span_valid)` provably still holds the lead's bits
   and the catch-up imports exactly the appended cells; invalidating at every window's end would re-import the
@@ -34,29 +31,38 @@
 
 ## Status of this milestone
 
-**The gate is open at 1 and 2.** `--exp tp_prompt_attn=1` arms the serialized slice, `=2` the pipelined one, both
-at `Prefill::set_peer`; 0 (the default) leaves the path byte-identical — the flag is read once, on the peer arm's
-setup, and no other code observes it. Anything else is refused rather than run as one of them. It is the prompt
-path's only flag: decode's seam (`qhs_peer_item()`, §4) stays shut.
+**The gate is open at 1 and 2** — since `2ea9a1ff`, not before. `--exp tp_prompt_attn=1` arms the serialized slice,
+`=2` the pipelined one, both at `Prefill::set_peer`; 0 (the default) leaves the path byte-identical — the flag is
+read once, on the peer arm's setup, and no other code observes it. Anything else is refused with both gates named.
+It is the prompt path's only flag: decode's seam (`qhs_peer_item()`, §4) stays shut.
+
+**The `=2` window measured nothing, because `=2` never ran** (`e2a7f0c7`, `2ea9a1ff`). The boot died into the
+`set_peer` refusal — the gate still accepted only 1, though `00d2732a`'s message said otherwise and this file
+repeated it — and the caller treated a refusal as benign: warn, `err.clear()`, serve. So the boot kept the
+partner's ~2 GiB span/wire/scratch reserve (taken at TIER-SIZING time, from the same flag) and lost the peer share
+`set_peer` never installed. What that reads as, all four markers: **1,454 t/s** (vs 1,833 at =1, 2,004 baseline)
+with ttft 236 s; chunk lines **`no peer -1/0`** and **`no peer -1/2`** with lead-experts 125–162 ms and peer-wait
+0.0; decode cached turn **28.5 t/s** (vs 61.6 at =1, 77–82 gate-off). **None of this is the pipeline's number** —
+the =2 predictions below are still unmeasured, and the pair line's missing `pipelined` marker was the thread that
+pulled it loose. A refusal now fails the boot (`peer_share_refusal_is_fatal()`); a crippled pair cannot be served.
 
 Gates, current: build green under `-j4`; `ctest -L cpu` **68/69** with the count verified at 69 — only the
 pre-existing `expert_multi_test` (no AVX512-VNNI/VBMI here); boundary and stderr checks ok. `:8000` never
 contacted; `=2` numbers stay **TODO-for-the-window**.
 
 **Three gated boots refused, each one step further than the last** — pack arithmetic (no canonical bytes; the pair
-packing the whole model rather than the stage), then the event contexts. Boots 1-2 are ledger §2k. Boot 3 brought
-the pair UP on both stages, every boot line below printing, and died at the FIRST publish of a 122k prompt:
-`the publish would not be recorded`, whose only producer is `cudaEventRecord(qs.ev_in, cs)` — `ev_in`/`ev_red`
-lived on the PARTNER's context while the LEAD's stream records them (`ev_out`, on the arm's own stream, was the
-only correct one); each now lives where it is recorded and both refusals print the CUDA error and the bytes queued
-(`22cc023e`). The passing 8-token probe proves less than it looks like: nothing logs that a chunk was sliced.
+packing the whole model rather than the stage; ledger §2k), then the event contexts: boot 3 brought the pair UP on
+both stages and died at the FIRST publish of a 122k prompt on `cudaEventRecord(qs.ev_in, cs)`, because `ev_in`/
+`ev_red` lived on the PARTNER's context while the LEAD's stream records them. Each event now lives where it is
+recorded and both refusals print the CUDA error and the bytes queued (`22cc023e`). The passing 8-token probe proves
+less than it looks like: nothing logs that a chunk was sliced.
 
 **The serialized slice (`b4cc1f70`, `e786401c`)**: `peer_qsa_publish()` ships the lead's `mixed_h` / `q_idx` /
 `idx_raw` — and the chunk's step counts once — into the wire set on the LEAD's compute stream and records
 `ev_in[wire]`; the lead drives `peer_qsa_layer()` per QSA layer at the stage's ordinal, wire set alternating, the
 partner's card current for its products; `peer_qsa_finish()` multiplies each card's gated rows by its OWN packed
-columns and issues one `tp2_all_reduce()` per rank, on two streams. A chunk wider than the arm's buffers is not
-sliced at all, decided once per layer so no layer can half-slice.
+columns and issues one `tp2_all_reduce()` per rank. A chunk wider than the arm's buffers is not sliced at all,
+decided once per layer so no layer can half-slice.
 Funding: `Prefill::lead_qsa_bytes()` prices what the slice takes on the LEAD's card (its side of the pair's
 staging, its packed columns), `generate.cpp` holds it back from each stage lead's tier, and `set_peer` refuses a
 split whose lead side exceeds the pinned symmetric cut by naming both figures. `fits_within` still guards the
@@ -92,35 +98,39 @@ on work enqueued in an earlier layer, so the chain cannot cycle. That is what *s
 
 - **The reduce leg crosses as FP32, not the ledger's BF16.** `tp2_all_reduce()` pushes `rows x stride` FLOATS, so
   the return leg is **83.9 MB a QSA layer each way** at an 8192-token chunk, not the 41.9 MB §2a files; nothing
-  writes `qs.part_out`. The pair's real traffic is ~190 MB a QSA layer, and the gates are graded against that
-  — or a BF16 push lands first (a new kernel: parity test plus a microbench line, per AGENTS.md). Both options are
-  priced in the ledger; the BF16 one is authorized only if the FP32 wire does not hide.
-- **`span_valid` now advances with the prompt** (to `p0 + T`, after a fully sliced chunk's reduce was proved
-  whole), and `set_peer_qsa_lead` finally has a call site, so a second prompt on a session that decoded imports
-  its gap instead of refusing.
+  writes `qs.part_out`. The pair's real traffic is ~190 MB a QSA layer, and the gates are graded against that — or
+  a BF16 push lands first (a new kernel: parity plus a microbench line, per AGENTS.md). Both priced in the ledger;
+  BF16 is authorized only if the FP32 wire does not hide.
+- **`span_valid` advances with the prompt** (to `p0 + T`, after a fully sliced chunk's reduce was proved whole), and
+  `set_peer_qsa_lead` has a call site, so a second prompt on a session that decoded imports its gap.
 
-**What `=2` is predicted to do, per QSA layer, before the boot** (run 25's decomposition as the baseline: peer-wait
-67.7-80.3 ms, lead attn +13-15 ms over the ~26 ms it should cost, 6 QSA layers a stage, two stages):
+**What `=2` is predicted to do, per QSA layer — STILL UNMEASURED: the one =2 boot died in the gate above, so no
+number below has been read off a card** (baseline: run 25's `=1` decomposition — peer-wait 67.7-80.3 ms, lead attn
++13-15 ms over the ~26 ms it should cost, 6 QSA layers a stage, two stages):
 
 - **peer-wait → toward the wire floor.** The serialized mode paid the partner's whole layer on the lead's stream;
-  =2 waits only on a set two layers back, so the two halves of a layer's attention overlap and the residue is the
-  reduce's own spin plus the wire the publisher leaves on the lead's stream. Filed as ~47 ms/layer of FP32 wire
-  unhidden (3.96 GiB/s staggered face), ~24 with a BF16 return. If the term does NOT collapse, the suspect is the
-  publish still sitting on `m.cs` — moving it to its own copy stream is the next lever and is not built.
+  =2 waits only on a set two layers back, so the two halves of a layer's attention overlap. Filed as ~47 ms/layer
+  of FP32 wire unhidden (3.96 GiB/s staggered face), ~24 with a BF16 return. If the term does NOT collapse, the
+  suspect is the publish still sitting on `m.cs` — moving it to its own copy stream is the next lever, not built.
 - **lead attn → ~13-15 ms (halved).** The window runs one of two KV groups; the parity case's own microbench says
-  2.00x for one of two groups. The lead's `gate_attn` halves with it; its `attn_q` projection and `split_q`/`rms`/
-  `rope` still cover all 24 heads — the next thing worth halving, and not built.
+  2.00x. The lead's `gate_attn` halves with it; its `attn_q` projection and `split_q`/`rms`/`rope` still cover all
+  24 heads — the next thing worth halving, and not built.
 - **decode stays the tier's problem**: the flag costs the partner ~2.09 GiB (=1's 2.01 plus the second staging) and
   the lead 116 MiB, and run 25 measured -20% decode for that residency. A prompt-path flag; not for serving.
-- **net**: the +10 abort / +20 ship bar grades the per-layer pair against EP+PP-without-the-slice on the same boot.
-  Honest band from run 25's numbers: the -8.5% of `=1` recovers by roughly one attention time per QSA layer; a
-  second loss means the wire did not hide, and then the BF16 return leg is the decision.
+- **net**: the +10 abort / +20 ship bar grades the per-layer pair against EP+PP-without-the-slice on the same boot;
+  the filed `+18/+15 ms` a layer-pair stands as the **no-extra-eviction upper bound**, its instrument (the two row
+  rates and `blob_mb_ms`, read before and after the slice on one boot) and the STOP rule are ledger §3.
 
-**The boot lines that say the slice is on** (both modes print these; the first must say `pipelined` for `=2`):
+**The boot lines that say the slice is on** (both modes print these; the first must say `pipelined` for `=2` — if
+it says `serialized` the flag never reached `set_peer`, and the boot is not the mode you asked for):
 
     grep "peer prompt-attention pair CUDA"     # pair open, staging floats, columns, heads, MODE and staging sets
     grep "peer prompt-attention arm, lead card" # the lead's reserve, the split, and the chunk ceiling
     grep "peer prompt-attention arm:"           # the shard projections copied resident on the partner card
+    grep "peer chunk at token" | head -1        # must read `mmq/p2p peer D/P`, NEVER `no peer -1/0`
+
+The last grep is the one the =2 window needed: `no peer -1/0` means `PeerPrefill` never went live, so every
+partner-held expert row fell to the lead's link and no per-layer term on that line means anything.
 
 What boot 3 read off, the first measurement of any of it: staging **20 971 520 floats = 8192 x 2560**, so the
 wire's funded width and the publisher's `rows_max` are one number as its check assumes; **79 MiB** of shard
@@ -131,14 +141,12 @@ card delta is not that — the gate-off boot also differed in its RAM split — 
 has never executed is not evidence. Adopted after the first execution of `tp2_head_split_parity`
 invalidated a kernel the head-split audit had explicitly cleared — one run, one real bug.
 
-The peer keeps its own KV span, so it can be stale: it only ever sees the chunks it is handed.
-Every cell the LEAD appends while the peer is out of the loop — decode's appends (decode stays
-collective-free, RUN 24 verdict 2, so nothing tells the peer), cached-prefix reuse
-(`session_copy_state`, generate.cpp:9634 and :9770, device-to-device on the lead),
-`prompt_session_clear` (:9623), park/resume, `Prefill::set_session` — leaves the peer's span and
-its indexer pooled table describing cells it never wrote. The selection covers `[0, p0)`, so a
-stale span is not a crash: it is plausible tokens from garbage, the RUN 17 class this branch
-refuses everywhere else. Ruled:
+The peer keeps its own KV span, so it can be stale: it only ever sees the chunks it is handed. Every cell the LEAD
+appends while the peer is out of the loop — decode's appends (decode stays collective-free, RUN 24 verdict 2, so
+nothing tells the peer), cached-prefix reuse (`session_copy_state`), `prompt_session_clear`, park/resume,
+`Prefill::set_session` — leaves the peer's span and its indexer pooled table describing cells it never wrote. The
+selection covers `[0, p0)`, so a stale span is not a crash: it is plausible tokens from garbage, the RUN 17 class
+this branch refuses everywhere else. Ruled:
 
 - **P1 approved.** Per stage, track `span_valid` = the cell count the peer's pools and indexer pooled table
   provably hold. At a prompt run's start, P2P-copy the peer's KV-head slice and its indexer pooled rows for
@@ -149,22 +157,20 @@ refuses everywhere else. Ruled:
   park/resume, and each decode window's end. Only has to be right under the gate; off stays
   byte-identical.
 - **P3, with the pricing correction applied below** in §2b.
-- **The FP4 planes are NOT an attention input.** The open assumption in the first version of this
-  file is closed: q/k/v must derive from the same source the lead's attention consumed, within the
-  kernel's 2e-3 relative tolerance. The planes carry ~1e-2-class expert-quantization error — two
-  orders outside — so q-from-planes fails parity the same class as a stale span. The planes stay
-  the expert leg's input only (RUN 19 unchanged). See §2a for the mix that survives this.
+- **The FP4 planes are NOT an attention input.** q/k/v must derive from the same source the lead's attention
+  consumed, within the kernel's 2e-3 relative tolerance; the planes carry ~1e-2-class expert-quantization error,
+  two orders outside, so q-from-planes fails parity in the same class as a stale span. They stay the expert leg's
+  input only (RUN 19 unchanged). See §2a for the mix that survives this.
 
 ## 2a. The mix, re-filed under the parity invariant
 
-The ruled invariant decides the mix: **the peer's attention must consume the same q/k/v sources as
-the lead's, within the kernel's 2e-3 relative tolerance.** Applying it to the two candidate shapes:
+The ruled invariant decides the mix: **the peer's attention must consume the same q/k/v sources as the lead's,
+within the kernel's 2e-3 relative tolerance.** Applying it to the two candidate shapes:
 
-- **q must come from the FP16 rows the lead's own `attn_q` consumed** — `m.mixed_h`
-  (`prefill.cpp:2849`, the `native_proj` input), not BF16 and not the FP4 planes. BF16 has an 8-bit
-  mantissa (~2e-3 relative), which sits exactly *on* the bound; the lead's own FP16 image has 11
-  bits (~5e-4) and, shipped as the same bits the lead read, makes the peer's q *its own half of the
-  lead's q bitwise*. Same 41.9 MB a layer, strictly better parity.
+- **q must come from the FP16 rows the lead's own `attn_q` consumed** — `m.mixed_h` (the `native_proj` input), not
+  BF16 and not the FP4 planes. BF16 has an 8-bit mantissa (~2e-3 relative), exactly *on* the bound; the lead's own
+  FP16 image has 11 bits (~5e-4) and, shipped as the same bits the lead read, makes the peer's q *its own half of
+  the lead's q bitwise*. Same 41.9 MB a layer, strictly better parity.
 - **The K/V-shipping substitution is declined, on arithmetic.** Shipping the lead's `m.Kc`/`m.Vc`
   slice for the peer's KV head (8.4 MB) and deleting the peer's `attn_k`/`attn_v` residency looks
   cheaper, but only if nothing else is on the wire. q parity already forces the 41.9 MB of mixed
@@ -195,20 +201,18 @@ takes the span and the call sites pass one (`peer_prompt_bytes` / `pair_prompt_b
 card's side of the same arithmetic is `Prefill::lead_qsa_bytes`.
 
 Pinned by `tests/cuda/peer_qsa_span_test.cpp` (CPU-labelled, no device touched), which prints what it measures and
-asserts the units explicitly — the wire figures are 10^6 bytes and the tier figures 2^30, so a future comparison
-cannot silently mix them. **The current figures are the ledger's §2k** (span 0.96 + wire 0.20 + scratch 0.64 +
-weights 0.08 + columns 0.04 + gemm 0.09 = **~2.01 GiB int8** at `--kv int8`, plus 83.9 MiB for the pipelined
-second staging set); the 1.2 / 1.58 GiB this section first filed are superseded there, and their lesson stands:
-the reserve is span **+ wire + the partner's own scratch**, never the span alone.
-
-Also checked, because the share flags make it live: an uneven cut is priced, its scratch grows with its heads, and
-a cut straddling a KV group is *priced* but refused for the kernels by `qsa_shard_whole_groups` — sizing is not
-where a bad ratio gets silently dropped.
+asserts the units explicitly — wire figures are 10^6 bytes, tier figures 2^30, so a future comparison cannot mix
+them. **The current figures are the ledger's §2k** (span 0.96 + wire 0.20 + scratch 0.64 + weights 0.08 + columns
+0.04 + gemm 0.09 = **~2.01 GiB int8** at `--kv int8`, plus 83.9 MiB for the pipelined second staging set); the 1.2 /
+1.58 GiB this section first filed are superseded there, and their lesson stands: the reserve is span **+ wire + the
+partner's own scratch**, never the span alone. And because the share flags make an uneven cut live: it is priced,
+its scratch grows with its heads, and a cut straddling a KV group is *priced* but refused for the kernels by
+`qsa_shard_whole_groups` — sizing is not where a bad ratio gets silently dropped.
 
 ## 2b. The span catch-up, priced per TURN (P3, with the correction applied)
 
-The catch-up is **once per prompt run**, covering `[span_valid, p0)`, not per layer and not per
-chunk. It moves the peer's KV slice plus the indexer pooled rows it must also hold:
+The catch-up is **once per prompt run**, covering `[span_valid, p0)` — not per layer, not per chunk. It moves the
+peer's KV slice plus the indexer pooled rows it must also hold:
 
     KV       6 layers x cells x 256 dim x 2 (K,V) x 1 B (int8)  = 134.2 MB x 6 =  805 MB at 262144 cells
     indexer  6 layers x (cells/idx_block + 2) x 128 dim x 4 B   =  33.6 MB x 6 =  201 MB
@@ -216,11 +220,10 @@ chunk. It moves the peer's KV slice plus the indexer pooled rows it must also ho
     at the staggered 3.96 GiB/s face                            ~254 ms ONCE per turn
     at the both-pairs 2.00 GiB/s face                           ~503 ms once per turn
 
-**A correction to the ruled figure, in the same spirit as §1a's:** the ruled estimate was ~0.6 GiB
-/~150 ms. Mine is ~1.0 GiB / ~250 ms because it bills K *and* V for all 6 layers (6 x 134 MB) and
-adds the indexer's pooled table (201 MB), which the peer must hold too in order to re-run the
-indexer. The arithmetic is above so it can be checked rather than trusted; if the ruling meant
-K-only or a per-stage 3 layers, the figure drops to the ruled one. Flagged, not silently adopted.
+**A correction to the ruled figure, in the same spirit as §1a's:** the ruled estimate was ~0.6 GiB / ~150 ms; this
+bills K *and* V for all 6 layers plus the indexer's pooled table, which the peer needs to re-run the indexer. The
+sizer's 0.96 GiB (§2c) supersedes the 1.006 above, so ~254 ms is a hair pessimistic; it stays as the filed number
+until the window measures the copy.
 
 Scaled by staleness, which is the point of tracking `span_valid`:
 
@@ -264,21 +267,13 @@ allocation COUNT in the sizing test, not only in bytes.
 
 ## Building this tree after a reboot
 
-A fresh `cmake` configure does **not** reproduce the working build: `BUILD_TESTING` defaults off, so
-`ctest -L cpu` finds **zero** tests and reports no failures, and `nvcc` is not on a non-login shell's
-`PATH`. Both fail silently. Configure with:
-
-    cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 \
-          -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DBUILD_TESTING=ON
-    cmake --build build -j4
-    ctest -L cpu --test-dir build -N       # MUST report 69 before a green suite means anything
-    ctest -L cpu --test-dir build          # 68/69; expert_multi_test is the known failure
-
-A suite of zero passes exactly as well as a suite of sixty-nine.
+See **`progress-tp2slice-build.md`** — the configure line this tree needs (`BUILD_TESTING=ON` or `ctest -L cpu`
+finds zero tests and "passes"), and the rule that the count is read before the pass rate means anything.
 
 ## Where the arithmetic lives
 
-The byte ledger, funding, catch-up pricing and filed predictions are in **`progress-tp2slice-ledger.md`**; the
+The byte ledger and filed predictions are in **`progress-tp2slice-ledger.md`** (the span catch-up's per-turn
+pricing stays in §2b here); the
 kernel and arm pieces — container and sizing walk, resident projections (`peer_qsa_resident_up`), the partner's own
 `Gemm`, the shard-width kernels and cache writer, the packed `attn_output` column funding, `peer_qsa_layer()`, and
 every hardcoded head count found, fixed and parity-tested — are in **`progress-tp2slice-kernels.md`**. The
