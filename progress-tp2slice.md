@@ -105,6 +105,17 @@ it should cost, 6 QSA layers a stage, two stages):
   24 heads — the next thing worth halving, and not built.
 - **decode stays the tier's problem**: the flag costs the partner ~2.09 GiB (=1's 2.01 plus the second staging) and
   the lead 116 MiB, and run 25 measured -20% decode for that residency. A prompt-path flag; not for serving.
+- **the two things `=2` summed wrong, and what they read as.** First the pair's collective landing region: one per
+  card, and the collective credits nothing back, so the partner's next push landed in the region the lead's add of
+  the previous layer was still reading (`e0d94223`). Then the **shipped step counts**: `qs.steps` was ONE buffer for
+  the whole prompt, published on a chunk's first QSA layer. The pipelined gate lets the lead begin the next chunk
+  while this card still attends over the last, so the partner selected its blocks - and attended - with the NEXT
+  chunk's positions: a wrong top-k, and a plausible but shifted token stream (`!` to the length cap at `acc=100%`,
+  a fresh concurrent turn at `hit=44.3%` against the usual 76-94). `=1` could not hit it, which is exactly why `=1`
+  read as correct: its end-of-layer wait keeps the lead a layer behind the partner's finish. The step counts are now
+  a set of the wire - published with every layer's other inbound bytes, freed by the same `ev_out`, collapsed to set
+  0 under the serialized gate the way `part_f32` is - and `replay_steps()` falsifies the old shape: one set corrupts
+  at 2 and at 6 layers a chunk, sets of the wire do not, to six chunks deep, and serialized is clean either way.
 - **net**: the +10 abort / +20 ship bar grades the per-layer pair against EP+PP-without-the-slice on the same boot;
   the filed `+18/+15 ms` a layer-pair stands as the **no-extra-eviction upper bound**, its instrument (the two row
   rates and `blob_mb_ms`, read before and after the slice on one boot) and the STOP rule are ledger §3.
@@ -190,8 +201,9 @@ card's side of the same arithmetic is `Prefill::lead_qsa_bytes`.
 Pinned by `tests/cuda/peer_qsa_span_test.cpp` (CPU-labelled, no device touched), which prints what it measures and
 asserts the units explicitly — wire figures are 10^6 bytes, tier figures 2^30, so a future comparison cannot mix
 them. **The current figures are the ledger's §2k** (span 0.96 + wire 0.20 + scratch 0.64 + weights 0.08 + columns
-0.04 + gemm 0.09 = **~2.01 GiB int8** at `--kv int8`); under `=2` add 83.9 MiB for the second `o_proj` staging set
-and 80.0 MiB for the pair's second collective landing region, both cards, all read from one figure
+0.04 + gemm 0.09 = **~2.01 GiB int8** at `--kv int8`); under `=2` add 83.9 MiB for the second `o_proj` staging set,
+80.0 MiB for the pair's second collective landing region and 128 KiB for the second shipped step-count set, both
+cards, all read from one figure
 (`peer_qsa_sets()`). The 1.2 / 1.58 GiB this section first filed are superseded there, and their lesson stands: the
 reserve is span **+ wire + the partner's own scratch**, never the span alone. And because the share flags make an
 uneven cut live: it is priced, its scratch grows with its heads, and a cut straddling a KV group is *priced* but

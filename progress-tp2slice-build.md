@@ -16,6 +16,8 @@ A fresh `cmake` configure does **not** reproduce the working build: `BUILD_TESTI
 A suite of zero passes exactly as well as a suite of sixty-nine. Build with `-j4`, not more: this worktree builds
 on the host that runs the serving engine.
 
-The slice's own CPU tests are `peer_qsa_span_test` (the partner's span: wire bytes, the two staging sets, the
-resident projections) and `tp2_shard_weights_test` (a weight the pack serves only as a native image can still be
+The slice's own CPU tests are `peer_qsa_span_test` (the partner's span: wire bytes, the staging sets, the resident
+projections, and two protocol replays of the pair - `replay_collective()` for the collective's landing regions and
+`replay_steps()` for the shipped step counts, each falsified by running the depth it should fail at) and
+`tp2_shard_weights_test` (a weight the pack serves only as a native image can still be
 cut); the attention window's parity case is `qsa_prompt_attn_parity` and needs a card.

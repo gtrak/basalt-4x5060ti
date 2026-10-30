@@ -2607,7 +2607,20 @@ bool peer_qsa_layer(PeerPrefill::Qsa& qs, int64_t li, int64_t wire, int64_t T, i
     // the decode fallback the lead uses exists for shapes this arm already refused above, so a refusal here is an
     // error rather than a slower path, and it is named rather than silently falling back to a kernel whose
     // scratch this arm does not hold.
-
+    //
+    // THE POOLS AND THE SHAPES ARE ONE WIDTH, CHECKED.  `qsa_prompt_attn_batch` derives TWO strides from the shapes
+    // it is handed: the per-query pitch of `q`/`attn` (`n_head`) and the row of the KV pool a cell reads
+    // (`(page * n_head_kv + kvh) * page_size`).  This card's pools were carved for its own shard's KV heads and its
+    // K/V rows hold exactly those, so a state carved at any other width would be read at the wrong row - a wrong
+    // attention input with nothing to see.  Refusing is the only honest response to that mismatch, and it costs one
+    // comparison per layer.
+    if (st.heads.nq() != sh.n_head || st.heads.nkv() != sh.n_head_kv) {
+        err = "peer QSA: layer " + std::to_string(li) + "'s pools were carved for " +
+              std::to_string(st.heads.nkv()) + " KV head(s) of " + std::to_string(st.heads.nq()) +
+              " query heads while the arm projects and attends with " + std::to_string(sh.n_head_kv) +
+              " of " + std::to_string(sh.n_head) + ", which would read the KV pool at the wrong row";
+        return false;
+    }
     const basalt::kernels::QsaAttnPools pools = core::qsa_attn_pools(st);
     if (!basalt::kernels::qsa_prompt_attn_batch(qs.q, pools, qs.sel_ids, qs.steps[qs.pipeline >= 2 ? wire : 0], cap,
                                                sh, qs.attn, T, cs)) {

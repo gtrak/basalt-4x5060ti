@@ -57,6 +57,15 @@ share only the row formulas, so a formula error visible in one format but not th
 single-format test would miss. Bitwise, unaligned `pos0` so the tail block has to land, and the card's `K`/`V`
 built as its own contiguous `[T, nkv, head_dim]` rather than a strided view, because that is what the arm hands it.
 
+`peer_qsa_layer()` now *checks* that agreement instead of relying on it: the arm refuses a layer whose `QsaState`
+carries a head width other than the `QsaShapes` it is about to hand `qsa_prompt_attn_batch`, because that kernel
+derives two strides from the same struct - the per-query pitch of `q`/`attn` (`n_head`) and the pool row a cell reads
+(`(page * n_head_kv + kvh) * page_size`). This card's pools are carved at its own shard's width, provably: a QSA
+state at `--kv int8` and 262144 cells is **0.281 GiB at the partner's shard against 0.531 GiB at whole geometry**, so
+the partner reads its own single KV head at `kvh0 = 0` and any whole-geometry call would index `page * 2 + 1` past
+its allocation. A claim that the partner "reads the lead's KV rows" is therefore about a shape the arm does not
+have; the guard is what makes that class of claim cheap to settle either way.
+
 Three sites now audited: `split_q`, `gate_attn`, `kv_append`. **Not yet audited**, and the arm will pass through
 each: `native_qsa_indexer_append_batch`, `qsa_block_scores_tc`, `qsa_block_topk`, `rope`, `rms_rows`, `fwht256`.
 The last two take their counts as arguments, so the arm must pass **its own head count and its own `Qf` stride**
@@ -112,7 +121,9 @@ Two deliberate asymmetries with the lead, both load-bearing:
   (which covers outputs), and a wrong answer there means the card attended to different cells than the lead - no
   bad number anywhere, no way for anything downstream to notice. It also pins the audit result: if
   `qsa_shard_shapes` ever narrowed an indexer field, or one of the selection kernels started following `n_head`,
-  the ids part here.
+  the ids part here. The buffer those bits travel in is a set of the wire, not one per prompt: the lead can begin
+  the next chunk while this card still attends over the last, and a single shared set hands the partner the next
+  chunk's positions to select with (`replay_steps()` in `peer_qsa_span_test` reproduces the corruption and its fix).
 - **it ends at `attn_h`, not at the partial.** The o_proj product needs this card's packed `attn_output` columns,
   which `qsa_pair_prepare` allocates and which arrive with the pair's collective. The product, the BF16 conversion
   and the reduce to the lead are one unit; splitting them would leave a half-finished reduce on the branch. The
