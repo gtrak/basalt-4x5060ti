@@ -833,6 +833,133 @@ int main(int argc, char** argv) {
         cudaFree(qf_d); cudaFree(at_d); cudaFree(qf_whole); cudaFree(g_whole);
     }
 
+    // ---- 8. kv_append over one card's KV run: the cache writer, both formats
+    //
+    // The third hardcoded-head site found while writing the partner's arm, and the worst of the three:
+    // kv_append_kernel took its KV-head count, its K/V row stride and BOTH pool row formulas from a literal 2.
+    // A partner holding one KV head would have read one head past its own K/V and written each cell at a
+    // two-heads-per-page stride into a pool carved one head per page - a corrupted cache that poisons every
+    // later layer while still producing plausible tokens.  The reader (qsa_prompt_attn_batch) was already
+    // shard-aware, which is why case 6 passed and this was invisible.
+    //
+    // The check is the whole run against each card's own pools, in BOTH the FP16 and the shipped INT8 layout,
+    // because the two take different branches of the kernel and share only the row formulas - a formula error
+    // shows in one and not the other is exactly what a single-format test would miss.  Bitwise: both sides
+    // quantize the same input value the same way.
+    {
+        const int64_t PS = 4;                       // the artifact's page size, in cells
+        const int64_t T8 = 12, pos8 = 8;            // not page-aligned: the tail block must land too
+        const int64_t cells = pos8 + T8;
+        const int64_t pages = (cells + PS - 1) / PS;
+        std::vector<int32_t> table((size_t) pages);
+        for (int64_t i = 0; i < pages; ++i) table[(size_t) i] = (int32_t) i;   // identity, mode 0
+        std::vector<float> K8((size_t) T8 * 2 * D), V8((size_t) T8 * 2 * D);
+        for (auto& x : K8) x = nd(rng) * 4.0f;
+        for (auto& x : V8) x = nd(rng) * 4.0f;
+        float* K_d = dalloc<float>((size_t) T8 * 2 * D);
+        float* V_d = dalloc<float>((size_t) T8 * 2 * D);
+        int32_t* tab_d = dalloc<int32_t>((size_t) pages);
+        up(K_d, K8); up(V_d, V8); up(tab_d, table);
+
+        for (int fmt = 0; fmt < 2; ++fmt) {
+            const bool int8_mode = fmt == 1;
+            // the whole layer's pools: n_head_kv heads per page
+            uint16_t* kp_f = dalloc<uint16_t>((size_t) pages * 2 * PS * D);
+            uint16_t* vp_f = dalloc<uint16_t>((size_t) pages * 2 * PS * D);
+            int8_t* kq_f = dalloc<int8_t>((size_t) pages * 2 * PS * D);
+            int8_t* vq_f = dalloc<int8_t>((size_t) pages * 2 * PS * D);
+            uint16_t* ks_f = dalloc<uint16_t>((size_t) pages * 2 * PS * (D / 64));
+            uint16_t* vs_f = dalloc<uint16_t>((size_t) pages * 2 * PS * (D / 64));
+            pr::kv_append(K_d, V_d, T8, pos8, tab_d, PS, int8_mode ? nullptr : kp_f,
+                          int8_mode ? nullptr : vp_f, int8_mode ? kq_f : nullptr, int8_mode ? vq_f : nullptr,
+                          int8_mode ? ks_f : nullptr, int8_mode ? vs_f : nullptr, nullptr, nullptr, nullptr);
+
+            bool bitwise = true;
+            for (const QsaHeadShard* r : {&r0, &r1}) {
+                const int nkv = (int) r->nkv();
+                // the card's OWN K and V: [T, nkv, head_dim] contiguous, its KV head's rows of the lead's
+                std::vector<float> Ks((size_t) T8 * nkv * D), Vs((size_t) T8 * nkv * D);
+                for (int64_t t = 0; t < T8; ++t)
+                    for (int64_t h = 0; h < nkv; ++h)
+                        for (int64_t d = 0; d < D; ++d) {
+                            Ks[(size_t) t * nkv * D + h * D + d] = K8[(size_t) t * 2 * D + (r->kv0() + h) * D + d];
+                            Vs[(size_t) t * nkv * D + h * D + d] = V8[(size_t) t * 2 * D + (r->kv0() + h) * D + d];
+                        }
+                float* Ks_d = dalloc<float>((size_t) T8 * nkv * D);
+                float* Vs_d = dalloc<float>((size_t) T8 * nkv * D);
+                up(Ks_d, Ks); up(Vs_d, Vs);
+                // the card's pools, carved nkv heads per page - what qsa_prompt_state_carve gives it
+                uint16_t* kp = dalloc<uint16_t>((size_t) pages * nkv * PS * D);
+                uint16_t* vp = dalloc<uint16_t>((size_t) pages * nkv * PS * D);
+                int8_t* kq = dalloc<int8_t>((size_t) pages * nkv * PS * D);
+                int8_t* vq = dalloc<int8_t>((size_t) pages * nkv * PS * D);
+                uint16_t* ks = dalloc<uint16_t>((size_t) pages * nkv * PS * (D / 64));
+                uint16_t* vs = dalloc<uint16_t>((size_t) pages * nkv * PS * (D / 64));
+                pr::kv_append_nkv(Ks_d, Vs_d, T8, pos8, tab_d, PS, int8_mode ? nullptr : kp,
+                                  int8_mode ? nullptr : vp, int8_mode ? kq : nullptr, int8_mode ? vq : nullptr,
+                                  int8_mode ? ks : nullptr, int8_mode ? vs : nullptr, nullptr, nullptr, nullptr,
+                                  nkv);
+                // compare the card's pool rows against its KV heads' rows of the whole run's pools
+                const size_t nrow_f = (size_t) pages * 2 * PS, nrow_c = (size_t) pages * nkv * PS;
+                auto cmp = [&](const int8_t* a, const int8_t* b, const char* what) {
+                    int rep = 0;
+                    for (int64_t pos = pos8; pos < cells && rep < 3; ++pos)
+                        for (int64_t h = 0; h < nkv && rep < 3; ++h)
+                            for (int64_t d = 0; d < D && rep < 3; ++d) {
+                                const int64_t page = pos / PS;
+                                const size_t cf = ((size_t) page * 2 + (r->kv0() + h)) * PS + pos % PS;
+                                const size_t cc = ((size_t) page * nkv + h) * PS + pos % PS;
+                                if (a[cc * D + d] == b[cf * D + d]) continue;
+                                bitwise = false;
+                                std::printf("FAIL kv_append %s rank %d pos %lld kv %lld dim %lld: %d vs %d\n", what,
+                                        r->rank, (long long) pos, (long long) (r->kv0() + h), (long long) d,
+                                        (int) a[cc * D + d], (int) b[cf * D + d]);
+                                ++g_fail; ++rep;
+                            }
+                };
+                auto cmp16 = [&](const uint16_t* a, const uint16_t* b, const char* what) {
+                    int rep = 0;
+                    for (int64_t pos = pos8; pos < cells && rep < 3; ++pos)
+                        for (int64_t h = 0; h < nkv && rep < 3; ++h)
+                            for (int64_t d = 0; d < D && rep < 3; ++d) {
+                                const int64_t page = pos / PS;
+                                const size_t cf = ((size_t) page * 2 + (r->kv0() + h)) * PS + pos % PS;
+                                const size_t cc = ((size_t) page * nkv + h) * PS + pos % PS;
+                                if (a[cc * D + d] == b[cf * D + d]) continue;
+                                bitwise = false;
+                                std::printf("FAIL kv_append %s rank %d pos %lld kv %lld dim %lld: %u vs %u\n", what,
+                                        r->rank, (long long) pos, (long long) (r->kv0() + h), (long long) d,
+                                        (unsigned) a[cc * D + d], (unsigned) b[cf * D + d]);
+                                ++g_fail; ++rep;
+                            }
+                };
+                if (int8_mode) {
+                    std::vector<int8_t> a_k(nrow_c * D), b_k(nrow_f * D), a_v(nrow_c * D), b_v(nrow_f * D);
+                    std::vector<uint16_t> a_ks(nrow_c * D / 64), b_ks(nrow_f * D / 64);
+                    a_k = down(kq, a_k.size()); b_k = down(kq_f, b_k.size());
+                    a_v = down(vq, a_v.size()); b_v = down(vq_f, b_v.size());
+                    a_ks = down(ks, a_ks.size()); b_ks = down(ks_f, b_ks.size());
+                    cmp(a_k.data(), b_k.data(), "int8 K");
+                    cmp(a_v.data(), b_v.data(), "int8 V");
+                    cmp16(a_ks.data(), b_ks.data(), "int8 K scale");
+                } else {
+                    std::vector<uint16_t> a_k(nrow_c * D), b_k(nrow_f * D), a_v(nrow_c * D), b_v(nrow_f * D);
+                    a_k = down(kp, a_k.size()); b_k = down(kp_f, b_k.size());
+                    a_v = down(vp, a_v.size()); b_v = down(vp_f, b_v.size());
+                    cmp16(a_k.data(), b_k.data(), "fp16 K");
+                    cmp16(a_v.data(), b_v.data(), "fp16 V");
+                }
+                cudaFree(Ks_d); cudaFree(Vs_d); cudaFree(kp); cudaFree(vp);
+                cudaFree(kq); cudaFree(vq); cudaFree(ks); cudaFree(vs);
+            }
+            std::printf("[kv_append %s] T %lld from pos %lld, %d cells, pages %lld: %s\n",
+                    int8_mode ? "int8" : "fp16", (long long) T8, (long long) pos8, (int) cells, (long long) pages,
+                    bitwise ? "bitwise vs the whole run's pools" : "NOT bitwise");
+            cudaFree(kp_f); cudaFree(vp_f); cudaFree(kq_f); cudaFree(vq_f); cudaFree(ks_f); cudaFree(vs_f);
+        }
+        cudaFree(K_d); cudaFree(V_d); cudaFree(tab_d);
+    }
+
     std::printf("\ntp2 head split parity: %d failures\n", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -580,16 +580,21 @@ __global__ void gate_attn_kernel(const float* __restrict__ a, const float* __res
 __global__ void kv_append_kernel(const float* __restrict__ K, const float* __restrict__ V, int64_t pos0,
                                  const int32_t* __restrict__ table, int64_t page_size, uint16_t* k_pool,
                                  uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
-                                 basalt::kernels::KvHostPools host, basalt::kernels::KvHostPools stage) {
+                                 basalt::kernels::KvHostPools host, basalt::kernels::KvHostPools stage, int nkv) {
     const int64_t t = blockIdx.x;
     const int kvh = blockIdx.y, g = blockIdx.z >> 1;
     const bool is_v = (blockIdx.z & 1) != 0;
     const int d = g * 64 + threadIdx.x;
-    const float x = (is_v ? V : K)[t * 512 + kvh * 256 + d];
+    // `nkv` is how many KV heads this card's pools hold.  It was hardcoded to 2 in four places (the grid, the
+    // K/V row stride, and both pool row formulas), which a pair's partner - one KV head at the symmetric cut -
+    // would have paid for by reading one head past its own K/V and writing its cells at a two-heads-per-page
+    // stride into a pool carved one head per page.  A corrupted cache poisons every layer after this one and
+    // still produces plausible tokens, so the count is an argument and the whole-layer 2 is its default below.
+    const float x = (is_v ? V : K)[t * (nkv * 256) + kvh * 256 + d];
     const int64_t pos = pos0 + t;
     const int64_t page = table[pos / page_size];
-    const int64_t row = (page * 2 + kvh) * page_size + pos % page_size;
-    const int64_t row_id = ((pos / page_size) * 2 + kvh) * page_size + pos % page_size;
+    const int64_t row = (page * nkv + kvh) * page_size + pos % page_size;
+    const int64_t row_id = ((pos / page_size) * nkv + kvh) * page_size + pos % page_size;
     if (k_pool != nullptr) {
         const uint16_t h = hf(x);
         if (page >= 0) (is_v ? v_pool : k_pool)[row * 256 + d] = h;
@@ -643,10 +648,19 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
                void* stream, const basalt::kernels::KvHostPools* host, const basalt::kernels::KvHostPools* stage) {
     if (T <= 0) return;
-    kv_append_kernel<<<dim3((unsigned) T, 2, 8), 64, 0, (cudaStream_t) stream>>>(
+    // the whole layer's KV heads; a pair's card calls `kv_append_nkv` with its own run
+    kv_append_nkv(K, V, T, pos0, page_table, page_size, k_pool, v_pool, k_q, v_q, k_scale, v_scale, stream, host,
+                  stage, basalt::kernels::qsa_real_shapes().n_head_kv);
+}
+void kv_append_nkv(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table,
+                   int64_t page_size, uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q,
+                   uint16_t* k_scale, uint16_t* v_scale, void* stream, const basalt::kernels::KvHostPools* host,
+                   const basalt::kernels::KvHostPools* stage, int nkv) {
+    if (T <= 0 || nkv <= 0) return;
+    kv_append_kernel<<<dim3((unsigned) T, (unsigned) nkv, 8), 64, 0, (cudaStream_t) stream>>>(
         K, V, pos0, page_table, page_size, k_pool, v_pool, k_q, v_q, k_scale, v_scale,
-        host ? *host : basalt::kernels::KvHostPools{}, stage ? *stage : basalt::kernels::KvHostPools{});
-    check("kv_append");
+        host ? *host : basalt::kernels::KvHostPools{}, stage ? *stage : basalt::kernels::KvHostPools{}, nkv);
+    check("kv_append_nkv");
 }
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;

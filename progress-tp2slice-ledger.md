@@ -174,6 +174,31 @@ What now prevents it, in order of strength:
 
 Found before the compute existed, which is the only reason it was cheap.
 
+## 2g. The third hardcoded-head site: the cache writer
+
+Found while transcribing the lead's QSA block into the partner's arm, and the most dangerous of the three:
+`kv_append_kernel` took its KV-head count, its `K`/`V` row stride **and both pool row formulas** from a literal 2
+(`dim3(T, 2, 8)`, `K[t * 512 + ...]`, `(page * 2 + kvh) * page_size`, `((pos / page_size) * 2 + kvh) * page_size`).
+A partner holding **one** KV head would have read one head past its own `K`/`V` and written each cell at a
+two-heads-per-page stride into a pool carved one head per page — a corrupted KV cache, which poisons every layer
+after the one that corrupted it and still produces plausible tokens.
+
+It was invisible because the *reader* was already shard-aware: `qsa_prompt_attn_batch` takes `QsaShapes`, which is
+why case 6 passed. A split is only real where both the writer and the reader agree on it, so a head-split audit
+has to cover writers too.
+
+Now `kv_append_nkv(..., nkv)` with `kv_append` = that at the model's `n_head_kv`, so lead and card share one body
+and `prefill.cpp` is untouched. Case 8 compares each card's pools against its KV heads' rows of the whole run's
+pools, in **both** the FP16 and the shipped INT8 layouts — the two take different branches of the kernel and
+share only the row formulas, so a formula error visible in one format but not the other is exactly what a
+single-format test would miss. Bitwise, unaligned `pos0` so the tail block has to land, and the card's `K`/`V`
+built as its own contiguous `[T, nkv, head_dim]` rather than a strided view, because that is what the arm hands it.
+
+Three sites now audited: `split_q`, `gate_attn`, `kv_append`. **Not yet audited**, and the arm will pass through
+each: `native_qsa_indexer_append_batch`, `qsa_block_scores_tc`, `qsa_block_topk`, `rope`, `rms_rows`, `fwht256`.
+The last two take their counts as arguments, so the arm must pass **its own head count and its own `Qf` stride**
+rather than the lead's `24`/`6144` — the same class, in the caller this time.
+
 ## 3. Predictions, filed before measuring
 
 Graded against the task's dual rule on the same boot, vs EP+PP without the slice.

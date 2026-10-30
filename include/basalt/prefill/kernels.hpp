@@ -112,6 +112,13 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
                void* stream, const basalt::kernels::KvHostPools* host = nullptr,
                const basalt::kernels::KvHostPools* stage = nullptr);
+/// The same over ONE card's KV-head run: `nkv` KV heads, `K`/`V` laid out [T, nkv, head_dim], and pools holding
+/// `nkv` heads per page.  The pair's partner calls this with its own run (core/qsa_head_split.hpp); the whole
+/// layer's `kv_append` above is this at the model's `n_head_kv`, so lead and card share one kernel body.
+void kv_append_nkv(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table,
+                   int64_t page_size, uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q,
+                   uint16_t* k_scale, uint16_t* v_scale, void* stream, const basalt::kernels::KvHostPools* host,
+                   const basalt::kernels::KvHostPools* stage, int nkv);
 
 /// fp32 -> fp16 bits and fp32 -> bf16, n elements (the two activation images of the prompt GEMMs).
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream);
