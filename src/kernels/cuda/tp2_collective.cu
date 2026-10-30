@@ -87,7 +87,7 @@ void Tp2Pair::close() {
     cudaGetLastError();   // a free on a device that went away is not this pair's problem
 }
 
-bool Tp2Pair::open(int dev_a, int dev_b, int64_t max_elems, std::string& err) {
+bool Tp2Pair::open(int dev_a, int dev_b, int64_t max_elems, std::string& err, int sets) {
     close();
     if (dev_a == dev_b || dev_a < 0 || dev_b < 0) {
         err = "tp2 all-reduce: a pair is two different cards";
@@ -95,6 +95,10 @@ bool Tp2Pair::open(int dev_a, int dev_b, int64_t max_elems, std::string& err) {
     }
     if (max_elems <= 0) {
         err = "tp2 all-reduce: the widest partial must be at least one float";
+        return false;
+    }
+    if (sets < 1) {
+        err = "tp2 all-reduce: a pair needs at least one staging set, not " + std::to_string(sets);
         return false;
     }
     int can = 0;
@@ -113,14 +117,17 @@ bool Tp2Pair::open(int dev_a, int dev_b, int64_t max_elems, std::string& err) {
             return false;
         }
         if (cudaDeviceEnablePeerAccess(other, 0) != cudaSuccess) cudaGetLastError();   // already on: fine
-        if (cudaMalloc((void**) &staging_[r], (size_t) max_elems * 4) != cudaSuccess ||
+        // One allocation, `sets` regions of `max_elems` floats each: collective n and collective n+sets are the
+        // only pair that can want the same region, and the flag protocol orders them (tp2_collective.hpp).
+        const uint64_t region = tp2_staging_elems(max_elems, sets);
+        if (cudaMalloc((void**) &staging_[r], (size_t) region * 4) != cudaSuccess ||
             cudaMalloc((void**) &pushed_[r], sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &seq_[r], sizeof(int32_t)) != cudaSuccess) {
             err = "tp2 all-reduce: CUDA" + std::to_string(me) + " out of memory for the staging buffer";
             close();
             return false;
         }
-        if (cudaMemset(staging_[r], 0, (size_t) max_elems * 4) != cudaSuccess ||
+        if (cudaMemset(staging_[r], 0, (size_t) region * 4) != cudaSuccess ||
             cudaMemset(pushed_[r], 0, sizeof(int32_t)) != cudaSuccess ||
             cudaMemset(seq_[r], 0, sizeof(int32_t)) != cudaSuccess) {
             err = "tp2 all-reduce: CUDA" + std::to_string(me) + " could not clear its staging buffer";
@@ -145,6 +152,7 @@ bool Tp2Pair::open(int dev_a, int dev_b, int64_t max_elems, std::string& err) {
     dev_a_ = dev_a;
     dev_b_ = dev_b;
     max_elems_ = max_elems;
+    sets_ = sets > 1 ? sets : 1;
     return true;
 }
 
@@ -153,7 +161,7 @@ bool Tp2Pair::timed_out(int rank) const {
 }
 
 bool Tp2Pair::all_reduce(float* buf, int64_t rows, int64_t stride, void* stream, int peer_dev, int rank,
-                         std::string& err) {
+                         std::string& err, int set) {
     if (!valid()) {
         err = "tp2 all-reduce: the pair is not open";
         return false;
@@ -178,21 +186,29 @@ bool Tp2Pair::all_reduce(float* buf, int64_t rows, int64_t stride, void* stream,
               " partial does not fit the pair's staging (" + std::to_string(max_elems_) + " floats)";
         return false;
     }
+    // Both ranks must name the same region for the same collective; a caller that runs two layers at once and
+    // passes one set for both gets a sum built from the peer's NEXT layer's partial, so this is refused, not warned.
+    if (!tp2_staging_set_ok(set, sets_)) {
+        err = "tp2 all-reduce: staging set " + std::to_string(set) + " is not one of this pair's " +
+              std::to_string(sets_) + "; a pair running this deep needs open(..., sets) raised to match";
+        return false;
+    }
     const cudaStream_t s = (cudaStream_t) stream;
     if (cudaSetDevice(dev_me) != cudaSuccess) {
         err = "tp2 all-reduce: cannot run on CUDA" + std::to_string(dev_me);
         return false;
     }
     const uint64_t bytes = tp2_all_reduce_bytes(rows, stride);
+    const int64_t off = (int64_t) set * max_elems_;
     // 1. push my partial into the peer's staging (one peer copy; the link the pair already has)
-    if (cudaMemcpyPeerAsync(staging_[other], dev_other, buf, dev_me, bytes, s) != cudaSuccess) {
+    if (cudaMemcpyPeerAsync(staging_[other] + off, dev_other, buf, dev_me, bytes, s) != cudaSuccess) {
         err = "tp2 all-reduce: the push to CUDA" + std::to_string(dev_other) + " failed";
         return false;
     }
     // 2. raise the peer's flag once it has landed, and 3. add the peer's push into my buffer once mine has
     tp2_push_flag<<<1, 32, 0, s>>>(seq_[rank], pushed_[other]);
     const int blocks = (int) std::min<int64_t>(kTp2Blocks, (rows * stride + kTp2Threads - 1) / kTp2Threads);
-    tp2_add_wait<<<blocks, kTp2Threads, 0, s>>>(buf, staging_[rank], pushed_[rank], seq_[rank], timeout_[rank],
+    tp2_add_wait<<<blocks, kTp2Threads, 0, s>>>(buf, staging_[rank] + off, pushed_[rank], seq_[rank], timeout_[rank],
                                                 rows * stride);
     if (const cudaError_t le = cudaGetLastError(); le != cudaSuccess) {
         err = std::string("tp2 all-reduce: the collective on CUDA") + std::to_string(dev_me) + " did not launch: " +

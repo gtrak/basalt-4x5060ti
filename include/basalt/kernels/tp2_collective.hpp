@@ -54,6 +54,27 @@ inline void tp2_all_reduce_ref(float* out, const float* a, const float* b, int64
     }
 }
 
+/// THE STAGING SETS, AND WHY ONE IS NOT ALWAYS ENOUGH.  Each card has one landing buffer per SET: a rank pushes
+/// its partial into the peer's region `set`, raises the peer's flag, then adds the peer's region `set` into its own
+/// buffer.  Nothing credits a region back after the add read it, so the ONLY thing protecting a region is the gap
+/// between the two collectives that use it.  With `sets` regions that gap is `sets` collectives, and the pair's own
+/// flag protocol puts a provable order inside it: my add of collective n is followed, on my stream, by my push of
+/// n+1 and its flag; the peer's add of n+1 cannot complete before that flag; and the peer's push of n+`sets` - the
+/// next one to touch region n%sets - sits behind that add on ITS stream.  So my add of n has finished before the
+/// peer may write that region again, and one region per set is exactly enough.
+///
+/// With `sets` 1 the gap is one collective, and the chain above needs the peer's add of n+1 to be gated on my flag
+/// of n+1 - which is only there if some other wait keeps a rank a whole collective behind its peer.  A caller that
+/// removes such a wait (running two layers in flight, say) must raise `sets` to match, or a peer's next push lands
+/// in a region this rank's add is still reading: the sum silently takes the NEXT layer's partial.
+/// `tp2_all_reduce_ref` cannot see that, and neither can a parity test of one collective.
+inline uint64_t tp2_staging_elems(int64_t max_elems, int sets) {
+    return (uint64_t) (sets > 1 ? sets : 1) * (uint64_t) (max_elems > 0 ? max_elems : 0);
+}
+
+/// Is `set` one of the regions a pair opened with `sets` has?  Pure, so the refusal's rule reads without a device.
+inline bool tp2_staging_set_ok(int set, int sets) { return set >= 0 && set < (sets > 0 ? sets : 1); }
+
 /// The two cards of a stage pair, in the order the engine opens them: rank 0 is the stage's lead card, rank 1 its
 /// partner.  Pure, so the sequence bookkeeping below can be reasoned about (and tested) without a device.
 inline int tp2_peer(int rank) { return rank ^ 1; }
@@ -81,12 +102,14 @@ public:
     ~Tp2Pair();
 
     /// Allocates the staging and the words on both cards.  `dev_r` are the pair's CUDA devices, `max_elems` the
-    /// largest partial (in floats) any collective will carry.  Refuses when peer access between the two is not
-    /// available: a pair that cannot reach across has no collective to run.
-    bool open(int dev_a, int dev_b, int64_t max_elems, std::string& err);
+    /// largest partial (in floats) any collective will carry, and `sets` how many such regions each card gets
+    /// (see THE STAGING SETS above; 1 is the historical single buffer).  Refuses when peer access between the two
+    /// is not available: a pair that cannot reach across has no collective to run.
+    bool open(int dev_a, int dev_b, int64_t max_elems, std::string& err, int sets = 1);
     void close();
     bool valid() const { return staging_[0] != nullptr && staging_[1] != nullptr; }
     int64_t max_elems() const { return max_elems_; }
+    int sets() const { return sets_; }
     int device(int rank) const { return rank == 0 ? dev_a_ : dev_b_; }
 
     /// The collective, with the brief's parameter names: `buf` (`rows` x `stride` floats, on `dev`) gets its
@@ -97,11 +120,17 @@ public:
     /// `rank` says which side of the pair `dev` is (the caller knows: the lead card is rank 0).  A call the peer
     /// never issues spins out at the timeout and returns false - the pair is then dead and must be closed.
     ///
+    /// `set` chooses the landing region, and BOTH ranks must pass the SAME one for the same collective - they do
+    /// when both derive it from the same layer ordinal, which is what the prompt-attention arm does with its wire
+    /// ordinal.  A caller that keeps more than one collective in flight must pass a different set per in-flight
+    /// collective, or open the pair with enough sets for the depth it runs (see THE STAGING SETS above).
+    ///
     /// **THE TWO RANKS' CALLS MUST BE ON STREAMS THAT MAKE INDEPENDENT PROGRESS.**  Both cards have their own
     /// stream in the engine, which is what lets rank 0's waiting kernel run while rank 1's push is still queued.
     /// Two collectives on ONE stream deadlock until the timeout: the first rank's add would wait for a push the
     /// same stream has not issued yet.
-    bool all_reduce(float* buf, int64_t rows, int64_t stride, void* stream, int peer_dev, int rank, std::string& err);
+    bool all_reduce(float* buf, int64_t rows, int64_t stride, void* stream, int peer_dev, int rank, std::string& err,
+                    int set = 0);
 
     /// Collectives issued per rank, and the bytes pushed per rank (the microbench reports both).
     int64_t issued(int rank) const { return rank == 0 ? issued_a_ : issued_b_; }
@@ -118,6 +147,7 @@ private:
     int32_t* seq_[2] = {nullptr, nullptr};
     int32_t* timeout_[2] = {nullptr, nullptr};   // mapped host memory, one per card: that rank sets its own
     int64_t max_elems_ = 0;
+    int sets_ = 1;                        // landing regions per card; see THE STAGING SETS above
     int64_t issued_a_ = 0, issued_b_ = 0;
     uint64_t bytes_a_ = 0, bytes_b_ = 0;
 };
@@ -138,7 +168,7 @@ private:
 /// the next collective of the pair", which for a per-layer reduce means the very next layer.  A caller that must
 /// know within one layer reads `timed_out(rank)` after its own stream sync.
 inline bool tp2_all_reduce(Tp2Pair& pair, float* buf, int64_t rows, int64_t stride, void* stream, int peer_dev,
-                           int rank, std::string& err) {
+                           int rank, std::string& err, int set = 0) {
     // Both ranks are checked, not just this one: the stage drives both cards from one thread, so a peer whose
     // last collective gave up has already left THIS one's sum short, whatever this rank's own flag says.
     if (const int r = pair.timed_out(0) ? 0 : (pair.timed_out(1) ? 1 : -1); r >= 0) {
@@ -147,7 +177,7 @@ inline bool tp2_all_reduce(Tp2Pair& pair, float* buf, int64_t rows, int64_t stri
               "in a state to reduce again";
         return false;
     }
-    return pair.all_reduce(buf, rows, stride, stream, peer_dev, rank, err);
+    return pair.all_reduce(buf, rows, stride, stream, peer_dev, rank, err, set);
 }
 
 }  // namespace basalt::kernels

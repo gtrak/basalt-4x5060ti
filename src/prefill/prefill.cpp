@@ -2247,7 +2247,11 @@ bool peer_qsa_pair_up(PeerPrefill& P, const core::ModelGeometry& g, const core::
     // would surface as an allocation-shaped complaint long after the number that caused it was chosen.  Priced
     // from the same T the span is priced at, so the tier and the pair cannot disagree about the chunk.
     const int64_t elems = T * g.n_embd;
-    if (!qs.pair.open(lead_dev, P.dev, elems, err)) {
+    // THE STAGING SETS, from the same figure that decided how many `o_proj` staging sets the arm holds: under the
+    // pipelined gate the lead keeps two layers in flight, and with one landing region the partner's next push
+    // would land in the region the lead's add of the previous layer is still reading - a sum built from the next
+    // layer's partial, with no error to see (tp2_collective.hpp, THE STAGING SETS).
+    if (!qs.pair.open(lead_dev, P.dev, elems, err, qs.span.staging_sets)) {
         err = "prefill peer: the pair would not open across CUDA" + std::to_string(lead_dev) + " and CUDA" +
               std::to_string(P.dev) + " for a " + std::to_string(T) + " x " + std::to_string(g.n_embd) +
               " partial: " + err;
@@ -2303,11 +2307,11 @@ bool peer_qsa_pair_up(PeerPrefill& P, const core::ModelGeometry& g, const core::
     basalt::log::info("basalt prefill",
                       "peer prompt-attention pair CUDA%d+CUDA%d open, staging %lld floats; attn_output columns "
                       "packed on both cards over %lld QSA layers (lead %d/%d, partner %d/%d heads; %s, %d o_proj "
-                      "staging set%s)",
+                      "staging set%s, %d collective staging set%s)",
                       lead_dev, P.dev, (long long) elems, (long long) built,
                       (int) lead_sh.nq(), (int) g.n_head, (int) peer_sh.nq(), (int) g.n_head,
                       P.qsa.pipeline >= 2 ? "pipelined" : "serialized", P.qsa.span.staging_sets,
-                      P.qsa.span.staging_sets == 1 ? "" : "s");
+                      P.qsa.span.staging_sets == 1 ? "" : "s", qs.pair.sets(), qs.pair.sets() == 1 ? "" : "s");
     return true;
 }
 
@@ -2683,11 +2687,11 @@ bool peer_qsa_finish(PeerPrefill& P, Gemm& lead_gemm, cudaStream_t lead_cs, cons
     // and returns WITHOUT adding: `tp2_all_reduce` refuses at entry when either word is already set, and the
     // driver reads `timed_out()` again at the chunk boundary, after its own stream sync, where the answer is
     // known.  Half a reduce must fail the run, never be a token.
-    if (!basalt::kernels::tp2_all_reduce(qs.pair, qs.part_f32[w], T, N, qs.s, P.prim, /*rank*/ 1, err)) {
+    if (!basalt::kernels::tp2_all_reduce(qs.pair, qs.part_f32[w], T, N, qs.s, P.prim, /*rank*/ 1, err, w)) {
         err = "peer QSA: the partner's half of layer " + std::to_string(layer) + ": " + err;
         return false;
     }
-    if (!basalt::kernels::tp2_all_reduce(qs.pair, lead_partial, T, N, lead_cs, P.dev, /*rank*/ 0, err)) {
+    if (!basalt::kernels::tp2_all_reduce(qs.pair, lead_partial, T, N, lead_cs, P.dev, /*rank*/ 0, err, w)) {
         err = "prefill: the lead's half of layer " + std::to_string(layer) + ": " + err;
         return false;
     }
@@ -3026,6 +3030,14 @@ static bool peer_fp4_possible(bool streamed_share) {
     return peer_fp4_gate(streamed_share) == nullptr;
 }
 
+/// How many staging sets a pair's collective needs at this boot — the SAME figure that decides how many `o_proj`
+/// partial buffers the arm holds, because both follow from one thing: whether the lead waits for its peer's add
+/// before the next push. Serialized (1) keeps a rank a whole collective behind its peer, so one landing region per
+/// card is enough; pipelined (2) does not, so the pair needs two (tp2_collective.hpp, THE STAGING SETS). One
+/// spelling, read by the span sizer, both tiers' reserves and the pair's open, so no two of them can disagree
+/// about a depth the other allocates for.
+static int peer_qsa_sets() { return core::exp_flag("tp_prompt_attn", 0.0) >= 2 ? 2 : 1; }
+
 /// The partner's prompt-attention span (`--exp tp_prompt_attn`).  ONE walk prices it: `bytes` counts through the
 /// same `Alloc` the arm will carve from later, so the reserve the tier leaves free cannot drift from what
 /// `set_peer` allocates - the failure mode where a boot survives sizing and dies in the allocation.
@@ -3055,7 +3067,7 @@ Prefill::PeerQsaSpan Prefill::make_peer_qsa_span(const core::ModelGeometry& g, c
     // bytes and the arm that allocates them are priced from ONE decision (`PeerQsaSpan::staging_sets`): the pipelined
     // gate holds a second `o_proj` staging set, and a tier that funded one under an arm that uses two is an
     // allocation failure at the first gated prompt.
-    sp.staging_sets = core::exp_flag("tp_prompt_attn", 0.0) >= 2 ? 2 : 1;
+    sp.staging_sets = peer_qsa_sets();
     if (!sp.on) return sp;
     // The first QSA layer of the stage supplies the pack figures: the sizer prices one row and multiplies by the
     // stage's QSA layer count, so a pack that varied its quantization between layers would be priced wrong here
@@ -3210,7 +3222,8 @@ uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_r
         // that does not describe them.  Sized from the same chunk the span is, so the tier and the pair cannot
         // disagree about the widest partial in flight.  The lead's own staging is the lead card's budget to make.
         if (qsa->on && qsa->g)
-            sum += (uint64_t) ((Tp * qsa->g->n_embd * 4 + 255) & ~size_t(255));
+            sum += (uint64_t) ((Tp * qsa->g->n_embd * 4 + 255) & ~size_t(255)) *
+                   (uint64_t) (qsa->staging_sets > 1 ? qsa->staging_sets : 1);
     }
     return sum;
 }
@@ -3223,7 +3236,8 @@ uint64_t Prefill::lead_qsa_bytes(const core::ModelGeometry& g, const core::Weigh
     // One collective moves `rows x stride` FLOATS through each card's staging, so the lead's side is the same
     // figure `peer_bytes` books for the partner's - and it is a `Tp2Pair::open` allocation, not the arm's walk,
     // exactly as the partner's is.
-    const uint64_t staging = ((uint64_t) chunk * (uint64_t) g.n_embd * 4u + 255) & ~uint64_t(255);
+    const uint64_t staging = (((uint64_t) chunk * (uint64_t) g.n_embd * 4u + 255) & ~uint64_t(255)) *
+                             (uint64_t) peer_qsa_sets();   // one landing region per set the pair runs with
     // The whole model's range, deliberately: the tier's reserve is struck before the boot knows which stage's
     // lead it is pricing, and `qsa_pair_bytes` prices only layers the TABLE can price - a stage-scoped table
     // holds neither canonical bytes nor a native image for another stage's layer, so those terms come out 0 and

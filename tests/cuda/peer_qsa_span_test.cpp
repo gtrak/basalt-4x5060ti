@@ -10,13 +10,18 @@
 //   3. the shard narrows the KV and NOT the indexer (qsa_head_split.hpp: the indexer never splits), which is the
 //      one place a mistake would silently over- or under-fund the partner;
 //   4. the wire is the mix RUN 25 settled on, and its total is the 104.8 MB a layer the ledger quotes.
+#include "basalt/core/diag.hpp"
 #include "basalt/core/layer.hpp"
+#include "basalt/kernels/tp2_collective.hpp"
 #include "basalt/prefill/prefill.hpp"
 
 #include <cstdio>
 #include <cstdint>
+#include <vector>
 
 using namespace basalt::core;
+using basalt::kernels::tp2_staging_elems;
+using basalt::kernels::tp2_staging_set_ok;
 using basalt::prefill::Prefill;
 
 namespace {
@@ -410,6 +415,124 @@ void test_the_pair_prices_its_stages_layers() {
 
 }  // namespace
 
+// ===================== the pair's collective: the staging-set protocol, replayed =====================
+
+/// Adversarial replay of `Tp2Pair`'s flag protocol (src/kernels/cuda/tp2_collective.cu) for `sets` landing regions.
+///
+/// The lead's queue per collective k mirrors the driver: publish the wire, push the o_proj partial, flag, add. The
+/// partner's queue per collective k is push, flag, add - its push waits on the lead's PUBLISH of k (the arm's
+/// `ev_in`, which sits ahead of the lead's own collective), and its add waits on the lead's flag of k. Nothing
+/// credits a region back after an add read it, so the question is only whether a peer's next push into a region
+/// can execute before this rank's add of the earlier collective in that region.
+///
+/// The scheduler starves one rank while the other runs every op it can, once with each rank as the victim: on the
+/// machine the two streams make independent progress, so a rank that CAN run ahead will, and a protocol is safe
+/// only if no such schedule corrupts a sum. `serialized` adds the `=1` gate's wait (the lead queues nothing more
+/// until its peer's add of the previous collective). Returns the first collective whose add read a region holding
+/// another collective's partial, 0 when every add read its own, -1 if the schedule deadlocks.
+int replay_collective(int n, int sets, bool serialized) {
+    if (sets < 1) sets = 1;
+    if (n < 1 || n > 16) return -2;
+    int pc[2] = {0, 0};
+    int pushed[2] = {0, 0};                              // pushed_[r]: the k the peer last flagged to card r
+    int adds_done[2] = {0, 0};
+    bool published[17] = {false};                        // the lead published collective k's wire
+    std::vector<std::vector<int>> last(2, std::vector<int>(sets, 0));   // last write into card r's region s
+
+    // One op of rank r, if its head is runnable. 0 = ran, 1 = blocked, 2 = corrupt read, 3 = queue done.
+    auto step = [&](int r) -> int {
+        const int p = 1 - r, qn = (r == 0 ? 4 : 3) * n;
+        if (pc[r] >= qn) return 3;
+        const int idx = pc[r], kind = idx % (r == 0 ? 4 : 3), k = idx / (r == 0 ? 4 : 3) + 1;
+        if (r == 0 && kind == 0) { published[k] = true; pc[r] = idx + 1; return 0; }        // wire publish
+        const bool lead_push = (r == 0 && kind == 1), part_push = (r == 1 && kind == 0);
+        if (part_push && !published[k]) return 1;                                          // the arm's ev_in
+        if (lead_push && serialized && k > 1 && adds_done[p] < k - 1) return 1;             // the =1 ev_out wait
+        const bool is_push = lead_push || part_push;
+        const bool is_flag = (r == 0 && kind == 2) || (r == 1 && kind == 1);
+        const bool is_add = (r == 0 && kind == 3) || (r == 1 && kind == 2);
+        if (is_push) last[p][(k - 1) % sets] = k;
+        if (is_flag) pushed[p] = k;
+        if (is_add) {
+            if (pushed[r] < k) return 1;                                                   // peer has not flagged it
+            if (last[r][(k - 1) % sets] != k) return 2;                                    // another collective's
+            adds_done[r] = k;
+        }
+        pc[r] = idx + 1;
+        return 0;
+    };
+
+    for (int victim = 0; victim < 2; ++victim) {
+        pc[0] = pc[1] = 0; pushed[0] = pushed[1] = 0; adds_done[0] = adds_done[1] = 0;
+        for (int i = 0; i <= n; ++i) published[i] = false;
+        for (int s = 0; s < sets; ++s) last[0][s] = last[1][s] = 0;
+        const int other = 1 - victim;
+        while (pc[0] < 4 * n || pc[1] < 3 * n) {
+            bool ran = false;
+            while (step(other) == 0) ran = true;          // the peer charges as far as it can
+            const int v = step(victim);
+            if (v == 2) return 1;                          // an add read another collective's partial
+            if (v != 0 && !ran) return -1;                 // neither rank can move: the protocol deadlocks
+        }
+    }
+    return 0;
+}
+
+void test_the_pair_funds_the_depth_it_runs() {
+    // The pair's own pure rules: sets are counted from one, a region is addressable only below the count, and the
+    // allocation is sets x the widest partial - which is what the tier's reserve has to book.
+    CHECK(tp2_staging_elems(0, 4) == 0);
+    CHECK(tp2_staging_elems(100, 1) == 100);
+    CHECK(tp2_staging_elems(100, 2) == 200);
+    CHECK(tp2_staging_elems(100, 0) == 100);        // a caller that asks for no sets still gets the one it needs
+    CHECK(tp2_staging_set_ok(0, 1) && tp2_staging_set_ok(1, 2));
+    CHECK(!tp2_staging_set_ok(1, 1));               // the pipelined depth, refused on a serialized pair
+    CHECK(!tp2_staging_set_ok(-1, 2));
+    CHECK(tp2_staging_set_ok(0, 0));                 // no sets asked for: the one region every pair must have is there
+
+    // SERIALIZED (the =1 gate): one region, and the waits the mode carries are enough at any depth.
+    CHECK(replay_collective(1, 1, true) == 0);
+    CHECK(replay_collective(6, 1, true) == 0);
+    CHECK(replay_collective(12, 1, true) == 0);
+
+    // PIPELINED (the =2 gate) on ONE region: the peer's next push lands in the region this rank's add is still
+    // reading. If this ever stops reproducing, the model has drifted from the kernel - or the protocol changed.
+    CHECK(replay_collective(2, 1, false) > 0);
+    CHECK(replay_collective(12, 1, false) > 0);
+
+    // PIPELINED on TWO regions: the flag chain alone orders the two collectives that share a region, at any depth
+    // the slice reaches (6 QSA layers a stage, and the wire alternates, so 12 is deeper than one chunk runs).
+    CHECK(replay_collective(2, 2, false) == 0);
+    CHECK(replay_collective(6, 2, false) == 0);
+    CHECK(replay_collective(12, 2, false) == 0);
+    std::printf("collective staging: one region corrupts at depth 2 with the lead ungated; two regions do not, to 12\n");
+
+    // And the reserves must book what the pair allocates, or the second region is an allocation failure at the
+    // first gated prompt.  `lead_qsa_bytes` reads the depth from the same gate `set_peer` refuses on, so the gate
+    // is set here and the figure is required to grow by exactly one landing region per card.
+    const uint64_t row = (((uint64_t) T * 2560ull * 4ull) + 255) & ~uint64_t(255);
+    std::vector<uint8_t> dummy(1);      // never read: the sizer prices, it does not dereference
+    WeightTable stage_a;
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        if (!is_qsa_layer(g, l)) continue;
+        WeightRef r;
+        r.ne0 = 24 * 256; r.ne1 = 2560;
+        r.kind = WeightKind::Verbatim; r.code_bits = 8; r.group_elems = 32; r.resident = false;
+        r.data = nullptr; r.bytes = r.codes_bytes = r.scales_bytes = r.offset_bytes = 0; r.has_offset = false;
+        r.native_data = dummy.data(); r.native_type = 14;   // Q6_K, as the shipped pack serves it
+        WeightTableFixture::put(stage_a, "blk." + std::to_string(l) + ".attn_output.weight", r);
+    }
+    auto& diag = basalt::core::diagnostics();
+    diag.exp["tp_prompt_attn"] = 1;
+    const uint64_t lead_one = Prefill::lead_qsa_bytes(g, stage_a, T, 12);
+    diag.exp["tp_prompt_attn"] = 2;
+    const uint64_t lead_two = Prefill::lead_qsa_bytes(g, stage_a, T, 12);
+    diag.exp.erase("tp_prompt_attn");
+    CHECK(lead_two == lead_one + row);      // the lead's landing region for the pair's second set
+    std::printf("collective staging reserve: the lead's figure grows %.1f MiB for the pair's second set\n",
+                (double) (lead_two - lead_one) / (1024.0 * 1024.0));
+}
+
 int main() {
     test_the_reserve_refuses_a_wider_split_by_name();
     test_o_cols_and_types_are_funded();
@@ -422,6 +545,7 @@ int main() {
     test_resident_projections_are_priced();
     test_uneven_ratio_stays_funded();
     test_the_pair_prices_its_stages_layers();
+    test_the_pair_funds_the_depth_it_runs();
     if (g_fail == 0) std::printf("peer_qsa_span_test: ok\n");
     else std::printf("peer_qsa_span_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;
