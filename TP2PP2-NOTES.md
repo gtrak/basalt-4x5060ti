@@ -2647,6 +2647,17 @@ both pairs open, columns packed on both cards, 79 MiB resident projections copie
   (wire ~47 ms/layer unhidden) and the decode tier cost. Honest band: -20 ms/layer (wire
   unhidden, loss) to +27 (hidden, ~2,300 t/s). The hiding question - the same rendezvous
   cadence kimi #4 promoted - is measured on REAL machinery the moment commit 2 lands.
+**Per-layer decomposition of the -8.5% (the honest read, not the done-line):** the lead's
+attn GREW 13-15 ms (61.6-67.5 vs 48.5-54.4 baseline - the publisher's per-QSA-layer copies
+and event serialization ride the lead's stream, plus L2 pressure from the staging), and the
+lead's peer-wait exploded to 67.7-80.3 ms on the stage where the partner's serialized arm
+sits on the critical path (publish 104.9 MB -> shard-width attention -> FP32 reduce
+167.8 MB, all unhidden). The loss is not diffuse: it is two named costs, both of which
+commit 2 (pipelined publish under MoE cover + the lead's attention actually halving) exists
+to remove. Term-by-term per-layer reads are MANDATORY at every grading from here on - the
+done-line t/s hid this decomposition entirely.
+
+
 
 **RUN 23 engine-grade attempt (04:30 UTC) - INCONCLUSIVE, recorded honestly.** Formal A/B on
 the merged binary (reseed on) vs the drafter-tree binary (reseed off, byte-identical), same
