@@ -669,6 +669,26 @@ static bool qsa_prepare_one(QsaPair& p, const WeightRef& w, const std::string& n
             return false;
         }
     }
+    // THE BYTES ARE ON THE CARD WHOSE PRODUCT READS THEM.  Nothing else in this path can say so: a pointer that
+    // landed on the other card of the pair still works, because the pair has peer access - the product simply
+    // walks a peer's memory for the whole layer, and any other mistake in where it came from is invisible behind
+    // the same plausible (or nan) numbers.  One query at boot, before any collective or kernel depends on it.
+    // A query that itself fails is not evidence about the buffer, so it warns and continues; a query that names
+    // another card refuses.
+    {
+        cudaPointerAttributes pa{};
+        if (cudaPointerGetAttributes(&pa, d) == cudaSuccess) {
+            if (pa.type != cudaMemoryTypeDevice || pa.device != dev) {
+                err = name + ": the packed columns sit on CUDA" + std::to_string(pa.device) + ", not on CUDA" +
+                      std::to_string(dev) + " where the product would read them";
+                cudaFree(d);
+                return false;
+            }
+        } else {
+            cudaGetLastError();   // the query is the observer, not the thing under test
+            basalt::log::warn("basalt tp2", "%s: the packed columns' card could not be read", name.c_str());
+        }
+    }
     // re-describe the view over the DEVICE copy: the sizes are the packer's, the pointers are the card's
     const uint8_t* base = (const uint8_t*) d;
     view.codes = view.codes_bytes ? base : nullptr;

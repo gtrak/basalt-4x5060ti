@@ -9,7 +9,9 @@
 // recorded, so the test writes those and the header must follow them (weights.hpp's own rule).
 #include "basalt/core/qsa_head_split.hpp"
 #include "basalt/core/tp2_shard_weights.hpp"
+#include "basalt/artifact/dequant.hpp"   // the scalar Q6_K reference the cut is graded against
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -567,6 +569,98 @@ void the_artifacts_native_o_proj_prices_what_the_tier_holds() {
                 (unsigned long long) (ROW * NE1), (unsigned long long) one_layer);
 }
 
+/// Q6_K's block: 256 values in 210 bytes (`ql[128] qh[64] scales[16]` then the fp16 `d` LAST).  The two places
+/// that must agree on these are the CUT (`qsa_weight_native_block_bytes`, derived from the loader's image size)
+/// and the DEQUANTIZER (`dequant_bf16.cu`'s `geometry()`, from its own table); `qsa_prepare_one` cross-checks the
+/// two against the image's total, and this pins what that check cannot: that a buffer cut at one pitch still
+/// DECODES as the columns it claims, when the product tells the kernel the view's `ne0` and the kernel rebuilds
+/// the pitch from it.
+constexpr int64_t kQ6kElems = 256, kQ6kBytes = 210;
+
+/// One row of a blocked image, decoded the way `dequant_f16` will decode it: `pitch_blocks` blocks per row, so a
+/// caller can ask what the same bytes would mean at a pitch the packer did not use.
+void decode_q6k_row(const uint8_t* blocks, int64_t pitch_blocks, int64_t row, int64_t cols,
+                    std::vector<float>& out) {
+    out.resize((size_t) cols);
+    for (int64_t b = 0; b < cols / kQ6kElems; ++b)
+        basalt::dequantize_q6_K(blocks + ((size_t) row * (size_t) pitch_blocks + (size_t) b) * (size_t) kQ6kBytes,
+                                out.data() + (size_t) b * (size_t) kQ6kElems);
+}
+
+bool all_finite(const std::vector<float>& v) {
+    for (float x : v) if (!std::isfinite(x)) return false;
+    return true;
+}
+
+/// A card's packed `attn_output` columns must decode, element for element, to the columns of the whole image they
+/// claim to be - at the artifact's own form and geometry, with the packer's pitch and the dequantizer's own.
+///
+/// This is the claim the pair's `o_proj` rests on and the one no byte test makes: `qsa_pack_weight_cols` can copy
+/// exactly the right bytes and the product still reads nonsense, because the bytes mean nothing without the pitch
+/// the decoder assumes, and the two are computed in two files.  A mismatch here is the nan this hunt is chasing:
+/// a block read across a boundary decodes its scale bits as a code and its code bits as an fp16 scale, which is
+/// how a weight that packed cleanly arrives as a partial of nan.
+void the_cut_decodes_as_the_wholes_columns() {
+    constexpr int64_t NE0 = 24 * 256, NE1 = 2560, HALF = 12 * 256;
+    FakeWeight f;
+    f.ne0 = NE0;
+    f.ne1 = NE1;
+    f.group = 32;
+    f.native_type = 14;                       // Q6_K, as the pack keeps `attn_output`
+    f.native_row = (NE0 / kQ6kElems) * kQ6kBytes;
+    f.build();
+    f.w.resident = false;                     // served from the GGUF section: one form, the native image
+    f.w.data = nullptr;
+    f.w.bytes = f.w.codes_bytes = f.w.scales_bytes = f.w.offset_bytes = 0;
+    f.w.has_offset = false;
+    CHECK((uint64_t) f.native.size() == 12902400ull);   // the pack's own attn_output byte count
+    // Q6_K's `d` is the LAST two bytes of the block, and the fake's pattern is free to set NaN bits there: a NaN
+    // would compare unequal to itself and read as a broken cut, so give every block a scale that decodes.
+    for (int64_t r = 0; r < NE1; ++r)
+        for (int64_t b = 0; b < NE0 / kQ6kElems; ++b) {
+            uint8_t* blk = f.native.data() + (size_t) r * (size_t) f.native_row + (size_t) b * (size_t) kQ6kBytes;
+            blk[208] = 0x00;
+            blk[209] = (uint8_t) (0x3C + (b % 4));   // d in [1.0, 2.0], finite by construction
+        }
+
+    const QsaHeadShard lead = qsa_pair_shard(24, 2, 12, 0), partner = qsa_pair_shard(24, 2, 12, 1);
+    const QsaHeadRun lc = qsa_out_cols(lead, 256), pc = qsa_out_cols(partner, 256);
+    CHECK(lc.start == 0 && lc.len == HALF);
+    CHECK(pc.start == HALF && pc.len == HALF);
+
+    std::vector<uint8_t> lb(qsa_weight_cols_bytes(f.w, lc.start, lc.len, f.native_all())),
+        pb(qsa_weight_cols_bytes(f.w, pc.start, pc.len, f.native_all()));
+    CHECK((uint64_t) lb.size() == 6451200ull && (uint64_t) pb.size() == 6451200ull);
+    const QsaShardWeight lv = qsa_pack_weight_cols(f.w, lc.start, lc.len, f.native_all(), lb.data());
+    const QsaShardWeight pv = qsa_pack_weight_cols(f.w, pc.start, pc.len, f.native_all(), pb.data());
+    CHECK(lv.ok && pv.ok);
+    // the pitch `dequant_f16` will compute from the VIEW's ne0, and the pitch the packer actually wrote
+    const int64_t pitch_blocks = lv.ne0 / kQ6kElems;
+    CHECK(pitch_blocks == HALF / kQ6kElems);
+    CHECK((uint64_t) pitch_blocks * (uint64_t) kQ6kBytes * (uint64_t) lv.ne1 == lv.native_bytes);
+
+    for (const int64_t row : {int64_t{0}, int64_t{1}, NE1 / 2, NE1 - 1}) {
+        std::vector<float> whole, cut;
+        decode_q6k_row((const uint8_t*) f.native.data(), NE0 / kQ6kElems, row, NE0, whole);
+        CHECK(all_finite(whole));
+        decode_q6k_row((const uint8_t*) lv.native, pitch_blocks, row, lv.ne0, cut);
+        CHECK(all_finite(cut));
+        CHECK(cut == std::vector<float>(whole.begin(), whole.begin() + HALF));   // the lead's columns
+        decode_q6k_row((const uint8_t*) pv.native, pitch_blocks, row, pv.ne0, cut);
+        CHECK(all_finite(cut));
+        CHECK(cut == std::vector<float>(whole.begin() + HALF, whole.end()));     // the partner's
+    }
+
+    // And the test can fail: the same bytes read at the WHOLE image's pitch - what happens when one side computes
+    // the stride the other side did not - must not reproduce those columns, or the comparison above is vacuous.
+    {
+        std::vector<float> whole, wrong;
+        decode_q6k_row((const uint8_t*) f.native.data(), NE0 / kQ6kElems, 1, NE0, whole);
+        decode_q6k_row((const uint8_t*) lv.native, NE0 / kQ6kElems, 1, HALF, wrong);
+        CHECK(wrong != std::vector<float>(whole.begin(), whole.begin() + HALF));
+    }
+}
+
 int main() {
     the_column_view_is_the_wholes_bytes();
     the_two_halves_are_the_whole_row();
@@ -579,6 +673,7 @@ int main() {
     an_uneven_cut_of_the_artifacts_o_proj();
     a_native_only_pack_cuts_too();
     the_artifacts_native_o_proj_prices_what_the_tier_holds();
+    the_cut_decodes_as_the_wholes_columns();
     if (g_fail != 0) { std::printf("tp2 shard weights test failed: %d\n", g_fail); return 1; }
     std::printf("tp2 shard weights test ok\n");
     return 0;

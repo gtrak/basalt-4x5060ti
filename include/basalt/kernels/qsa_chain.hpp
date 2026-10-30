@@ -57,6 +57,7 @@ enum QsaChainSlot : int {
     kChainVPool,       // the lead's V pool rows
     kChainAttn,        // the lead's attention output, before the gate
     kChainGated,       // the gated rows the lead's `o_proj` multiplies
+    kChainColsL,       // the lead's PACKED `attn_output` columns, whole: the W its product dequantizes (sliced only)
     kChainPartL,       // the lead's `o_proj` partial, before the collective (sliced layers only)
     kChainSumL,        // the lead's buffer after the collective (sliced layers only)
     kChainBo,          // the summed `o_proj` as the model reads it: the figure all three modes must agree on
@@ -71,10 +72,19 @@ enum QsaChainSlot : int {
     kChainSelR,        // the partner's selection ids
     kChainAttnP,       // the partner's attention output, before the gate
     kChainGatedP,      // the gated rows the partner's `o_proj` multiplies
+    kChainColsP,       // the partner's PACKED `attn_output` columns, whole: the W ITS product dequantizes
     kChainPartP,       // the partner's `o_proj` partial, before the collective
     kChainSumP,        // the partner's buffer after the collective: must equal `kChainSumL`
     kChainCount
 };
+
+// THE TWO COLUMN SLOTS ARE FINGERPRINTED WHOLE, not row-sampled like every other component. They are the only
+// weights in the chain - everything else is an activation - and a packed `attn_output` column image is a buffer
+// where ONE bad block poisons every element of the partial it feeds: the product sums over the whole input axis,
+// so a single non-finite weight value arrives as a whole buffer of nan, from bytes 32/2560ths of the way through
+// the ones the row sampler would have looked at. Sampling 32 rows there would report the buffer innocent while
+// the partial went nan, which is the one answer this instrument must not be able to give. `rows` is therefore 1
+// and the stride the whole image, so the window is every byte.
 
 /// One component's fingerprint.  Three figures, because they answer different questions: `hash` says whether the
 /// bits moved at all, `sum` says by how much when they did (which is what separates a rounding drift from a wrong

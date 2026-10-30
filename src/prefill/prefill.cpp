@@ -2525,6 +2525,18 @@ static void qsa_chain_put(basalt::kernels::QsaChainFp* card, int64_t layer, int 
                            basalt::kernels::qsa_chain_slot_name(slot), e.c_str());
 }
 
+/// A card's packed `attn_output` columns as its own `o_proj` product is about to read them.  ONE row of the whole
+/// image, so the fingerprint covers every byte: a packed weight poisons a partial from a single bad block (the
+/// product sums over the whole input axis), and the row sampler that suits activations would see 32 of the image's
+/// `n_embd` rows and report the buffer innocent beside a partial of nan.  A view with no native image is not
+/// fingerprinted - the slot then reads `--------`, an absence, never a zero - and so is an image that is not a
+/// whole number of words, which cannot be walked wordwise.
+static void qsa_chain_cols(basalt::kernels::QsaChainFp* card, int64_t layer, int slot,
+                           const basalt::core::QsaShardWeight& w, cudaStream_t stream) {
+    if (w.native == nullptr || w.native_bytes == 0 || w.native_bytes % 4 != 0) return;
+    qsa_chain_put(card, layer, slot, w.native, 1, (int64_t)(w.native_bytes / 4), stream);
+}
+
 /// One KV plane as the chain fingerprints it: the FP16 pool when the state keeps one, its INT8 codes when it does
 /// not, its Q4_0 blocks when it keeps neither, and the row's pitch in 4-byte words either way.  The row COUNT comes
 /// from the caller and must be a figure that is the same on every boot: sampling rows out of an allocation would
@@ -2838,6 +2850,18 @@ bool peer_qsa_finish(PeerPrefill& P, Gemm& lead_gemm, cudaStream_t lead_cs, cons
     // lets this card's product for l+1 be queued while the lead's add of l is still in flight.
     const int w = qs.pipeline >= 2 ? (int) wire : 0;
     if (cudaStreamWaitEvent(qs.s, qs.ev_red[w], 0) != cudaSuccess) { err = "peer QSA: the arm would not wait on the lead's reduce"; return false; }
+
+    // THE CHAIN, the pack inputs: what each card's product is about to dequantize, on the card that holds it.
+    // Everything else the arm fingerprints is an activation, and an activation that is wrong has somewhere
+    // upstream to look; a weight that is wrong has only these bytes and the geometry handed to the dequantizer.
+    // `colsl` nan while `partl` is nan names the bytes; `colsl` finite while `partl` is nan leaves the pitch,
+    // the type or the scratch, and says so in one boot rather than in one hypothesis at a time.
+    if (qs.chain[0] != nullptr || qs.chain[1] != nullptr) {
+        { const core::OnDevice on_lead(P.prim);
+          qsa_chain_cols(qs.chain[0], layer, basalt::kernels::kChainColsL, lc, lead_cs); }
+        { const core::OnDevice on_partner(P.dev);
+          qsa_chain_cols(qs.chain[1], layer, basalt::kernels::kChainColsP, pc, qs.s); }
+    }
 
     // ---- each card's partial, on its own card and its own stream.  cuBLAS wants its handle's card current, which
     // is why each product is scoped to its card rather than run from the lead's thread as things stand.

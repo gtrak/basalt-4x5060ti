@@ -83,8 +83,9 @@ __global__ void qsa_chain_kernel(QsaChainFp* __restrict__ dst, const uint32_t* _
 
 const char* qsa_chain_slot_name(int slot) {
     static const char* const names[kChainCount] = {
-        "mix", "steps", "sel", "kpool", "vpool", "attn", "gated", "partl", "suml", "bo",
-        "pub", "stepsr", "qidxr", "idxraw", "kspan", "vspan", "q", "selr", "attnp", "gatedp", "partp", "sump",
+        "mix", "steps", "sel", "kpool", "vpool", "attn", "gated", "colsl", "partl", "suml", "bo",
+        "pub", "stepsr", "qidxr", "idxraw", "kspan", "vspan", "q", "selr", "attnp", "gatedp", "colsp", "partp",
+        "sump",
     };
     if (slot < 0 || slot >= kChainCount) return "?";
     return names[slot];

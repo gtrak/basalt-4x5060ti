@@ -150,12 +150,41 @@ partner's twelve are all finite. And the packer cannot leave holes:
 and copies it up whole under a checked `cudaMemcpy`, symmetrically for both cards from one weight table. So
 the difference is not in the cut's bookkeeping.
 
-The cheapest thing that separates "bad bytes under `lc.native`" from "something in the lead's `Gemm`": run
-one `=1` boot with the lead's product pointed at the PARTNER's columns -
-`qs.peer_cols.o_cols[layer].native` instead of `lc.native` - and nothing else changed. `partl` finite says
-the lead's packed buffer is the bad stream; `partl` still nan says the byte stream is innocent and the
-suspect is the lead's `Gemm` (its dequant scratch is the model's shared one) or the pitch, and the next cut
-is to fingerprint `lc.native` itself.
+### 5a. The two static candidates, adjudicated on the CPU
+
+The two hypotheses that needed no hardware were run down against the pack's own form (Q6_K: 256 values a block,
+210 B; `attn_output` 6144 x 2560, the native image 12 902 400 B, one card's columns 6 451 200 B):
+
+- **The packing side is clean.** `qsa_pack_weight_cols` gathers whole blocks per row from the image the caller
+  hands it (`gdn_gather_cols`), symmetrically in `col0`; `tests/core/tp2_shard_weights_test.cpp` already compared
+  each half byte-for-byte against the source range, at this geometry, for a native-only pack. Nothing was added
+  there because it was already the right test.
+- **The cut/decode contract is clean, and now pinned.** The pack derives one block's bytes from the loader's
+  image size (`qsa_weight_native_block_bytes`); `dequant_f16` derives each row's pitch from the `cols` it is
+  handed (`cols / block_elems * block_bytes`, its own table). Those are two files computing one stride, which is
+  exactly the seam where a cut can hold the right bytes and still decode to garbage - a block read across a
+  boundary takes its fp16 scale from code bits. `the_cut_decodes_as_the_wholes_columns` now decodes both cards'
+  cuts with the scalar reference (`basalt::dequantize_q6_K`) at the pitch the kernel will use and requires them
+  to equal the whole image's columns, element for element and finite, including the last row; a negative control
+  (the same bytes at the whole image's pitch) has to fail, so the comparison is not vacuous. It passes.
+- **The copy is checked and the buffers are not shareable:** the H2D is a checked `cudaMemcpy` from a
+  zero-initialized host vector, the `QsaPair` is never copied (`PeerPrefill` lives in a `unique_ptr`),
+  `qsa_pair_free` runs only at teardown and on refusal paths, and `cudaMalloc` cannot alias the expert tier.
+
+What survives is the runtime state of the lead's twelve buffers, which no CPU test can see. Two changes make one
+boot decide it:
+
+- **The chain now fingerprints the weights.** `colsl` and `colsp` are each card's whole packed `attn_output`
+  column image, hashed as ONE row of `native_bytes / 4` words so the window is every byte - not the 32-of-2560
+  row sample the activations use, because a single bad block poisons an entire partial (the product sums over the
+  whole input axis), and a sampled slot could have reported the buffer innocent beside a partial of nan. Read it
+  as: `colsl` nan names the bytes (packing, copy, or something written over them); `colsl` finite with `partl`
+  nan names the pitch, the type or the scratch, with every byte of the image already accounted for.
+- **The pack now says where its bytes landed.** `qsa_pair_prepare` refused on rank, on the pair and on the layer
+  range, but never on the card: a column buffer that ended up on the other card of the pair still "works", since
+  the pair has peer access - the product just walks a peer's memory all layer, and any mistake in where the bytes
+  came from hides behind the same nan. One `cudaPointerGetAttributes` per buffer at boot, naming both cards in
+  the refusal; a query that itself fails warns and continues, because the observer must not be able to stop a run.
 
 ## 6. Notes for whoever runs it
 
@@ -168,6 +197,11 @@ is to fingerprint `lc.native` itself.
 - Both prompt passes of a boot give identical figures, and gate-off passes differ from each other in every
   hash (reduction order is not deterministic across launches), so cross-boot comparisons are evidence only
   where a value goes from finite to nan - which is how this section reads them.
-- CPU gates at `0efe4931`: 69/70 with the count at 70 (`expert_multi_test` pre-existing),
-  `peer_qsa_span_test` ok, `tp2_*` parity ok, platform boundary and stderr logging ok. No numerics change:
-  the fixed stride is a fingerprint argument under `--exp qsa_dump_chain`.
+- The chain is now 24 components a layer (`colsl`, `colsp`), and those two are the expensive ones: they walk every
+  byte of a 6.45 MB image on one 256-thread block, per sliced layer per card. That is the price of not being able
+  to miss a block, and it is behind `--exp qsa_dump_chain`; read `colsl`/`colsp` first, they answer the question
+  the other 22 have been circling.
+- CPU gates at `548e2c07` + this work: 69/70 with the count at 70 (`expert_multi_test` pre-existing),
+  `qsa_chain_parity` 0 failures, `tp2_shard_weights_test` ok with the new decode-contract case, platform boundary
+  and stderr logging ok. No numerics change: the two chain slots are behind `--exp qsa_dump_chain`, the pack's new
+  card check only refuses a layout that was already wrong, and the test is a test.
