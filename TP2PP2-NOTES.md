@@ -2625,6 +2625,29 @@ rule and needs the PPL/KLD gate, not just greedy identity.
    term-by-term vs peer chunk; the row-rate ratio >= 1.4x) + a blob_mb_ms measurement -
    1-boot exercises, top of the morning list.
 
+**RUN 25 MEASURED (13:49 UTC, the slice's first graded boot — all four bring-up lines printed,
+both pairs open, columns packed on both cards, 79 MiB resident projections copied at boot):**
+- Serialized prefill: **1,833 t/s** (fresh 122k concurrent) vs the 2,004 baseline = **-8.5%**.
+  The -2/-4 ms/layer-pair prediction was itself optimistic: measured loss ~15 ms/layer-pair,
+  consistent with the corrected ledger once the FP32 return leg (~190 MB/QSA layer at the
+  3.96 GiB/s staggered face ~ 47 ms) is priced and Ruling B's no-attention-halving is applied
+  (the serialized mode pays full wire and saves no attention compute — a loss was the honest
+  expectation; the stepping stone's job was validating the ledger and the machinery, both done:
+  the reduce, publish, catch-up and timeout path all executed end-to-end with zero corruption).
+- **Decode under the flag: 61.6 t/s cached (vs 77-82 baseline, -20%) — the tier displacement
+  (1.89 partner + 1.16 lead GiB) costs decode rows too.** This likely breaches the solo floor
+  (>= 78); the flag therefore STAYS OFF for serving (it is), and the decode cost of the
+  residency joins the pipelined variant's ledger.
+- The engine-exit-on-error contract hole (publish failure killed the engine at scale; wrapper
+  crash-looped on a queued 228k prompt) is FIXED-WORTHY before the flag ever ships: a refusal
+  must fail the request, never the process. Open.
+- What the +10/+20 gates now grade: the pipelined (=2) variant WITH the lead's attention
+  actually halved (option (a) pools, or the kernel taking the KV-head index separately from
+  the query count — the pool-row formula is the only blocker), re-priced with the FP32 return
+  (wire ~47 ms/layer unhidden) and the decode tier cost. Honest band: -20 ms/layer (wire
+  unhidden, loss) to +27 (hidden, ~2,300 t/s). The hiding question - the same rendezvous
+  cadence kimi #4 promoted - is measured on REAL machinery the moment commit 2 lands.
+
 **RUN 23 engine-grade attempt (04:30 UTC) - INCONCLUSIVE, recorded honestly.** Formal A/B on
 the merged binary (reseed on) vs the drafter-tree binary (reseed off, byte-identical), same
 122k prompt + greedy 20k continuation: the reseed leg made 9,000 tok at 51.3 t/s (acc 75%),
