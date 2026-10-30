@@ -89,3 +89,24 @@ it.
   sum it ended with; the rings are compared at the chunk boundary and a disagreement fails the run named). The next
   window either confirms the structural number with a clean run or says "in the pair", which is where the remaining
   hunt lives.
+
+## 7. What `=2` actually changes relative to `=1` — read from the code, not guessed
+
+The depth decision has exactly one source (`peer_qsa_sets()`, `prefill.cpp:3117`, reading `--exp tp_prompt_attn`),
+one stored figure (`PeerQsaSpan::staging_sets`), and one derived mode flag (`qsa.pipeline`, `:2905`). Every reader of
+them, in full:
+
+- **the arm's set indexing** — `part_f32` and `steps` allocation (`:2146`, `:2156`), the pair's `open(…, sets)`
+  (`:2279`), and the eight `pipeline >= 2 ? wire : 0` index sites across publish, arm, finish and the driver's wait
+  (`:2509`, `:2534`, `:2539`, `:2588`, `:2630`, `:2660`, `:2733`, `:4392`); and
+- **the lead's end-of-layer wait**, present at `=1` and absent at `=2` (`:4391`);
+- **two residency figures**, both priced from the same number: the partner's tier carries a second `o_proj` staging
+  set and a second step-count set (~84 MB), and the lead's reserve carries a second collective landing region
+  (~80 MB, `:3304`).
+
+Nothing outside the prompt-attention arm reads the flag, so a `=2`-only corruption is one of exactly those three
+things. That is what makes the tripwire's negative answer informative rather than merely exculpatory: if the rings
+agree on every layer and the tokens still differ, the wait and the set indexing are already accounted for, and what
+is left is the residency delta — the partner's expert tier holding ~84 MB fewer bytes, whose effect is read off the
+chunk line's `qsa_lead_row_us` / `qsa_peer_row_us` and `blob_mb_ms`, which the boot checklist already requires.
+Those three figures should therefore be captured on the SAME boot as the differential, not left for a later window.
