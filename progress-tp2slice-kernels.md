@@ -126,7 +126,19 @@ Two deliberate asymmetries with the lead, both load-bearing:
   chunk's positions to select with (`replay_steps()` in `peer_qsa_span_test` reproduces the corruption and its fix).
 - **it ends at `attn_h`, not at the partial.** The o_proj product needs this card's packed `attn_output` columns,
   which `qsa_pair_prepare` allocates and which arrive with the pair's collective. The product, the BF16 conversion
-  and the reduce to the lead are one unit; splitting them would leave a half-finished reduce on the branch. The
+  and the reduce to the lead are one unit; splitting them would leave a half-finished reduce on the branch.
+
+**THE PAIR AUDITS ITSELF** (`PeerPrefill::Qsa::chk`, the agreement rings). A collective leaves BOTH cards holding the
+sum of the same two partials - each added its own and its peer's, and IEEE addition commutes - so after each layer's
+reduce, `peer_qsa_finish` samples `kTp2Samples` elements of the sum its own card ended with (`tp2_sample_partial`,
+one index rule in `tp2_collective.hpp` shared by the kernel and the host), and the driver compares the two rings at
+the chunk's end beside the existing `timed_out()` read. Exact equality, NaN agreeing with NaN. A pair that disagreed
+is otherwise invisible: like a half reduce or a neighbouring layer's partial, it reaches the model as a plausible
+token with the acceptance at 100%. Now it fails the request and names the QSA layer and the sample. The rings are
+eight floats a layer a card, allocated and priced with the pair rather than through the tier's 68-allocation walk,
+and zeroed at each chunk's start on the streams that fill them - so "sampled on one card only" fails the same way
+rather than agreeing by silence. `tp2_staging_depth`'s last case is its falsifier: one layer summed on one card only
+must be reported, or the whole check is decoration. The
   arm therefore has **no caller yet** - it is wired by the `span_valid` and reduce-to-lead steps, not before.
 
 The attention has no decode fallback, unlike the lead's: that fallback exists for shapes this arm already refused

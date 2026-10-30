@@ -21,3 +21,13 @@ projections, and two protocol replays of the pair - `replay_collective()` for th
 `replay_steps()` for the shipped step counts, each falsified by running the depth it should fail at) and
 `tp2_shard_weights_test` (a weight the pack serves only as a native image can still be
 cut); the attention window's parity case is `qsa_prompt_attn_parity` and needs a card.
+
+The pair's own device tests, both needing two cards and skipping (77) with fewer: `tp2_allreduce_parity` (the
+collective bitwise against `tp2_all_reduce_ref`, the refusals, the microbench line, and now the pair-agreement
+sampler against `tp2_sample_ref` - the engine compares two cards' sampled sums element for element at its chunk
+boundary, so a sampler reading an index the host does not use would make a broken pair look sound) and
+`tp2_staging_depth` (the arm's whole per-layer pair protocol - the publish's rows, the partner's read of them, both
+partials, both reduces - at each gate's depth, the lead running ahead the way the pipelined gate lets it, plus the
+tripwire's falsifier: one layer summed on one card only must be seen or the check is decoration). Its second-set
+case matters because the set-1 region of a `sets` 2 pair had never been touched by a kernel before it: the parity
+test reduces at set 0 only.

@@ -61,7 +61,10 @@ partner's side.
 the staging back, so a rank a layer ahead can overwrite the peer's staging — or republish a wire set — while the
 peer is still reading it. The lead's stream now waits on `ev_out` (the partner's layer is done) before the next
 publish, and the partner's stream waits on `ev_red` (the lead's add is done) before its next push; every wait is
-on work enqueued in an earlier layer, so the chain cannot cycle. That is what *serialized* means here.
+on work enqueued in an earlier layer, so the chain cannot cycle. That is what *serialized* means here — and the
+index of the event it waits on is the *staging* set, not the wire set, on both sides of the wait: recording at
+`ev_out[0]` while waiting on `ev_out[wire]` left every odd layer waiting on an event nothing had recorded, which
+CUDA answers immediately, and half the mode ran pipelined while its boot line said `serialized` (verdict §3).
 
 **COMMIT 2 (the pipelined variant) is landed and unmeasured.** Three moves, one commit each:
 
@@ -92,30 +95,32 @@ on work enqueued in an earlier layer, so the chain cannot cycle. That is what *s
 - **`span_valid` advances with the prompt** (to `p0 + T`, once a sliced chunk's reduce was proved whole), and
   `set_peer_qsa_lead` has a call site, so a second prompt on a decoded session imports its gap.
 
-**What `=2` is predicted to do, per QSA layer — STILL UNMEASURED: the `=2` boots so far died in the gate or in the
-collective race above** (run 25's `=1` decomposition: peer-wait 67.7-80.3 ms, lead attn +13-15 ms over the ~26 ms
-it should cost, 6 QSA layers a stage, two stages):
+**What `=2` was predicted, and what it measured: right about the terms, wrong about the conclusion, and the
+difference is the finding.** Full account in **`progress-tp2slice-verdict.md`**. Short form, from the maintainer's
+own windows: `=1` ~1,833 t/s, `=2` ~1,826 t/s, `=2` peer-wait still 52-66 ms a layer. Buffering the wire bought
+nothing and could not have: the partner's attention of l+1 consumes `mixed_h(l+1)`, which the lead makes in its own
+MoE of l, so the publish of l+1 cannot issue before that completes and the partner's attention and reduce sit on the
+lead's critical path at any staging depth - the pipelined mode overlaps the *transfer*, not the dependency. The
+filed terms (partner attention ~27 ms + reduce ~40 ms, less the lead's halved attention ~23 ms, over 6 QSA layers of
+a 24-layer stage) then reproduce the measured -8.7%: **the cost is the rendezvous, once per QSA layer, structural to
+splitting attention at this pipeline position.** The slice pays only where neither card leads - full TP=2 sharding,
+where the MoE halves too (that file's §4-§5 carry the arithmetic and the decision it hands the owner).
 
-- **peer-wait → toward the wire floor.** The serialized mode paid the partner's whole layer on the lead's stream;
-  =2 waits only on a set two layers back, so the two halves of a layer's attention overlap. Filed as ~47 ms/layer
-  of FP32 wire unhidden (3.96 GiB/s staggered face), ~24 with a BF16 return. If the term does NOT collapse, the
-  suspect is the publish still sitting on `m.cs` — moving it to its own copy stream is the next lever, not built.
-- **lead attn → ~13-15 ms (halved).** The window runs one of two KV groups; the parity case's own microbench says
-  2.00x. The lead's `gate_attn` halves with it; its `attn_q` projection and `split_q`/`rms`/`rope` still cover all
-  24 heads — the next thing worth halving, and not built.
+Two terms from the filed predictions (run 25's `=1` decomposition: peer-wait 67.7-80.3 ms, lead attn +13-15 ms over
+the ~26 ms it should cost, 6 QSA layers a stage, two stages):
+
+- **lead attn → ~13-15 ms (halved), and it did halve.** The window runs one of two KV groups; the parity case's own
+  microbench says 2.00x. The lead's `gate_attn` halves with it; its `attn_q` projection and `split_q`/`rms`/`rope`
+  still cover all 24 heads - the next thing worth halving, and not built.
 - **decode stays the tier's problem**: the flag costs the partner ~2.09 GiB (=1's 2.01 plus the second staging) and
   the lead 116 MiB, and run 25 measured -20% decode for that residency. A prompt-path flag; not for serving.
-- **the two things `=2` summed wrong, and what they read as.** First the pair's collective landing region: one per
-  card, and the collective credits nothing back, so the partner's next push landed in the region the lead's add of
-  the previous layer was still reading (`e0d94223`). Then the **shipped step counts**: `qs.steps` was ONE buffer for
-  the whole prompt, published on a chunk's first QSA layer. The pipelined gate lets the lead begin the next chunk
-  while this card still attends over the last, so the partner selected its blocks - and attended - with the NEXT
-  chunk's positions: a wrong top-k, and a plausible but shifted token stream (`!` to the length cap at `acc=100%`,
-  a fresh concurrent turn at `hit=44.3%` against the usual 76-94). `=1` could not hit it, which is exactly why `=1`
-  read as correct: its end-of-layer wait keeps the lead a layer behind the partner's finish. The step counts are now
-  a set of the wire - published with every layer's other inbound bytes, freed by the same `ev_out`, collapsed to set
-  0 under the serialized gate the way `part_f32` is - and `replay_steps()` falsifies the old shape: one set corrupts
-  at 2 and at 6 layers a chunk, sets of the wire do not, to six chunks deep, and serialized is clean either way.
+- **the two things `=2` summed wrong, and what they read as**: the pair's single collective landing region, and the
+  single shipped step-count set (`e0d94223`, `0db8cc63`). Both put a *neighbour's* bytes into a layer's sum with no
+  error anywhere - step counts meant the partner selected and attended with the NEXT chunk's positions, which read
+  as `!` repeated to the length cap at `acc=100%` and a fresh concurrent turn at `hit=44.3%` against the usual
+  76-94. `=1` could not hit either, and the reason it could not is §3 of the verdict file. Both are now sets of the
+  wire, published with every layer's other inbound bytes and freed by the same `ev_out`; `replay_steps()` and
+  `replay_collective()` falsify the old shapes on the CPU, and `tp2_staging_depth` grades the pair on two cards.
 - **net**: the +10 abort / +20 ship bar grades the per-layer pair against EP+PP-without-the-slice on the same boot;
   the filed `+18/+15 ms` a layer-pair stands as the **no-extra-eviction upper bound**, its instrument (the two row
   rates and `blob_mb_ms`, read before and after the slice on one boot) and the STOP rule are ledger §3.
@@ -130,7 +135,9 @@ it says `serialized` the flag never reached `set_peer`, and the boot is not the 
     grep "peer chunk at token" | head -1        # must read `mmq/p2p peer D/P`, NEVER `no peer -1/0`
 
 The last grep is the one the =2 window needed: `no peer -1/0` means `PeerPrefill` never went live, so every
-partner-held expert row fell to the lead's link and no per-layer term on that line means anything.
+partner-held expert row fell to the lead's link and no per-layer term on that line means anything. (The pair also
+audits itself now - the agreement rings, `PeerPrefill::Qsa::chk`, described with the arm in
+`progress-tp2slice-kernels.md`; a pair that disagrees about what it summed fails the request, naming the layer.)
 
 What boot 3 read off, the first measurement of any of it: staging **20 971 520 floats = 8192 x 2560**, so the
 wire's funded width and the publisher's `rows_max` are one number as its check assumes; **79 MiB** of shard
@@ -280,7 +287,8 @@ headline figures, restated so this file stands alone:
     tier reserve   2.01 GiB int8 (=1)          span 0.96 + wire 0.20 + scratch 0.64 + weights 0.08 + cols 0.04 + gemm 0.09
     =2 adds        +83.9 MiB partner           the second `o_proj` staging set (`staging_sets`), priced by the same walk
     span copy      <= 0.96 GiB per TURN        zero on a fresh prompt; ~254 ms worst case
-    predictions    =1 measured -8.5%            =2 filed: peer-wait -> ~47 ms wire floor, lead attn ~13-15, +BF16 ~24
+    predictions    =1 and =2 measure the SAME (~-8.7%): the cost is the rendezvous, structural under PP=2
+                   (verdict file); the earlier "=1 -8.5%" was a half-pipelined mode, see §3 there
 
 ## 4. What stays closed
 
