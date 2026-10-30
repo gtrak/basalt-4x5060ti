@@ -34,33 +34,29 @@
 
 ## Status of this milestone
 
-**The gate is open at 1.** `--exp tp_prompt_attn=1` arms the prompt-attention slice at `Prefill::set_peer`; 0 (the
-default) leaves the path byte-identical — the flag is read once, on the peer arm's setup, and no other code
-observes it. It is the prompt path's only flag: decode's seam (`qhs_peer_item()`, §4) stays shut.
+**The gate is open at 1 and 2.** `--exp tp_prompt_attn=1` arms the serialized slice, `=2` the pipelined one, both
+at `Prefill::set_peer`; 0 (the default) leaves the path byte-identical — the flag is read once, on the peer arm's
+setup, and no other code observes it. Anything else is refused rather than run as one of them. It is the prompt
+path's only flag: decode's seam (`qhs_peer_item()`, §4) stays shut.
 
 Gates, current: build green under `-j4`; `ctest -L cpu` **68/69** with the count verified at 69 — only the
-pre-existing `expert_multi_test` (no AVX512-VNNI/VBMI here); boundary and stderr checks ok. `:8000` never contacted;
-GPU numbers stay **TODO-for-the-window**.
+pre-existing `expert_multi_test` (no AVX512-VNNI/VBMI here); boundary and stderr checks ok. `:8000` never
+contacted; `=2` numbers stay **TODO-for-the-window**.
 
-**Three gated boots refused, each one step further than the last.** Boots 1 and 2 were pack arithmetic — the
-projections carry no canonical bytes here (native Q6_K images only, all four, every QSA layer), and the pair packed
-`[0, n_layers)` while a stage's table holds only its own layers — both fixed and priced from the pack (ledger §2k).
-Boot 3 brought the pair UP on both stages — every boot line below printed — and died at the FIRST publish of a
-122k-token prompt on both slots: `the publish would not be recorded`, whose only producer is
-`cudaEventRecord(qs.ev_in, cs)`: `ev_in`/`ev_red` lived on the PARTNER's context while the LEAD's stream records
-them (`ev_out`, on the arm's own stream, was the only correct one). Each now lives where it is recorded, every
-record site scopes its card, and both refusals print the CUDA error and the bytes queued (`22cc023e`). The passing
-8-token probe proves less than it looks like: nothing logs that a chunk was sliced, so "the publish works at small
-T" is NOT on the record.
+**Three gated boots refused, each one step further than the last** — pack arithmetic (no canonical bytes; the pair
+packing the whole model rather than the stage), then the event contexts. Boots 1-2 are ledger §2k. Boot 3 brought
+the pair UP on both stages, every boot line below printing, and died at the FIRST publish of a 122k prompt:
+`the publish would not be recorded`, whose only producer is `cudaEventRecord(qs.ev_in, cs)` — `ev_in`/`ev_red`
+lived on the PARTNER's context while the LEAD's stream records them (`ev_out`, on the arm's own stream, was the
+only correct one); each now lives where it is recorded and both refusals print the CUDA error and the bytes queued
+(`22cc023e`). The passing 8-token probe proves less than it looks like: nothing logs that a chunk was sliced.
 
-**LANDED (`b4cc1f70`, `e786401c`): the serialized slice runs.** (a) `peer_qsa_publish()` ships the lead's
-`mixed_h` / `q_idx` / `idx_raw` — and the chunk's step counts once — into the wire set on the LEAD's compute
-stream and records `qs.ev_in`; (b) the lead drives `peer_qsa_layer()` per QSA layer of the stage, at the stage's
-ordinal, wire set alternating, with the partner's card current for its products (cuBLAS wants its own handle's
-card, which nothing had needed to discover while the arm had no caller); (d) `peer_qsa_finish()` multiplies each
-card's gated rows by its OWN packed columns and issues one `tp2_all_reduce()` per rank, on two streams. The gate
-lifts for `--exp tp_prompt_attn=1` and refuses any other value rather than running it as 1. A chunk wider than
-the arm's buffers is not sliced at all, decided once per layer so no layer can half-slice.
+**The serialized slice (`b4cc1f70`, `e786401c`)**: `peer_qsa_publish()` ships the lead's `mixed_h` / `q_idx` /
+`idx_raw` — and the chunk's step counts once — into the wire set on the LEAD's compute stream and records
+`ev_in[wire]`; the lead drives `peer_qsa_layer()` per QSA layer at the stage's ordinal, wire set alternating, the
+partner's card current for its products; `peer_qsa_finish()` multiplies each card's gated rows by its OWN packed
+columns and issues one `tp2_all_reduce()` per rank, on two streams. A chunk wider than the arm's buffers is not
+sliced at all, decided once per layer so no layer can half-slice.
 Funding: `Prefill::lead_qsa_bytes()` prices what the slice takes on the LEAD's card (its side of the pair's
 staging, its packed columns), `generate.cpp` holds it back from each stage lead's tier, and `set_peer` refuses a
 split whose lead side exceeds the pinned symmetric cut by naming both figures. `fits_within` still guards the
@@ -70,28 +66,59 @@ partner's side.
 the staging back, so a rank a layer ahead can overwrite the peer's staging — or republish a wire set — while the
 peer is still reading it. The lead's stream now waits on `ev_out` (the partner's layer is done) before the next
 publish, and the partner's stream waits on `ev_red` (the lead's add is done) before its next push; every wait is
-on work enqueued in an earlier layer, so the chain cannot cycle. That is what *serialized* means here, and why
-only 1 is accepted: the pipelined gate needs a free-ness protocol the reduce currently supplies by sitting in the
-lead's stream.
+on work enqueued in an earlier layer, so the chain cannot cycle. That is what *serialized* means here.
 
-**Three findings the window must read rather than inherit:**
+**COMMIT 2 (the pipelined variant) is landed and unmeasured.** Three moves, one commit each:
+
+- `00d2732a` — **`=2` exists.** The serialized mode's end-of-layer wait was the only thing making the two wire sets
+  and the single staging safe, so the mode now supplies what that wait was supplying: `ev_in`/`ev_out`/`ev_red` are
+  arrays indexed like the wire (`qsa_ord % kWireSets`) — one object cannot describe two layers in flight — and
+  `part_f32` goes to two sets, funded by the same walk that prices the tier (`staging_sets`, read from the flag
+  `set_peer` refuses on, so the reserve and the arm cannot disagree). The lead waits before a publish on the
+  partner's `ev_out` for the layer that last READ that set (two back), and the partner's product for l+1 waits on
+  the lead's add of l-2. **No wait after the arm**: the cards compute a layer's halves at once and meet at the
+  reduce, the one rendezvous the mode keeps. The bring-up line says `pipelined, 2 o_proj staging sets`.
+- `ed7d4d33` — **the lead's attention is halved.** `qsa_prompt_attn_batch` takes a KV-group window (`kvh0`,
+  `groups`): whole groups only, pools and pitch still the model's, so the group index moves the KV rows and the
+  heads that read them together. Ruling B stands — the lead's pools were never narrowed, and option (a) stayed the
+  funded contingency it was. The parity case pins a group's rows bitwise against the whole run's AND every other
+  head's row still holding its sentinel; the microbench line reads **2.00x** for one of two groups.
+- `79fe41e3` — **a refusal fails the request, not the engine.** The arm's guards set
+  `Prefill::prompt_attention_refused()`; the request loop prints `ERR` and stays up (the RAM guard's protocol),
+  while a poisoned context (`cuda_context_poisoned()`: illegal address/instruction, launch failure, assert …) still
+  leaves by `_Exit` whatever refused.
+
+**Findings the window must read rather than inherit:**
 
 - **The reduce leg crosses as FP32, not the ledger's BF16.** `tp2_all_reduce()` pushes `rows x stride` FLOATS, so
   the return leg is **83.9 MB a QSA layer each way** at an 8192-token chunk, not the 41.9 MB §2a files; nothing
-  writes `qs.part_out`. The pair's real traffic is ~190 MB a QSA layer, and the gates must be graded against that
-  — or a BF16 push lands first (a new kernel: parity test plus a microbench line, per AGENTS.md).
-- **The lead's attention is NOT halved by this leg.** Ruling B keeps the lead's pools whole, and the prompt-
-  attention kernel derives a pool row from the head count it is handed (`(page * n_head_kv + kvh) * page_size`),
-  so a 12-head lead run would read the wrong KV rows. The lead keeps every head's attention and gives up half an
-  o_proj while the partner's attention is redundant — which is what the filed -2/-4 prediction was for, and the
-  reason option (a) is the slice-success contingency rather than a free extra.
+  writes `qs.part_out`. The pair's real traffic is ~190 MB a QSA layer, and the gates are graded against that
+  — or a BF16 push lands first (a new kernel: parity test plus a microbench line, per AGENTS.md). Both options are
+  priced in the ledger; the BF16 one is authorized only if the FP32 wire does not hide.
 - **`span_valid` now advances with the prompt** (to `p0 + T`, after a fully sliced chunk's reduce was proved
   whole), and `set_peer_qsa_lead` finally has a call site, so a second prompt on a session that decoded imports
-  its gap instead of refusing. Neither has been executed.
+  its gap instead of refusing.
 
-**The boot lines that say the slice is on** (`--exp tp_prompt_attn=1`; both must print, or the boot is not it):
+**What `=2` is predicted to do, per QSA layer, before the boot** (run 25's decomposition as the baseline: peer-wait
+67.7-80.3 ms, lead attn +13-15 ms over the ~26 ms it should cost, 6 QSA layers a stage, two stages):
 
-    grep "peer prompt-attention pair CUDA"     # pair open, staging floats, columns on both cards, N QSA layers
+- **peer-wait → toward the wire floor.** The serialized mode paid the partner's whole layer on the lead's stream;
+  =2 waits only on a set two layers back, so the two halves of a layer's attention overlap and the residue is the
+  reduce's own spin plus the wire the publisher leaves on the lead's stream. Filed as ~47 ms/layer of FP32 wire
+  unhidden (3.96 GiB/s staggered face), ~24 with a BF16 return. If the term does NOT collapse, the suspect is the
+  publish still sitting on `m.cs` — moving it to its own copy stream is the next lever and is not built.
+- **lead attn → ~13-15 ms (halved).** The window runs one of two KV groups; the parity case's own microbench says
+  2.00x for one of two groups. The lead's `gate_attn` halves with it; its `attn_q` projection and `split_q`/`rms`/
+  `rope` still cover all 24 heads — the next thing worth halving, and not built.
+- **decode stays the tier's problem**: the flag costs the partner ~2.09 GiB (=1's 2.01 plus the second staging) and
+  the lead 116 MiB, and run 25 measured -20% decode for that residency. A prompt-path flag; not for serving.
+- **net**: the +10 abort / +20 ship bar grades the per-layer pair against EP+PP-without-the-slice on the same boot.
+  Honest band from run 25's numbers: the -8.5% of `=1` recovers by roughly one attention time per QSA layer; a
+  second loss means the wire did not hide, and then the BF16 return leg is the decision.
+
+**The boot lines that say the slice is on** (both modes print these; the first must say `pipelined` for `=2`):
+
+    grep "peer prompt-attention pair CUDA"     # pair open, staging floats, columns, heads, MODE and staging sets
     grep "peer prompt-attention arm, lead card" # the lead's reserve, the split, and the chunk ceiling
     grep "peer prompt-attention arm:"           # the shard projections copied resident on the partner card
 
@@ -99,10 +126,6 @@ What boot 3 read off, the first measurement of any of it: staging **20 971 520 f
 wire's funded width and the publisher's `rows_max` are one number as its check assumes; **79 MiB** of shard
 projections per partner (the ledger's 80.0 MiB truncated); **116 MiB** off each stage lead's tier. The partner's
 card delta is not that — the gate-off boot also differed in its RAM split — so ~2.01 GiB stays arithmetic.
-
-**Why the reduce was never allowed ahead of (a)+(b)**: `tp2_add_wait` spins, gives up, and returns leaving the
-buffer a HALF sum while the collective still reported success — RUN 17's class, caught at the wrapper
-(`b34904ba`) but only late.
 ## 0. Rulings taken mid-run (the supervisor's, applied to this file)
 **Branch doctrine (supervisor):** *cases unrun are cases that have not passed.* A GPU-labelled test that
 has never executed is not evidence. Adopted after the first execution of `tp2_head_split_parity`
@@ -163,41 +186,23 @@ The q-source is stated explicitly because everything downstream grades against i
 the peer's own projections of the lead's FP16 mixed rows**; the lead ships its indexer projections
 rather than the peer recomputing those, so the selection stays the lead's.
 
-## 2c. Item (1) landed: the span is SIZED, and the sizer corrects my hand estimate
+## 2c. The span is SIZED, by the walk that allocates it
 
 `Prefill::PeerQsaSpan` (`include/basalt/prefill/prefill.hpp`, implemented beside `Prefill::peer_bytes`) prices
-what the partner's card must hold resident for its half of the attention. One `Alloc` count walk produces both
-the reserve and, later, the carve, so the tier cannot be sized for a different amount than `set_peer`
-allocates. `peer_bytes` takes an optional `const PeerQsaSpan*` and the call sites now pass one
-(`peer_prompt_bytes` / `pair_prompt_bytes`, generate.cpp), so the partner's tier leaves the room; the lead card's
-side of the same arithmetic is `Prefill::lead_qsa_bytes`, held back from each stage lead's tier beside the windows.
+what the partner's card must hold resident for its half of the attention. One count walk produces both the reserve
+and, later, the carve, so the tier cannot be sized for a different amount than `set_peer` allocates; `peer_bytes`
+takes the span and the call sites pass one (`peer_prompt_bytes` / `pair_prompt_bytes`, generate.cpp), and the lead
+card's side of the same arithmetic is `Prefill::lead_qsa_bytes`.
 
-Pinned by `tests/cuda/peer_qsa_span_test.cpp` (CPU-labelled, no device touched), which prints what it measures:
+Pinned by `tests/cuda/peer_qsa_span_test.cpp` (CPU-labelled, no device touched), which prints what it measures and
+asserts the units explicitly — the wire figures are 10^6 bytes and the tier figures 2^30, so a future comparison
+cannot silently mix them. **The current figures are the ledger's §2k** (span 0.96 + wire 0.20 + scratch 0.64 +
+weights 0.08 + columns 0.04 + gemm 0.09 = **~2.01 GiB int8** at `--kv int8`, plus 83.9 MiB for the pipelined
+second staging set); the 1.2 / 1.58 GiB this section first filed are superseded there, and their lesson stands:
+the reserve is span **+ wire + the partner's own scratch**, never the span alone.
 
-    wire   104.9 MB a QSA layer           (the filed 104.8, confirmed -- and it does NOT shrink with the split)
-    span   1.69 GiB fp16 / 0.96 GiB int8  6 QSA layers of KV + indexer pooled, at 262144 cells
-    total  1.58 GiB int8                  span + wire + the partner's per-chunk scratch
-
-Three things this settles, each of which was an estimate before:
-
-- **My 1.006 GiB was high; 0.96 GiB is the sizer's number.** I priced int8 K at "~1 B + per-64 scales" by hand
-  and the layout is slightly tighter. **0.96 GiB int8 supersedes 1.006 everywhere in this file**, including in
-  §2b's catch-up arithmetic -- the supervisor's adoption of my figure stands as to method (per turn, indexed
-  by `span_valid`, KV *and* V, indexer table included) but the byte count is now the sizer's, not mine. The
-  span catch-up moves the same 0.96 GiB at full staleness, so §2b's ~254 ms is a hair pessimistic; it stays
-  as the filed number until the window measures the copy.
-- **The tier cost of the slice is 1.58 GiB, not 1.2 GiB.** Ruling B was taken on 1.2 GiB (~7.6% of the
-  15.8 GiB half-depth carve). The honest reserve is span + wire + scratch = **1.58 GiB, ~10% of the carve**,
-  because the partner also needs the wire's staging and its own shard-width attention scratch (0.55 GiB at
-  an 8192-token chunk, which the split halves -- a 16-head partner prices 0.63 GiB). Restated here rather
-  than discovered at a boot.
-- **Units, because the ledger mixed them:** the wire figures are 10^6 bytes, the tier figures 2^30. The test
-  asserts both explicitly so a future comparison cannot silently mix them; the filed 104.8 MB wire and the
-  ~1 GiB span were always consistent.
-
-Also checked, because the share flags make it live: an uneven cut (`qsa_lead_heads` at the fired falsifier's
-2.61 / 0.98 ratio puts 16 heads on the partner) is still priced, its scratch grows with its heads, and a
-cut straddling a KV group is *priced* but refused for the kernels by `qsa_shard_whole_groups` -- sizing is not
+Also checked, because the share flags make it live: an uneven cut is priced, its scratch grows with its heads, and
+a cut straddling a KV group is *priced* but refused for the kernels by `qsa_shard_whole_groups` — sizing is not
 where a bad ratio gets silently dropped.
 
 ## 2b. The span catch-up, priced per TURN (P3, with the correction applied)
@@ -245,23 +250,17 @@ If that measured term eats the margin, the P3 fallback verdict stands as filed: 
 slice cannot pay on this fabric, and peer-reads-the-lead's-pool-over-P2P is not the escape — ~50 GB a chunk
 (cap 2048 x 256 dim x 2 B x 8192 queries) and dead.
 
-## Item (2) so far: the arm's container, allocated by the sizing walk itself
+## The arm's container, allocated by the sizing walk itself
 
 `PeerPrefill::Qsa`: the partner's per-QSA-layer `QsaState` array, two wire sets, its shard-width scratch, its
 resident projection pointers, its **own** `Gemm` (ruled: `Gemm::native` dequantizes on the device the product runs
-on, so the lead's scratch and cuBLAS workspace cannot cross the link), and its own stream with an `ev_in`/
-`ev_out` pair — the event-not-sync shape the ruling asked for, matching RUN 19's early transport.
+on, so the lead's scratch and cuBLAS workspace cannot cross the link), its stream, and its per-set events.
 
 **The anti-drift property, which is the point of this unit:** the buffers are laid out by ONE function,
 `peer_qsa_layout`, and both callers drive it with a different `take` — `make_peer` with `cudaMalloc`, and
 `Prefill::PeerQsaSpan::bytes()` with a counting no-op. The tier's reserve and the allocation are therefore the
-same code, not two ledgers kept in step by hand, and the states are carved with `qsa_prompt_state_carve` over an
-allocation of `qsa_prompt_state_bytes`, so the pools cannot come out a different width than the tier was shrunk by.
-
-**The arm today:** its o_proj product lives in `peer_qsa_finish()`, beside the pair's collective, since both need
-the packed columns. The head-split audit is closed: `split_q`, `gate_attn`, `kv_append` fixed; the selection
-kernels cleared. Still unexecuted: the pair opening across two physical GPUs, the publish landing, the reduce
-summing and the chunk-line verdicts — **TODO-for-the-window**, refused rather than degraded.
+same code, not two ledgers kept in step by hand — which is also why the pipelined second staging set is pinned by
+allocation COUNT in the sizing test, not only in bytes.
 
 ## Building this tree after a reboot
 
@@ -286,15 +285,16 @@ every hardcoded head count found, fixed and parity-tested — are in **`progress
 headline figures, restated so this file stands alone:
 
     wire traffic   104.9 MB in a QSA layer    what the +10/+20 gates grade; the RETURN leg is FP32 today (83.9 MB)
-    tier reserve   2.01 GiB int8               span 0.96 + wire 0.20 + scratch 0.64 + weights 0.08 + cols 0.04 + gemm 0.09
+    tier reserve   2.01 GiB int8 (=1)          span 0.96 + wire 0.20 + scratch 0.64 + weights 0.08 + cols 0.04 + gemm 0.09
+    =2 adds        +83.9 MiB partner           the second `o_proj` staging set (`staging_sets`), priced by the same walk
     span copy      <= 0.96 GiB per TURN        zero on a fresh prompt; ~254 ms worst case
-    predictions    serialized -2/-4 ms         pipelined +18/+15 ms as an UPPER BOUND (no-extra-eviction)
+    predictions    =1 measured -8.5%            =2 filed: peer-wait -> ~47 ms wire floor, lead attn ~13-15, +BF16 ~24
 
 ## 4. What stays closed
 
-`--exp tp_prompt_attn` accepts **1 (serialized) only**; any other value is refused at `Prefill::set_peer` rather
-than run as 1, because the operator would read the resulting number as the pipelined one. The pipelined `=2` is
-the next commit and needs the free-ness protocol the reduce currently supplies by being in the lead's stream.
-`qhs_peer_item()` (`src/core/verify.cpp`) still returns false: that is decode's window item, supposed to stay
-false for this milestone, and `--exp decode_headsplit=1` still refuses. Decode's paths — `qhs_peer_item`, the
-peer window, `dm_peer_kernel` — are untouched by this slice. None of the slice has been executed on a card.
+`--exp tp_prompt_attn` accepts **1 (serialized) and 2 (pipelined)**; anything else is refused at
+`Prefill::set_peer` rather than run as one of them, because the operator would read the resulting number as the
+mode they did not ask for. `qhs_peer_item()` (`src/core/verify.cpp`) still returns false: that is decode's window
+item, supposed to stay false for this milestone, and `--exp decode_headsplit=1` still refuses. Decode's paths —
+`qhs_peer_item`, the peer window, `dm_peer_kernel` — are untouched by this slice and by commit 2's kernel window
+(the prompt-attention kernel has no decode caller).

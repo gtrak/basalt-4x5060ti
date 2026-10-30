@@ -112,9 +112,21 @@ The tier figure, one honest number, int8 shipped boot (`--kv int8`, 262144 cells
     weights  0.08 GiB   resident projections, Q6_K rows - the pack's own figures, re-read in §2k
     gemm     0.09 GiB   the partner's own dequant scratch + cuBLAS workspace
     TOTAL    2.01 GiB   ~12.7% of the 15.8 GiB half-depth carve
+    =2 adds  0.08 GiB   a SECOND `o_proj` staging set (rows x n_embd x FP32, 83.9 MiB) - the pipelined gate's price
 
-1.77 GiB is the figure with the projections unpriced (the test's default, pack not consulted). **The boot prints
-this total**, since the projection term is the only one that depends on the quantization type — §2k has the answer.
+1.77 GiB is the figure with the projections unpriced (the test's default, pack not consulted), so the boot prints
+the total: the projection term is the only one that depends on the quantization type (§2k). The second staging is
+pinned by allocation COUNT as well as bytes, because an arm allocating what the tier did not price is an allocation
+failure at the first gated prompt rather than a slower boot.
+
+**The return leg, both options priced** (8192-token chunk, the 3.96 GiB/s staggered face the run-25 numbers use):
+
+    FP32 (today)   83.9 MB each way per QSA layer  ~47 ms a layer of wire, unhidden on the lead's stream
+    BF16 (option)  41.9 MB each way               ~24 ms, halving the term - `qs.part_out[2]` already exists for it
+
+The BF16 leg is a new kernel: parity test plus a microbench line per AGENTS.md, and `Gemm` has no BF16-output entry
+point, so it needs its own conversion after the product. It is authorized only if the FP32 wire does not hide under
+`=2` — the measure decides, not the arithmetic.
 
 ## 2f. A funding bug the single walk did not prevent, and what now prevents it
 
@@ -177,57 +189,30 @@ test the arithmetic, which is why it reports MiB.
 
 Graded against the task's dual rule on the same boot, vs EP+PP without the slice.
 
-**Commit 1 — serialized reduce-to-lead (`--exp tp_prompt_attn=1`).** The 26.5 ms of wire sits on
-the critical path beside the 27.2 ms of attention compute it removes.
+**Commit 1 — serialized (`=1`) — MEASURED, TP2PP2-NOTES run 25: 1,833 t/s against the 2,004 baseline, -8.5%**
+(≈ -15 ms a layer-pair, against the `-2/-4` filed here). The filed figure was optimistic in the way this file had
+already warned about: Ruling B left the lead's attention whole (no compute removed) and the return leg is FP32, so
+the mode paid full wire for nothing. The machinery it validated is the reason it was built.
 
-    predicted net, stage A: -2 ms/layer-pair   (90% CI roughly [-12, +6])
-    predicted net, stage B: -4 ms/layer-pair
+**Commit 2 — pipelined (`=2`), re-filed on run 25's own decomposition** (peer-wait 67.7-80.3 ms, lead attn +13-15
+ms over its ~26 ms, 6 QSA layers a stage): the lead's attention halves (the kernel's own microbench: 2.00x for one
+of two groups) and the peer-wait collapses toward the wire the publisher leaves on the lead's stream — ~47 ms a
+layer of FP32 wire, ~24 with a BF16 return. The inbound legs move under layer l's ~92.6 ms of MoE, which is where
+the hiding was always supposed to happen.
 
-**Prediction: commit 1 lands below the +10 ms kill gate.** It is being built for correctness and
-parity, exactly as directed, not as a candidate to ship.
-
-**Commit 2 — pipelined (`--exp tp_prompt_attn=2`).** The inbound legs move under layer l's
-~92.6 ms MoE compute. They fit with room (26.5 ms of wire under 92.6 ms of cover), so the
-transfer should largely disappear and the 27.2 ms of saved lead attention should mostly land.
-
-    predicted net, stage A: +18 ms/layer-pair   (90% CI roughly [+6, +26])
+    predicted net, stage A: +18 ms/layer-pair   (90% CI roughly [+6, +26])   no-extra-eviction case: an UPPER BOUND
     predicted net, stage B: +15 ms/layer-pair
 
-**Prediction: commit 2 clears +10 ms but does not reach the +20 ms ship bar** — the residual is
-the peer's own attention kernel, which the ledger does not remove from the pair, only relocate,
-plus the reduce-to-lead the pipeline cannot hide at the last layer.
+**Prediction: `=2` clears +10 ms but does not reach +20** — the residual is the peer's own attention kernel, which
+the ledger relocates rather than removes, plus the reduce the pipeline cannot hide at the last layer of a chunk.
 
-### 3a. The re-based predictions: what the extra tier shrink does to them
-
-The `+18/+15` above was taken while the slice's tier cost was believed to be **1.2 GiB (7.6% of the 15.8 GiB
-half-depth carve)**. It is **1.67 GiB (~10.6%)**: span 0.96 + wire 0.21 + scratch 0.55. The traffic the
-predictions are built on is unchanged (104.8 MB a layer, both modes), so the re-basing touches only the
-expert-residency term, and that term is the one the window measures rather than the one this file models:
-
-- The shrink is ~0.47 GiB deeper into the partner's expert tier. Experts evicted from that tier stop being
-  tier hits and become streamed rows, which raises the **partner's per-row time** — the quantity the share-v2
-  model prices with `qsa_peer_row_us`, and the quantity the fired falsifier read at **0.98 us/visit** against
-  the lead's **2.61**. The slice's gain is proportional to that asymmetry, so a shrink that pushes the partner's
-  row rate up moves the net down directly, not secondarily.
-- **No fabricated number for it.** The cost depends on how many of the partner's tier experts the eviction
-  displaces at this boot's placement, which is a per-boot fact this file cannot price. So the prediction is
-  re-filed as a **bounded statement, not a point**: the `+18/+15` stands as the **no-extra-eviction** case,
-  and it is an **upper bound**. The window's falsifier re-read — `qsa_lead_row_us` / `qsa_peer_row_us` and
-  `blob_mb_ms` read **after** the slice is resident, against the same boot's pre-slice values — is the
-  instrument that prices the difference.
-- **What to read at the window, per boot:** the two row rates and `blob_mb_ms` before and after the slice, plus
-  the chunk line's span-copy fields (`span_valid`, cells copied, copy wall). If the partner's row rate rises and
-  the net lands under +10 ms, **the honest verdict is STOP with the eviction cost named as the cause**, per the
-  ratified kill criterion — not a re-tune of `qsa_ratio_stage_*` to recover the margin, and not a re-basing of
-  the bar. Per the ruling: if the measured net misses the ship bar because of the extra shrink, that is the
-  number.
-- The **serialized (`=1`) prediction of `-2/-4` ms is unaffected**: it is dominated by the 26.5 ms of wire on
-  the critical path, which the tier change does not move.
-- The **turn-start span copy is a separate term** from both (§2b), and it is unaffected by the doubling: it is
-  a per-turn move of at most the 0.96 GiB span, not a per-layer one.
-
-If commit 2 measures under +10 ms/layer-pair, **STOP and re-plan** per the ratified kill criterion.
-I will report the number as measured; it will not be tuned to pass.
+The bound's condition is the tier, not the wire: the slice's ~2.09 GiB of partner residency (§2e, §2k) pushes
+experts out of its tier, streamed rows rise, and the partner's per-row rate — the quantity the gain is
+proportional to — rises with them. No fabricated number for that: read `qsa_lead_row_us` / `qsa_peer_row_us` and
+`blob_mb_ms` before and after the slice on the same boot, plus the chunk line's span-copy fields. If the partner's
+row rate rises and the net lands under +10 ms, the verdict is **STOP with the eviction cost named**, not a re-tune
+of `qsa_ratio_stage_*` and not a re-basing of the bar. If `=2` measures under +10 ms, STOP and re-plan; the number
+gets reported as measured.
 
 ## 5. Landed earlier in the milestone
 
