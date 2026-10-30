@@ -33,22 +33,13 @@
 // relative error are what a mis-sliced stride would blow up by orders of magnitude, which is the point of it.
 //
 // BUILD (deliberately not a CMake target: this is a probe, not a shipped artifact). The ggml format table is C,
-// so it is compiled by the host C compiler and linked in:
+// so it is compiled by the host C compiler and linked in. The flags are the ones CMake gives the `mmq` target.
+// moe_mmq.cu's switch names every instantiated format, so every instance in src/prefill/mmq/instances/ links:
 //   cd /home/gary/opt/basalt-tpstep0
 //   gcc -O2 -c src/kernels/cpu/ggml/ggml_quants.c -Iinclude -Isrc/kernels/cpu/ggml -o /tmp/ggml_quants.o
-//   /usr/local/cuda/bin/nvcc -O3 -std=c++17 -arch=sm_120 --extended-lambda -use_fast_math \
-//     -Iinclude -Isrc/prefill -o /tmp/mmq_width_probe tools/mmq_width_probe.cu \
-//     src/prefill/moe_mmq.cu src/prefill/mmq/mmq_host.cu src/prefill/mmq/quantize.cu \
-//     src/prefill/mmq/instances/mmq_q2_0.cu src/prefill/mmq/instances/mmq_q8_0.cu \
-//     src/prefill/mmq/instances/mmq_q5_1.cu src/prefill/mmq/instances/mmq_q4_k.cu \
-//     src/prefill/mmq/instances/mmq_q5_k.cu src/prefill/mmq/instances/mmq_q6_k.cu \
-//     src/prefill/mmq/instances/mmq_iq2_xxs.cu src/prefill/mmq/instances/mmq_iq2_xs.cu \
-//     src/prefill/mmq/instances/mmq_iq2_s.cu src/prefill/mmq/instances/mmq_iq3_xxs.cu \
-//     src/prefill/mmq/instances/mmq_iq3_s.cu src/prefill/mmq/instances/mmq_iq4_nl.cu \
-//     src/prefill/mmq/instances/mmq_iq4_xs.cu src/prefill/mmq/instances/mmq_nvfp4.cu \
-//     /tmp/ggml_quants.o -lcudart
-// (moe_mmq.cu's switch names every instantiated format, so every instance links; the minutes are MMQ's templates,
-// not this file. The flags are the ones CMake gives the `mmq` target: -O3, --extended-lambda, -use_fast_math.)
+//   MMQ='src/prefill/moe_mmq.cu src/prefill/mmq/mmq_host.cu src/prefill/mmq/quantize.cu src/prefill/mmq/instances/*.cu'
+//   nvcc -O3 -std=c++17 -arch=sm_120 --extended-lambda -use_fast_math -Iinclude -Isrc/prefill -o /tmp/mmq_width_probe tools/mmq_width_probe.cu $MMQ /tmp/ggml_quants.o -lcudart
+// The minutes of that build are MMQ's templates, not this file.
 //
 // RUN
 //   /tmp/mmq_width_probe --sweep --parity                                   # the decision run
@@ -97,12 +88,6 @@ bool fail(cudaError_t e, const char* what) {
     if (e == cudaSuccess) return true;
     std::fprintf(stderr, "mmq probe: %s: %s\n", what, cudaGetErrorString(e));
     return false;
-}
-
-double median(std::vector<double> v) {
-    if (v.empty()) return 0.0;
-    std::sort(v.begin(), v.end());
-    return v[v.size() / 2];   // --reps is odd, so the median is one of the samples
 }
 
 struct Point {
@@ -285,16 +270,14 @@ bool run_point(mmq::Context& ctx, const Point& p, int dev, size_t budget, bool a
         per_row.push_back((double) ms * 1e6 / (double) p.rows);
     }
     if (ok) {
-        const double ns = median(per_row);
-        const std::vector<double> sorted = per_row;
-        std::vector<double> srt = sorted;
-        std::sort(srt.begin(), srt.end());
+        std::sort(per_row.begin(), per_row.end());   // one sort: the median is the middle sample, the ends the spread
+        const double ns = per_row[per_row.size() / 2];
         const double wt = (double) pr.expert_bytes * p.experts;
         const double act = (double) mmq::q8_bytes(p.rows, p.k);
         const double flops = 2.0 * (double) p.rows * (double) p.n * (double) p.k * p.experts;
         std::printf("  RESULT N=%lld T=%lld experts=%d: median %.1f ns/row (min %.1f, max %.1f), weights %.1f MiB "
                     "-> %.2f GiB/s, q8 %.1f MiB -> %.2f GiB/s, %.2f TFLOP/s\n",
-                    (long long) p.n, (long long) p.rows, p.experts, ns, srt.front(), srt.back(),
+                    (long long) p.n, (long long) p.rows, p.experts, ns, per_row.front(), per_row.back(),
                     wt / (1024.0 * 1024.0), wt / (ns * 1e-9) / (1024.0 * 1024.0),
                     act / (1024.0 * 1024.0), act / (ns * 1e-9) / (1024.0 * 1024.0),
                     flops / (ns * 1e-9) / 1e12);

@@ -16,40 +16,34 @@ for a group's gate/up, with the engine's `mmq::quantize` for the q8_1 activation
 `mmq::Context` for the stream-k scratch pool. `nm` confirms the engine's kernel is what is in the binary: 112
 `launch_mul_mat_q<(ggml_type)40, ...>` instantiations (NVFP4), 6090 `mul_mat_q` symbols overall.
 
-Reproduce the build (the `mmq` target's own flags; the ggml format table is C so the host C compiler builds it):
+Reproduce the build (the `mmq` target's own flags; the ggml format table is C so the host C compiler builds it, and
+`moe_mmq.cu`'s switch names every instantiated format so all fourteen instances are required):
 
     cd /home/gary/opt/basalt-tpstep0
     gcc -O2 -c src/kernels/cpu/ggml/ggml_quants.c -Iinclude -Isrc/kernels/cpu/ggml -o /tmp/ggml_quants.o
-    /usr/local/cuda/bin/nvcc -O3 -std=c++17 -arch=sm_120 --extended-lambda -use_fast_math \
-      -Iinclude -Isrc/prefill -o /tmp/mmq_width_probe tools/mmq_width_probe.cu \
-      src/prefill/moe_mmq.cu src/prefill/mmq/mmq_host.cu src/prefill/mmq/quantize.cu \
-      src/prefill/mmq/instances/mmq_q2_0.cu src/prefill/mmq/instances/mmq_q8_0.cu \
-      src/prefill/mmq/instances/mmq_q5_1.cu src/prefill/mmq/instances/mmq_q4_k.cu \
-      src/prefill/mmq/instances/mmq_q5_k.cu src/prefill/mmq/instances/mmq_q6_k.cu \
-      src/prefill/mmq/instances/mmq_iq2_xxs.cu src/prefill/mmq/instances/mmq_iq2_xs.cu \
-      src/prefill/mmq/instances/mmq_iq2_s.cu src/prefill/mmq/instances/mmq_iq3_xxs.cu \
-      src/prefill/mmq/instances/mmq_iq3_s.cu src/prefill/mmq/instances/mmq_iq4_nl.cu \
-      src/prefill/mmq/instances/mmq_iq4_xs.cu src/prefill/mmq/instances/mmq_nvfp4.cu \
-      /tmp/ggml_quants.o -lcudart
+    MMQ='src/prefill/moe_mmq.cu src/prefill/mmq/mmq_host.cu src/prefill/mmq/quantize.cu src/prefill/mmq/instances/*.cu'
+    nvcc -O3 -std=c++17 -arch=sm_120 --extended-lambda -use_fast_math -Iinclude -Isrc/prefill -o /tmp/mmq_width_probe tools/mmq_width_probe.cu $MMQ /tmp/ggml_quants.o -lcudart
 
-Verified: that command links clean (4m01s; `moe_mmq.cu`'s switch names every instantiated format, so all fourteen
-instances are required). `./tools/check_platform_boundary.sh` and `./tools/check_stderr_logging.sh` both pass with
-the file present.
+Verified: that command builds clean from a bare tree (4m01s the first time; the minutes are MMQ's templates) and,
+with `-Xcompiler -Wall,-Wextra`, this file compiles without a warning of its own. `./tools/check_platform_boundary.sh`
+and `./tools/check_stderr_logging.sh` both pass with it present.
 
 ### CPU-side findings (measured without a GPU)
 
 The tile config is a host-side table, so `--layout` answers the block-layout and byte questions with no CUDA call
-at all. NVFP4 on this path always lands on `I=128, nthreads=256, sram_layout=2 (Q3_K), K_vram=256, stream_k=1`;
-the only thing that varies across the grid is `nty = ceil(N/128)` and `ntx = ceil(T/J)`:
+at all - `strace` on that path opens no card node, which is how this section is written without a GPU window. It
+takes `--smpbo`/`--nsm` if you have them (the sweep itself prints them from the card); without them it prints every
+tile candidate. NVFP4 on this path takes `I=128, nthreads=256, sram_layout=2 (Q3_K), K_vram=256, stream_k=1` at
+every candidate, and the only thing that varies across the grid is `nty = ceil(N/128)` and `ntx = ceil(T/J)`:
 
-| N | K | T | weights B/expert | q8 B | dst B | one-card footprint | J | ntx x nty |
+| N | K | T | weights B/expert | q8 B | dst B | one-card footprint | shared B at J=128 | ntx x nty |
 |---|---|---|---|---|---|---|---|---|
-| 2560 | 2560 | 2048 | 3 686 400 | 5 916 672 | 20 971 520 | 49 MiB | 128 | 16 x 20 |
-| 1280 | 2560 | 2048 | 1 843 200 | 5 916 672 | 10 485 760 | 37 MiB | 128 | 16 x 10 |
-| 640 | 2560 | 2048 | 921 600 | 5 916 672 | 5 242 880 | 31 MiB | 128 | 16 x 5 |
-| 2560 | 2560 | 8192 | 3 686 400 | 23 611 392 | 83 886 080 | 186 MiB | 128 | 64 x 20 |
-| 1280 | 2560 | 8192 | 1 843 200 | 23 611 392 | 41 943 040 | 144 MiB | 128 | 64 x 10 |
-| 640 | 2560 | 8192 | 921 600 | 23 611 392 | 20 971 520 | 123 MiB | 128 | 64 x 5 |
+| 2560 | 2560 | 2048 | 3 686 400 | 5 916 672 | 20 971 520 | 49 MiB | 61 952 | 16 x 20 |
+| 1280 | 2560 | 2048 | 1 843 200 | 5 916 672 | 10 485 760 | 37 MiB | 61 952 | 16 x 10 |
+| 640 | 2560 | 2048 | 921 600 | 5 916 672 | 5 242 880 | 31 MiB | 61 952 | 16 x 5 |
+| 2560 | 2560 | 8192 | 3 686 400 | 23 611 392 | 83 886 080 | 186 MiB | 61 952 | 64 x 20 |
+| 1280 | 2560 | 8192 | 1 843 200 | 23 611 392 | 41 943 040 | 144 MiB | 61 952 | 64 x 10 |
+| 640 | 2560 | 8192 | 921 600 | 23 611 392 | 20 971 520 | 123 MiB | 61 952 | 64 x 5 |
 
 Three things follow, before any timing:
 
