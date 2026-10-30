@@ -143,8 +143,24 @@ must be reported, or the whole check is decoration.
 What it reads like when it fires (the string to grep a window log for): `the prompt-attention pair disagreed about
 what it summed at QSA layer N, sample K`. It refuses the request and disarms the pair for the next prompt, like the
 chunk's other collective verdicts; a run that says this has localized the corruption to the pair, and a `=2` run that
-emits tokens without saying it has not. The
-  arm therefore has **no caller yet** - it is wired by the `span_valid` and reduce-to-lead steps, not before.
+emits tokens without saying it has not.
+
+**WHAT THAT SILENCE DOES NOT MEAN** (the chain, `include/basalt/kernels/qsa_chain.hpp`). The rings compare what the
+two cards ended up holding, and each card ends up holding `own + peer` - so a partner that attended on the wrong KV,
+or on another chunk's step counts, or on rows the lead overwrote early, leaves both cards holding the SAME wrong sum
+and agreeing element for element. The check is blind by construction to a wrong input, which is the shape the
+window's `!`-to-the-cap run had. The chain is the asymmetric read: `--exp qsa_dump_chain=1` fingerprints every
+component of a sliced layer on the stream that produced it - `mix`/`steps`/`sel`/`kpool`/`vpool`/`attn`/`gated`/`bo`
+from the lead in every mode (so a gate-off boot is a reference), `pub`/`stepsr`/`qidxr`/`idxraw`/`kspan`/`vspan`/`q`/
+`selr`/`attnp`/`gatedp`/`partp`/`sump` from the partner, `partl`/`suml` from the lead - and prints one line per card
+per layer, indexed by MODEL layer. Lead `mix` against peer `pub` is the read on a stale wire set; `steps` against
+`stepsr` on the shipped-positions class; `kspan`/`vspan` against the lead's `kpool`/`vpool` on the import, the one
+path whose in-context form has never been validated end to end. `--------` is a slot nobody recorded, which is an
+answer rather than a gap, and is why both arrays are cleared to the sentinel per chunk. Three boots of one prompt,
+three chains, one diff: see `progress-tp2slice-verdict.md` §8 for the commands and what each divergence shape means.
+The fingerprint is one block per component with a fixed reduction tree, not an atomic, because a sum in a
+schedule-dependent order would print different figures every boot and be read as corruption; `qsa_chain_parity` grades
+it against `qsa_chain_ref`, the host rule in the same header, at the arm's real widths.
 
 The attention has no decode fallback, unlike the lead's: that fallback exists for shapes this arm already refused
 above, and it would need scratch the walk does not fund. A refusal there is an error naming itself, not a slow path.

@@ -31,3 +31,16 @@ partials, both reduces - at each gate's depth, the lead running ahead the way th
 tripwire's falsifier: one layer summed on one card only must be seen or the check is decoration). Its second-set
 case matters because the set-1 region of a `sets` 2 pair had never been touched by a kernel before it: the parity
 test reduces at set 0 only.
+
+The chain's own test needs one card, not two, and skips (77) with none: `qsa_chain_parity` grades the fingerprint
+kernel against `qsa_chain_ref` - the host rule in the same header the kernel includes - at the widths the arm really
+presents (mixed rows at 2560 columns, 24-head and 12-head attention, a chunk's step counts), bitwise on hash, sum
+and max-abs, and then the things a fingerprint must be sensitive to that a test can only ask for: one bit flipped, two
+rows swapped, one row's columns rotated, a NaN in the window, a row the sampled window does not select (which must be
+invisible - the case asks the rule which rows it selects rather than assuming, and caught its author guessing wrong).
+Its cost line is the instrument's price in a boot: ~48 us per component at the widest shape, launch cost, so a
+sliced layer pays a few tenths of a millisecond per card and a chunk pays what a debug flag should but a default must
+not. It caught its own harness before landing: the first draft copied its windows on the legacy stream and recorded
+on a non-blocking one, so the kernel read the previous shape's bytes and correctly disagreed with a reference
+computed from bytes still in flight. That is the instrument's contract in miniature - it fingerprints what a STREAM
+has written - and the engine meets it because every component it records is produced on the stream it records onto.

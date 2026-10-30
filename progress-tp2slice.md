@@ -133,11 +133,12 @@ it says `serialized` the flag never reached `set_peer`, and the boot is not the 
     grep "peer prompt-attention arm, lead card" # the lead's reserve, the split, and the chunk ceiling
     grep "peer prompt-attention arm:"           # the shard projections copied resident on the partner card
     grep "peer chunk at token" | head -1        # must read `mmq/p2p peer D/P`, NEVER `no peer -1/0`
+    grep "qsa chain:" | head -2                 # per-layer component fingerprints, when `--exp qsa_dump_chain=1`
 
 The last grep is the one the =2 window needed: `no peer -1/0` means `PeerPrefill` never went live, so every
-partner-held expert row fell to the lead's link and no per-layer term on that line means anything. (The pair also
-audits itself now - the agreement rings, `PeerPrefill::Qsa::chk`, described with the arm in
-`progress-tp2slice-kernels.md`; a pair that disagrees about what it summed fails the request, naming the layer.)
+partner-held expert row fell to the lead's link and no per-layer term on that line means anything. (The pair audits
+itself - the agreement rings, and beside them the per-layer chain that says what the rings cannot: two cards agreeing
+on a WRONG sum agree perfectly. Both in the kernels file; the chain's three boots are verdict §8.)
 
 What boot 3 read off, the first measurement of any of it: staging **20 971 520 floats = 8192 x 2560**, so the
 wire's funded width and the publisher's `rows_max` are one number as its check assumes; **79 MiB** of shard
@@ -272,16 +273,15 @@ allocation COUNT in the sizing test, not only in bytes.
 ## Building this tree after a reboot
 
 See **`progress-tp2slice-build.md`** — the configure line this tree needs (`BUILD_TESTING=ON` or `ctest -L cpu`
-finds zero tests and "passes"), and the rule that the count is read before the pass rate means anything.
+finds zero tests and "passes"), and that the count is read before the pass rate means anything.
 
 ## Where the arithmetic lives
 
-The byte ledger and filed predictions are in **`progress-tp2slice-ledger.md`** (the span catch-up's per-turn
-pricing stays in §2b here); the
-kernel and arm pieces — container and sizing walk, resident projections (`peer_qsa_resident_up`), the partner's own
-`Gemm`, the shard-width kernels and cache writer, the packed `attn_output` column funding, `peer_qsa_layer()`, and
-every hardcoded head count found, fixed and parity-tested — are in **`progress-tp2slice-kernels.md`**. The
-headline figures, restated so this file stands alone:
+The byte ledger and filed predictions are in **`progress-tp2slice-ledger.md`** (the span catch-up's per-turn pricing
+stays in §2b here); the kernel and arm pieces — container and sizing walk, resident projections
+(`peer_qsa_resident_up`), the partner's own `Gemm`, the shard-width kernels and cache writer, the packed
+`attn_output` column funding, `peer_qsa_layer()`, and every hardcoded head count found, fixed and parity-tested — are
+in **`progress-tp2slice-kernels.md`**. The headline figures, restated so this file stands alone:
 
     wire traffic   104.9 MB in a QSA layer    what the +10/+20 gates grade; the RETURN leg is FP32 today (83.9 MB)
     tier reserve   2.01 GiB int8 (=1)          span 0.96 + wire 0.20 + scratch 0.64 + weights 0.08 + cols 0.04 + gemm 0.09

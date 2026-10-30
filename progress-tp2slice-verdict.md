@@ -104,9 +104,80 @@ them, in full:
   set and a second step-count set (~84 MB), and the lead's reserve carries a second collective landing region
   (~80 MB, `:3304`).
 
-Nothing outside the prompt-attention arm reads the flag, so a `=2`-only corruption is one of exactly those three
-things. That is what makes the tripwire's negative answer informative rather than merely exculpatory: if the rings
-agree on every layer and the tokens still differ, the wait and the set indexing are already accounted for, and what
-is left is the residency delta — the partner's expert tier holding ~84 MB fewer bytes, whose effect is read off the
-chunk line's `qsa_lead_row_us` / `qsa_peer_row_us` and `blob_mb_ms`, which the boot checklist already requires.
-Those three figures should therefore be captured on the SAME boot as the differential, not left for a later window.
+Nothing outside the prompt-attention arm reads the flag, so a `=2`-only corruption lives in the arm.
+
+**The paragraph that used to end this section was wrong, and the wrongness is worth keeping where it can be read.**
+It said the agreement check's silence would leave only the residency delta, because the wait and the set indexing
+were "already accounted for". They are accounted for as *asymmetric* failures only. The check compares what the two
+cards ended up holding, and each card ends up holding `own_partial + peer_partial` — so if the partner's attention
+ran over the wrong KV, or with another chunk's step counts, or on a wire set the lead overwrote early, both cards
+hold the SAME wrong sum and agree element for element. **The check is blind by construction to a wrong input, which
+is the exact signature the window returned: silent rings, `!` to the cap.** A pair that agrees on a wrong value
+agrees perfectly, and "the pair is sound" was never what the check could prove.
+
+## 8. The chain: three boots that name the component, for the price of one hypothesis each
+
+`--exp qsa_dump_chain=1` fingerprints every component of a sliced QSA layer as the layer completes — on the stream
+that produced it, so it records what the layer used rather than what the buffer holds by the chunk's end — and prints
+one line per card per layer. Three boots of one prompt, three chains, one diff. The instrument is the point: it turns
+the hunt from one hypothesis per boot (five boots so far, one class eliminated) into one boot per class boundary,
+which composes with rule 12 because the budget is the same three boots the differential already costs.
+
+**The boots** — the same server, the same cached `nat` prompt, `max_tokens=64`, greedy, as §1's differential, with
+`--exp qsa_dump_chain=1` added to each and the chunk-line figures (`qsa_lead_row_us`, `qsa_peer_row_us`,
+`blob_mb_ms`) captured as before:
+
+1. gate off — the reference; its chain exists because the lead-side components are recorded in every mode, and
+   `m.bo` is the same buffer sliced or whole, which is what makes the three comparable;
+2. `--exp tp_prompt_attn=1 --exp qsa_dump_chain=1`;
+3. `--exp tp_prompt_attn=2 --exp qsa_dump_chain=1`.
+
+**The read** — the lines are grep-able by construction:
+
+    grep 'qsa chain:' boot.log | sed 's/^.*qsa chain: //' > chain.<mode>.txt
+    diff chain.off.txt chain.2.txt
+
+The first line that differs names the chunk and the model layer; within it, the first field that differs names the
+component. `--------` means that mode never recorded it, which is an answer rather than a gap.
+
+**The shape is the diagnosis**, which is why the fields carry a sum and a max-abs beside the hash — a hash alone
+says "moved", the pair says by how much:
+
+| what the diff shows | what it means |
+|---|---|
+| `bo`/`suml` differ from the FIRST sliced QSA layer of the first chunk, and stay wrong | a wrong input reached the layer: read down the component list to the first one that also differs |
+| `bo` matches for the first layers and the difference grows with the layer index | an accumulation — something is being added, or lost, per layer |
+| `bo` matches for early chunks and diverges mid-context | a race, or state that only diverges once the context is wide enough |
+| lead `mix` ≠ peer `pub` at the same layer | the link or the wire set: the partner attended on rows the lead did not publish |
+| lead `steps` ≠ peer `stepsr` | the class that made `=2` select with another chunk's positions, still alive |
+| `kspan`/`vspan` move between boots while `pub` did not | the IMPORT — the path §1's case 11 never validated in context: cells landing where the attention does not look |
+| `partl`/`partp` match the gate-off path but `suml`/`sump` do not | the collective itself |
+| everything matches through `suml`/`sump` and only `bo` differs | outside the pair after all — the residency delta is then the only suspect left standing |
+
+Its price, measured rather than assumed: ~48 us per component at the widest shape (`qsa_chain_parity`'s line), which
+is launch cost; a sliced layer pays a few tenths of a millisecond per card, so a boot with the flag on is a slightly
+slower boot. Nothing is allocated against the tier; the arrays are the pair's own, and a boot with the flag off pays
+neither the records nor the read-back.
+
+## 9. Two audits that came out of placing the records
+
+Both are the same class as the `=1` wait defect — one CUDA object carrying two meanings, nothing complaining — and
+both were found by asking "what does this event/flag actually mean?" at the moment of writing a record next to it.
+
+- **The span import was borrowing the arm's end-of-layer proof.** `peer_qsa_span_catch_up` recorded `ev_out[0]` on
+  the arm's stream and host-synced it to wait on its own DMAs; `ev_out[0]` is the proof the driver's serialized wait
+  and the next publish's set-freeing consume. Harmless today (every wait follows its own record), and "today" is
+  precisely when a borrowed event costs nothing — the day an import's record and a layer's record exchange places is
+  the day a gate silently stops gating. The host now asks the stream it queued on (`prefill.cpp`, the import's
+  barrier). `ev_in`, `ev_red`, the driver's wait and the six remaining `pipeline >= 2 ? wire : 0` index sites were
+  each checked against the rule the `=1` fix established — record side and wait side name the same set — and are
+  consistent; this was the one that was not.
+- **Cross-chain aliasing was audited, not assumed.** The two wire sets, the two collective sets and the chain's
+  arrays are indexed by `qsa_ord`, the QSA ordinal of ONE chunk of THIS `Prefill`; nothing in that index names a
+  chain or a slot, so two chains driving one arm would share the sets — and the agreement check would be silent, by
+  the argument above. What the code says today: one `Prefill` per slot (`engine_local.hpp`, the single `sp` beside
+  `ver` and `ver_b`, which are decode verifiers, not prefills), and the only thread that enters a run is waited for
+  before its caller returns (`generate.cpp`, the oversubscription thread's `mail.fin`). So the class cannot explain
+  a corruption that appears on a single cached prompt with no second slot prefilling — and it is now observable
+  rather than argued: `run_impl` notices a second entry into the same arm and says so on one log line. A detectable
+  class is one a boot can rule out; a boot that died on its own invariant would have taught the hunt nothing.
