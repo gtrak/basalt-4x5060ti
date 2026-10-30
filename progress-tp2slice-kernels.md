@@ -171,8 +171,10 @@ cannot drift, and which prints into the same log line. It is what makes one cros
 reduction-order difference between boots rotates a window by ulps and leaves its direction alone, so a cosine taken
 between two boots' sketches separates "same distribution" from "another layer's tensor" where the hash cannot
 (`progress-tp2slice-cosine.md`). It is read as shape only - its estimator error is ~1/sqrt(kChainProj), and `hash`
-remains the sole claim about exact bits. Price, measured: ~48 us per component without it, ~138 us with
-(`qsa_chain_parity`'s line). `qsa_chain_parity`'s CPU contract, which runs with no card, both anchors the sketch (a
+remains the sole claim about exact bits. Price: ~48 us per component without the sketch, ~138 us with
+(`qsa_chain_parity`'s line) - but BOTH were read on a card the serving engine was using (63-90% util), so they
+are an upper bound under contention and not a microbench; the window owes them a re-measure with the server
+stopped, as everywhere in this campaign. `qsa_chain_parity`'s CPU contract, which runs with no card, anchors the sketch (a
 window against itself is 1.0) and falsifies it (a structureless window below 0.5, a 0.02% perturbation above 0.999,
 an unrecorded or all-zero side reading `kChainCosineNa` rather than a misreadable 0 or 1), so a unity cosine is a
 finding and not a sketch that never filled.

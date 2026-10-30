@@ -21,8 +21,10 @@ cosine from two log lines and **no buffer ever crosses to the host**. `qsa_chain
 between kernel and reference, and its CPU contract — which runs with no card — asserts the anchor (a window against
 itself is 1.0), and falsifies it: a structureless window against the ramp must read **below 0.5**, a 0.02 %
 perturbation must stay **above 0.999**, an unrecorded or all-zero side must read `kChainCosineNa` rather than a
-misreadable 0 or 1, and a filled field must carry all 32 words. Its price is measured: ~48 µs per component bare,
-~138 µs with the sketch (`qsa_chain_parity`'s line, 8192 × 1280). Read a cosine as shape, never as a measurement —
+misreadable 0 or 1, and a filled field must carry all 32 words. Its price: ~48 µs per component bare, ~138 µs
+with the sketch (`qsa_chain_parity`'s line, 8192 × 1280) — read on a card the serving engine was using, so an
+upper bound under contention until re-measured with the server stopped. Read a cosine as shape, never as a
+measurement —
 the estimator's own error is ~`1/sqrt(kChainProj)` ≈ 18 %, which is enough to tell "same distribution" from
 "unrelated tensor" and nothing finer.
 
