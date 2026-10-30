@@ -91,6 +91,9 @@ struct WeightRef {
     int native_type = -1;
     /// False when the loader SKIPPED this tensor's canonical bytes because another form serves it
     /// (native GGUF projections, the native head).  The metadata above stays valid; `data` is null.
+    /// `bytes` and all three plane sizes are then 0 TOO, so a figure built from them is 0 and says nothing about
+    /// the tensor's cost: for a tensor served this way the only bytes it has are its native image, whose size
+    /// follows from `native_type` and ne0/ne1 (`core::qsa_native_bytes` reads exactly that).
     bool resident = true;
 };
 

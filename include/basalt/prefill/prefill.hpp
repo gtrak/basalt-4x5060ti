@@ -176,6 +176,9 @@ public:
         /// `wo->native_type` for exactly this reason.  Negative means unset, and the arm refuses to project
         /// rather than assume a quantization the pack never stated.
         int q_type = -1, kv_type = -1, o_type = -1;
+        /// Why `make_peer_qsa_span` refused, when it did: which tensor of which layer, and what the pack did not
+        /// say about it.  A refusal that only says "no figure" costs a boot to diagnose; this one does not.
+        std::string why;
         /// How many allocations the last `bytes()` call walked.  Diagnostics for the sizing test, which pins it:
         /// the byte figures alone do not catch a tensor taken once where it should be taken once a QSA layer.
         mutable int m_takes_ = 0;

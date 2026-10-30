@@ -2187,6 +2187,9 @@ static constexpr int64_t kPeerSelBatch = 256;
 ///
 /// `active` is the chunk's widest n_bid + 1, from whoever shipped the steps: it is a property of the chunk's
 /// positions, not of a layer, so the arm takes it rather than reading a host copy per layer.
+bool peer_qsa_resident_up(PeerPrefill& P, const core::WeightTable& wt, int lead_dev, int64_t lb, int64_t le,
+                          std::string& err);   // defined below, beside the arm's other boot-time pieces
+
 /// Put the pair on the two cards and give each card the `attn_output` columns it will reduce with.
 ///
 /// This is the substrate every later piece stands on - the publisher, the per-layer driver and the reduce all
@@ -2262,11 +2265,132 @@ bool peer_qsa_pair_up(PeerPrefill& P, const core::ModelGeometry& g, const core::
         err = "prefill peer: the packed columns were not built over the whole model";
         return false;
     }
+    // The columns reduce; these are what the arm PROJECTS with.  Filled here, once, so a QSA layer's arm never
+    // touches the link for weight and the ledger's per-layer traffic stays the bytes it says it is.
+    if (!peer_qsa_resident_up(P, wt, lead_dev, lb, le, err)) {
+        core::qsa_pair_free(qs.lead_cols);
+        core::qsa_pair_free(qs.peer_cols);
+        qs.pair.close();
+        return false;
+    }
     basalt::log::info("basalt prefill",
                       "peer prompt-attention pair CUDA%d+CUDA%d open, staging %lld floats; attn_output columns "
                       "packed on both cards over %lld QSA layers (lead %d/%d, partner %d/%d heads)",
                       lead_dev, P.dev, (long long) elems, (long long) built,
                       (int) lead_sh.nq(), (int) g.n_head, (int) peer_sh.nq(), (int) g.n_head);
+    return true;
+}
+
+/// The partner's resident projections, copied off the lead's card ONCE at boot: its shard's rows of `attn_q`, its
+/// KV head's rows of `attn_k` and `attn_v`, and the four RMS norms those projections and the indexer read.  The
+/// RUN 25 ruling put them resident so no QSA layer moves weight bytes across the link; the allocation is the
+/// walk's (`peer_qsa_layout`), and this is the copy that makes those buffers mean something - without it the arm
+/// multiplies whatever `cudaMalloc` left in them, which is a plausible token rather than a fault.
+///
+/// Every copy is checked against the figure the span was PRICED from, per layer rather than once: the sizer reads
+/// one QSA layer and multiplies, so a pack that changed a projection's type or row width between layers would
+/// otherwise copy a wider row into a buffer sized for a narrower one.  A pack that serves the tensor from its GGUF
+/// section keeps it only as a native image, which is the form copied here and the form `Gemm::native` reads.
+bool peer_qsa_resident_up(PeerPrefill& P, const core::WeightTable& wt, int lead_dev, int64_t lb, int64_t le,
+                          std::string& err) {
+    PeerPrefill::Qsa& qs = P.qsa;
+    const Prefill::PeerQsaSpan& sp = qs.span;
+    if (!qs.live || !sp.on || sp.g == nullptr || !sp.heads.ok()) {
+        err = "prefill peer: the prompt-attention arm is not live, so it has no projections to fill";
+        return false;
+    }
+    if (!P.p2p) {
+        err = "prefill peer: the resident projections need peer access between CUDA" + std::to_string(lead_dev) +
+              " and CUDA" + std::to_string(P.dev);
+        return false;
+    }
+    const basalt::kernels::QsaShapes sh = core::qsa_shard_shapes(*sp.g, sp.heads);
+    const core::QsaHeadRun qr = core::qsa_q_rows(sp.heads, sp.g->head_dim);
+    const core::QsaHeadRun kr = core::qsa_kv_rows(sp.heads, sp.g->head_dim);
+    if (qr.len <= 0 || kr.len <= 0) { err = "prefill peer: the shard owns no projection rows"; return false; }
+    if (qs.wq.size() != qs.wk.size() || qs.wk.size() != qs.wv.size() || qs.wk.size() != qs.wqn.size() ||
+        qs.wk.size() != qs.wkn.size() || qs.wk.size() != qs.wiqn.size() || qs.wk.size() != qs.wikn.size()) {
+        err = "prefill peer: the arm's projection buffers are not one per QSA layer";
+        return false;
+    }
+    // One row of a native image, or 0 when the pack has none: the same expression the sizer used, written here so
+    // the comparison is against this layer's own pack figure and not against the sizer's memory of another's.
+    auto native_row = [](const core::WeightRef& w) -> int64_t {
+        const uint64_t nb = core::qsa_native_bytes(w);
+        return nb != 0 && w.ne1 > 0 ? (int64_t) (nb / (uint64_t) w.ne1) : 0;
+    };
+    uint64_t moved = 0;
+    int64_t i = 0;
+    for (int64_t l = lb; l < le; ++l) {
+        if (!core::is_qsa_layer(*sp.g, l)) continue;
+        const core::LayerView v(wt, l);
+        const core::WeightRef *wq = v.get("attn_q.weight"), *wk = v.get("attn_k.weight"),
+                              *wv = v.get("attn_v.weight"), *wqn = v.get("attn_q_norm.weight"),
+                              *wkn = v.get("attn_k_norm.weight"), *wiqn = v.get("indexer.q_norm.weight"),
+                              *wikn = v.get("indexer.k_norm.weight");
+        for (const core::WeightRef* pr : {wq, wk, wv, wqn, wkn, wiqn, wikn}) {
+            if (pr == nullptr) {
+                err = "prefill peer: layer " + std::to_string(l) + " is missing one of the projections or norms the "
+                      "partner's arm projects with, so its buffers cannot be filled";
+                return false;
+            }
+        }
+        if (wq->native_type != sp.q_type || native_row(*wq) != sp.q_row_bytes ||
+            wk->native_type != sp.kv_type || native_row(*wk) != sp.kv_row_bytes ||
+            wv->native_type != sp.kv_type || native_row(*wv) != sp.kv_row_bytes) {
+            err = "prefill peer: layer " + std::to_string(l) + "'s projections are not the form the span was "
+                  "priced from (q type " + std::to_string(wq->native_type) + ", a row of " +
+                  std::to_string(native_row(*wq)) + " B, against the priced type " + std::to_string(sp.q_type) +
+                  " and row " + std::to_string(sp.q_row_bytes) + " B)";
+            return false;
+        }
+        if (wqn->ne0 != sh.head_dim || wkn->ne0 != sh.head_dim || !wqn->data || !wkn->data ||
+            wiqn->ne0 != sh.idx_dim || wikn->ne0 != sh.idx_dim || !wiqn->data || !wikn->data) {
+            err = "prefill peer: layer " + std::to_string(l) + "'s RMS norms are not the resident f32 vectors the "
+                  "arm reads";
+            return false;
+        }
+        auto across = [&](void* dst, const void* src, int64_t bytes, const char* what) -> bool {
+            if (bytes <= 0) return true;
+            if (cudaMemcpyPeerAsync(dst, P.dev, const_cast<void*>(src), lead_dev, (size_t) bytes, qs.s) !=
+                cudaSuccess) {
+                err = std::string("prefill peer: layer ") + std::to_string(l) + "'s " + what +
+                      " would not cross to CUDA" + std::to_string(P.dev);
+                return false;
+            }
+            moved += (uint64_t) bytes;
+            return true;
+        };
+        const uint8_t* nq = (const uint8_t*) wq->native_data;
+        const uint8_t* nk = (const uint8_t*) wk->native_data;
+        const uint8_t* nv = (const uint8_t*) wv->native_data;
+        if (!across(qs.wq[(size_t) i], nq + (int64_t) qr.start * sp.q_row_bytes, qr.len * sp.q_row_bytes, "q rows"))
+            return false;
+        if (!across(qs.wk[(size_t) i], nk + (int64_t) kr.start * sp.kv_row_bytes, kr.len * sp.kv_row_bytes, "k rows"))
+            return false;
+        if (!across(qs.wv[(size_t) i], nv + (int64_t) kr.start * sp.kv_row_bytes, kr.len * sp.kv_row_bytes, "v rows"))
+            return false;
+        if (!across(qs.wqn[(size_t) i], wqn->data, sh.head_dim * 4, "q norm")) return false;
+        if (!across(qs.wkn[(size_t) i], wkn->data, sh.head_dim * 4, "k norm")) return false;
+        if (!across(qs.wiqn[(size_t) i], wiqn->data, sh.idx_dim * 4, "indexer q norm")) return false;
+        if (!across(qs.wikn[(size_t) i], wikn->data, sh.idx_dim * 4, "indexer k norm")) return false;
+        ++i;
+    }
+    if (i != (int64_t) qs.wq.size()) {
+        err = "prefill peer: the stage's QSA layers and the arm's projection buffers disagree (" +
+              std::to_string(i) + " against " + std::to_string(qs.wq.size()) + ")";
+        return false;
+    }
+    if (const cudaError_t e = cudaStreamSynchronize(qs.s); e != cudaSuccess) {
+        err = std::string("prefill peer: the resident projections did not land: ") + cudaGetErrorString(e);
+        return false;
+    }
+    basalt::log::info("basalt prefill",
+                      "peer prompt-attention arm: %llu MiB of shard projections resident on CUDA%d over %lld QSA "
+                      "layers (q rows %d/%d x %lld B, KV rows %d x %lld B), copied at boot from CUDA%d",
+                      (unsigned long long) (moved >> 20), P.dev, (long long) i, (int) sp.heads.nq(),
+                      (int) sp.g->n_head, (long long) sp.q_row_bytes, (int) sp.heads.nkv(),
+                      (long long) sp.kv_row_bytes, lead_dev);
     return true;
 }
 
@@ -2861,20 +2985,33 @@ Prefill::PeerQsaSpan Prefill::make_peer_qsa_span(const core::ModelGeometry& g, c
     // stage's QSA layer count, so a pack that varied its quantization between layers would be priced wrong here
     // rather than refused.  Checked, not assumed - the same reasoning that made the walk count inside `take`.
     const int64_t nl = sp.n_qsa_layers();
-    if (nl <= 0) { sp.on = false; return sp; }
+    if (nl <= 0) { sp.why = "the stage holds no QSA layer"; sp.on = false; return sp; }
     int64_t qi = -1;
     for (int64_t l = lb; l < le; ++l) if (core::is_qsa_layer(g, l)) { qi = l; break; }
     const core::LayerView v(wt, qi);
     const core::WeightRef* wq = v.get("attn_q.weight");
     const core::WeightRef* wk = v.get("attn_k.weight");
     const core::WeightRef* wo = v.get("attn_output.weight");
-    if (wq == nullptr || wk == nullptr || wo == nullptr || wq->ne1 <= 0 || wk->ne1 <= 0 || wq->bytes == 0 ||
-        wk->bytes == 0 || wq->native_type < 0 || wk->native_type < 0 || wo->native_type < 0) {
+    if (wq == nullptr || wk == nullptr || wo == nullptr) {
+        sp.why = "blk." + std::to_string(qi) + " has no attn_q, attn_k or attn_output in the pack";
         sp.on = false;   // the pack was never consulted, or cannot answer: price nothing rather than guess a layout
         return sp;
     }
-    sp.q_row_bytes = (int64_t) (wq->bytes / (uint64_t) wq->ne1);
-    sp.kv_row_bytes = (int64_t) (wk->bytes / (uint64_t) wk->ne1);
+    // THE PACK FIGURES COME FROM THE NATIVE IMAGE, NOT FROM THE ARENA.  A pack may serve these projections from
+    // its source GGUF - `weights.hpp`'s `resident` false, `data` null, `bytes` 0 and every plane 0 - which is what
+    // the shipped artifact does for all three.  What the partner holds resident, and what `Gemm::native` reads,
+    // is the native block form either way, so that is the figure the span is sized by: `qsa_native_bytes` is the
+    // one helper `qsa_pair_bytes` sums the packed columns with, so a row cannot mean two sizes in two places.
+    const uint64_t qb = core::qsa_native_bytes(*wq), kb = core::qsa_native_bytes(*wk), ob_img = core::qsa_native_bytes(*wo);
+    if (wq->ne1 <= 0 || wk->ne1 <= 0 || wo->ne1 <= 0 || qb == 0 || kb == 0 || ob_img == 0) {
+        sp.why = "blk." + std::to_string(qi) + "'s attn_q/attn_k/attn_output carry no native image the shard can be"
+                 " sized from (a projection is served from the pack's GGUF section, so its arena bytes are 0 and"
+                 " only its native image says how big a row is)";
+        sp.on = false;
+        return sp;
+    }
+    sp.q_row_bytes = (int64_t) (qb / (uint64_t) wq->ne1);
+    sp.kv_row_bytes = (int64_t) (kb / (uint64_t) wk->ne1);
     sp.q_type = wq->native_type;
     sp.kv_type = wk->native_type;
     sp.o_type = wo->native_type;
@@ -2882,9 +3019,14 @@ Prefill::PeerQsaSpan Prefill::make_peer_qsa_span(const core::ModelGeometry& g, c
     // read here per layer because the sizer needs the per-layer figure to scale to the stage's range.
     const basalt::kernels::QsaShapes sh = core::qsa_shard_shapes(g, sp.heads);
     const core::QsaHeadRun cols = core::qsa_out_cols(sp.heads, sh.head_dim);
-    const uint64_t ob = core::qsa_weight_cols_bytes(*wo, cols.start, cols.len, core::qsa_native_bytes(*wo));
+    const uint64_t ob = core::qsa_weight_cols_bytes(*wo, cols.start, cols.len, ob_img);
     sp.o_col_bytes = (int64_t) ((ob + 15) & ~uint64_t(15));
-    if (sp.q_row_bytes <= 0 || sp.kv_row_bytes <= 0 || sp.o_col_bytes <= 0) sp.on = false;
+    if (sp.q_row_bytes <= 0 || sp.kv_row_bytes <= 0 || sp.o_col_bytes <= 0) {
+        sp.why = "blk." + std::to_string(qi) + "'s figures do not price a row: a q row of " +
+                 std::to_string(sp.q_row_bytes) + " B, a KV row of " + std::to_string(sp.kv_row_bytes) +
+                 " B, " + std::to_string(sp.o_col_bytes) + " B of packed attn_output columns";
+        sp.on = false;
+    }
     return sp;
 }
 
@@ -3146,8 +3288,9 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
         const int64_t lead_heads = core::qsa_lead_heads(heads, ratio);
         PeerQsaSpan want = make_peer_qsa_span(*m.g, *m.wt, mc, lb, le, lead_heads, true);
         if (!want.on) {
-            err = "prefill peer: --exp tp_prompt_attn: the pack gave no figure for the partner's projections or "
-                  "attn_output columns, so its span cannot be reserved";
+            err = "prefill peer: --exp tp_prompt_attn: " + (want.why.empty() ? std::string("the pack gave no figure")
+                                                                              : want.why) +
+                  ", so the partner's span cannot be reserved";
             return false;
         }
         // The reserve rule, in one place: half the query heads to the lead, the same geometry, the same range.
