@@ -10359,6 +10359,8 @@ int main(int argc, char** argv) {
             if (o.suffix_draft > 0) {
                 sfx.reset();
                 for (int64_t t : ids) sfx.append((int32_t) t);
+                // --exp draft_reseed: the generated tail is its own repeat material from the first token on
+                if (basalt::core::exp_flag("draft_reseed", 0) != 0) { sfx.set_reseed(true); sfx.mark_history(); }
             }
             bool first_window = true;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
@@ -11023,6 +11025,7 @@ int main(int argc, char** argv) {
                         sl.sfx = std::make_unique<basalt::spec::SuffixDrafter>(std::max(1, o.suffix_draft), 64,
                                                                                (size_t) o.max_context + 4096);
                         for (int32_t t : live) sl.sfx->append(t);
+                        if (basalt::core::exp_flag("draft_reseed", 0) != 0) { sl.sfx->set_reseed(true); sl.sfx->mark_history(); }
                         sl.sfx->append(x);
                     }
                     sl.x = x;
@@ -11440,6 +11443,7 @@ int main(int argc, char** argv) {
         int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
         if (o.suffix_draft > 0) {
             for (int64_t t : o.tokens) sfx.append((int32_t) t);
+            if (basalt::core::exp_flag("draft_reseed", 0) != 0) { sfx.set_reseed(true); sfx.mark_history(); }
             for (int64_t t : produced) sfx.append((int32_t) t);
         }
         const double pool_ms0 = drive.cpu_ms;
