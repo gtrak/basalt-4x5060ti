@@ -1742,9 +1742,10 @@ same bits, same rows, same combine. The gate is only required if the parity line
 | 128, FP32 → planes | 540 → 333 | 14 159 → 22 903 | 21 239 → 24 788 |
 
 Against run 18's measured 825-836 MiB/1024 tokens and ~19.3k crossover: the acts term is 24 x 10 240 B a token
-(251.6 MiB of those 825-836), so the boot line should print **618-629**, and the crossover moves up by the ratio of
-the two wires, ~19.3k → **~25.5k**, capped by the pack ceiling at **24 788** (the printed figure stays
-`min(chunk, crossover, ceiling)`, so at `--prefill 8192` it reads 8 192 either way — read the MiB field).
+(240.0 MiB of those 825-836, against 33.8 MiB with the planes), so the boot line should print **618-629**, and the
+crossover moves up by the ratio of the two wires, ~19.3k → **~25.5k**, capped by the pack ceiling at **24 788**
+(the printed figure stays `min(chunk, crossover, ceiling)`, so at `--prefill 8192` it reads 8 192 either way — read
+the MiB field).
 
 The band's lanes re-price without a line of new logic (`acts` is now `chunk * peer_act_bytes`), and because the
 pair's lane got ~69 MiB a layer emptier, more of the RAM band moves to the partner:
@@ -1813,8 +1814,9 @@ Other files: `include/basalt/prefill/prefill.hpp` (`set_peer`, `peer_bytes`), `i
 
 ### Validated here (GPU untouched: the server is live, `:8000` never touched)
 
-Build green (`cmake --build build -j4`), no new warnings (the two `prefill.cpp`/`generate.cpp` warnings are the
-baseline's). `ctest -L cpu` 67/68, only the pre-existing `expert_multi_test` (this CPU lacks AVX512-VNNI/VBMI) —
+Build green from clean (`cmake --build build -j4`), and the warning set is byte-identical to the pre-change
+build's (`diff` of the sorted `warning:` lines: empty) — no new warnings from this change. `ctest -L cpu` 67/68,
+only the pre-existing `expert_multi_test` (this CPU lacks AVX512-VNNI/VBMI) —
 identical to the pre-change baseline run. `tp2_pair_test`, `qsa_head_split_test`, `session_head_shard_test`,
 `tp2_shard_weights_test` pass. `tools/check_platform_boundary.sh` and `tools/check_stderr_logging.sh` ok.
 `prefill_fp4_test` compiles; its two new lines need the reviewer's two devices. The crossover/ceiling/lanes table
