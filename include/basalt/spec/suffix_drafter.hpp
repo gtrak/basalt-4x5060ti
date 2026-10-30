@@ -34,7 +34,15 @@ public:
     int last_match() const { return last_match_; }
     size_t size() const { return hist_.size(); }
 
+    /// Tail re-seeding: once `mark_history` has been called, a match shorter than `min_match` still qualifies
+    /// when its source lies in the generated tail - the tail's own repeats are reliable at trigram length, where
+    /// a repeat of prompt material is not.
+    void set_reseed(bool on) { reseed_ = on; }
+    /// Everything already appended is prompt material; tokens appended after this are the generated tail.
+    void mark_history() { tail_start_ = hist_.size(); history_marked_ = true; }
+
 private:
+    static constexpr int kReseedMin = 3;    // a tail-sourced match qualifies at this length
     struct Slot {
         uint64_t key = 0;             // trigram hash + 1 (0 = empty)
         uint32_t pos[WAYS] = {};      // end positions, most recent first
@@ -48,6 +56,9 @@ private:
     std::vector<Slot> table_;
     size_t mask_ = 0;
     int last_match_ = 0;
+    bool reseed_ = false;
+    bool history_marked_ = false;
+    size_t tail_start_ = 0;
 };
 
 }  // namespace basalt::spec

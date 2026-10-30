@@ -28,6 +28,8 @@ void SuffixDrafter::reset() {
     hist_.clear();
     std::fill(table_.begin(), table_.end(), Slot{});
     last_match_ = 0;
+    history_marked_ = false;
+    tail_start_ = 0;
 }
 
 uint64_t SuffixDrafter::key_at(size_t end) const {
@@ -70,14 +72,19 @@ int SuffixDrafter::propose(int max_k, int32_t* out) {
     if (s == nullptr) return 0;
     size_t best_end = 0;
     int best_len = 0;
+    bool best_short_tail = false;
     for (int w = 0; w < s->n; ++w) {
         const size_t p = s->pos[w];
         if (p >= cur) continue;                             // the current suffix itself
         int len = 0;
         while (len < max_match_ && len <= (int) p && hist_[p - len] == hist_[cur - len]) ++len;
-        if (len > best_len) { best_len = len; best_end = p; }   // most recent first, so ties keep the newer
+        const bool short_tail = reseed_ && history_marked_ && p >= tail_start_ && len >= kReseedMin;
+        if (len >= min_match_ || short_tail) {
+            // most recent first, so ties keep the newer
+            if (len > best_len) { best_len = len; best_end = p; best_short_tail = short_tail && len < min_match_; }
+        }
     }
-    if (best_len < min_match_) return 0;
+    if (best_len < min_match_ && !best_short_tail) return 0;
     last_match_ = best_len;
     int k = 0;
     // The continuation may run into the current suffix (periodic text); reading history up to `cur` is valid.
