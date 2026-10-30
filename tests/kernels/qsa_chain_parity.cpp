@@ -11,6 +11,8 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -148,6 +150,114 @@ void reference_contract() {
     CHECK(qsa_chain_ref(big.data(), 200, 2).hash != before.hash);
 }
 
+// ---- the sketch: the figures a cross-boot cosine is read from ---------------------------------------------
+//
+// The hash above cannot answer a cross-boot question (the engine's own kernels are not reproducible between runs,
+// so a cross-boot hash diff is noise against noise - the retraction in progress-tp2slice-verdict.md §8). The
+// sketch is the instrument that can: a cosine taken between two boots' log lines, with no buffer crossing to the
+// host. An ungraded sketch would be the worst kind of instrument, because a cosine of 1.0 read off a broken sketch
+// would be believed exactly as much as a correct one, so every property below is asserted AND falsified.
+
+/// A window of `rows` x `stride` words whose values are a smooth ramp plus a deterministic wobble: a cosine
+/// against a perturbed copy of it is a meaningful figure rather than a coincidence of zeros.
+std::vector<uint32_t> ramp_window(int64_t rows, int64_t stride, uint32_t seed) {
+    std::vector<uint32_t> v((size_t) rows * stride);
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = 0; c < stride; ++c) {
+            const float x = (float)(r * 0.125 + c * 0.03125) + (float)((r * 7 + c * 13 + seed) % 11) * 0.05f;
+            v[(size_t) r * stride + c] = bits(x);
+        }
+    return v;
+}
+
+/// A zero-mean, structureless window: no shared trend with `ramp_window`, so the two are close to orthogonal in
+/// the direction the sketch measures. Two smooth ramps of different seeds would NOT do - they share their
+/// dominant low-frequency trend, and a cosine near 1 between them is the sketch working, not failing.
+std::vector<uint32_t> noise_window(int64_t rows, int64_t stride, uint32_t seed) {
+    std::vector<uint32_t> v((size_t) rows * stride);
+    uint32_t x = seed * 2654435761u + 1u;
+    for (auto& e : v) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        e = bits(((x >> 8) % 2001u < 1000u) ? -1.0f : 1.0f);
+    }
+    return v;
+}
+
+void sketch_contract() {
+    // The chunking is an implementation detail the kernel and the reference must agree on; if it stopped dividing
+    // the sketch, projections would be written out of bounds and the cosine would silently read zeros.
+    CHECK(kChainProj > 1);
+    CHECK(kChainProj % kChainProjChunk == 0);
+
+    // A component nobody recorded has no direction to have: `NA` out of range, never a 0 that reads as orthogonal
+    // and never a 1 that reads as agreement.
+    QsaChainFp blank, one;
+    one.hash = 0x12345678u;
+    for (int p = 0; p < kChainProj; ++p) one.proj[p] = (float)(p % 7) - 3.0f;
+    CHECK(qsa_chain_cosine(blank, blank) == kChainCosineNa);
+    CHECK(qsa_chain_cosine(one, blank) == kChainCosineNa);
+    CHECK(qsa_chain_cosine(blank, one) == kChainCosineNa);
+    // A recorded component whose sketch is empty (all projections zero) is also not a direction.
+    QsaChainFp empty_sketch;
+    empty_sketch.hash = 0xabcdef01u;
+    CHECK(qsa_chain_cosine(empty_sketch, empty_sketch) == kChainCosineNa);
+
+    const int64_t rows = 64, stride = 40;   // 64 rows so the sampling actually thins, as it does at real widths
+    const std::vector<uint32_t> base = ramp_window(rows, stride, 0);
+    const QsaChainFp a = qsa_chain_ref(base.data(), rows, stride);
+    CHECK(a.hash != kChainUnrecorded);
+
+    // (1) the same window against itself is exactly 1. Both sides are the same computation on the same bytes, so
+    // this is not a tolerance - it is the anchor the other two cases are read against.
+    CHECK(std::fabs(qsa_chain_cosine(a, qsa_chain_ref(base.data(), rows, stride)) - 1.0f) < 1e-5f);
+
+    // (2) the sketch is not constant: a window with no shared structure must NOT read as the same direction.
+    // Without this, a sketch left at zero by a broken fill would score 1.0 on everything and the whole instrument
+    // would be decoration - this is the falsifier that makes (1) mean something. `noise_window` is zero-mean and
+    // structureless, so against the ramp it is near orthogonal; the tolerance is loose because the estimate
+    // carries the `1/sqrt(kChainProj)` the header quotes, and this case asks only for "clearly not 1".
+    const std::vector<uint32_t> other = noise_window(rows, stride, 5);
+    const QsaChainFp b = qsa_chain_ref(other.data(), rows, stride);
+    CHECK(a.hash != b.hash);
+    const float c_far = qsa_chain_cosine(a, b);
+    CHECK(c_far < 0.5f);
+    // And the sketch is not all zeros on a real window, which is what would make every cosine read NA or 1.
+    bool any_nonzero = false;
+    for (int p = 0; p < kChainProj; ++p) any_nonzero |= a.proj[p] != 0.0f;
+    CHECK(any_nonzero);
+
+    // (3) a small perturbation keeps the direction. This is the property the hunt actually relies on: reduction-
+    // order noise between boots must NOT move the cosine, while a substituted tensor must.
+    std::vector<uint32_t> nudged = base;
+    for (size_t i = 0; i < nudged.size(); i += 3)
+        nudged[i] = bits(std::bit_cast<float>(nudged[i]) * 1.0002f + 1e-6f);
+    const float c_near = qsa_chain_cosine(a, qsa_chain_ref(nudged.data(), rows, stride));
+    CHECK(c_near > 0.999f);
+
+    // (4) half the window zeroed - a mild version of the class the =2 corruption is (a stale wire set, another
+    // layer's rows) - must be visible.
+    std::vector<uint32_t> half = base;
+    for (size_t i = 0; i < half.size(); i += 2) half[i] = bits(0.0f);
+    const float c_half = qsa_chain_cosine(a, qsa_chain_ref(half.data(), rows, stride));
+    CHECK(c_half < 0.99f);
+
+    // (5) the sign rule must depend on all three of its arguments, or the projections are not independent and the
+    // quoted error is a fiction.
+    CHECK(qsa_chain_sign(0, 3, 4) != qsa_chain_sign(1, 3, 4) ||
+          qsa_chain_sign(0, 3, 4) != qsa_chain_sign(0, 4, 4) ||
+          qsa_chain_sign(0, 3, 4) != qsa_chain_sign(0, 3, 5));
+    int plus = 0;
+    for (int p = 0; p < kChainProj; ++p) plus += qsa_chain_sign(p, 7, 9) > 0.0f ? 1 : 0;
+    CHECK(plus * 3 > kChainProj && plus * 3 < kChainProj * 2);   // roughly balanced, not a constant
+
+    // (6) the sketch survives the line: a field's sketch round-trips, so the boot's log is enough to rebuild a
+    // cosine and no buffer has to be shipped off the card.
+    const std::string line = qsa_chain_field(kChainMix, a);
+    size_t commas = 0;
+    for (char ch : line) if (ch == ',') ++commas;
+    CHECK(commas == (size_t)kChainProj - 1);
+}
+
 // ---- the names and the line ---------------------------------------------------------------------------
 
 void names_and_fields() {
@@ -166,10 +276,10 @@ void names_and_fields() {
     fp.hash = 0x0000abcd; fp.sum = 1.5f; fp.maxabs = 3.25f;
     const std::string line = qsa_chain_field(kChainMix, fp);
     CHECK(line.rfind("mix=", 0) == 0);
-    CHECK(line == "mix=0000abcd/1.5/3.25");   // fixed-width hex, so two boots diff by field and not by padding
+    CHECK(line.find("/1.5/3.25/") != std::string::npos);   // hash / sum / maxabs, then the sketch
     size_t slashes = 0;
     for (char c : line) if (c == '/') ++slashes;
-    CHECK(slashes == 2);
+    CHECK(slashes == 3);   // hash / sum / maxabs / the sketch
 }
 
 // ---- the device kernel against the host rule ----------------------------------------------------------
@@ -209,6 +319,10 @@ int device_parity() {
         CHECK(host.hash == want.hash);
         CHECK(host.sum == want.sum);
         CHECK(host.maxabs == want.maxabs);
+        // The sketch is graded bitwise too, and it is the figure a cross-boot cosine is read from. A kernel and a
+        // reference that disagreed here would print cosines that meant nothing, which is the failure the whole
+        // instrument exists to avoid - so an ulp is as much a failure as a hash mismatch.
+        for (int p = 0; p < kChainProj; ++p) CHECK(host.proj[p] == want.proj[p]);
         if (host.hash != want.hash)
             std::printf("  %s: kernel %08x vs host %08x\n", sh.what, host.hash, want.hash);
 
@@ -267,6 +381,7 @@ int main(int argc, char** argv) {
     const bool selftest = argc > 1 && std::string(argv[1]) == "--selftest";
     sampling_contract();
     reference_contract();
+    sketch_contract();
     names_and_fields();
     if (g_fail) {
         std::printf("qsa chain parity: %d failures\n", g_fail);

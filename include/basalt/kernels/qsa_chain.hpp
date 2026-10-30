@@ -12,6 +12,7 @@
 // spelled once and compiled both ways (`tp2_collective.hpp` does the same for its sample rule): two spellings of
 // the same rule is one way for a chain to match for the wrong reason.
 
+#include <cmath>
 #include <cstdint>
 #include <string>
 
@@ -32,6 +33,17 @@ constexpr int kChainBlock = 256;
 /// What a slot holds when nobody recorded it.  A component a mode never reached must read as absent in the diff,
 /// never as whatever bytes the buffer happened to keep from the previous chunk.
 constexpr uint32_t kChainUnrecorded = 0xFFFFFFFFu;
+/// Projections per component in the direction sketch below.  A fixed-count sketch trades estimator error for log
+/// size: the cosine it supports carries a relative error of about `1/sqrt(kChainProj)`, which at 32 is ~18%.  That
+/// is enough to separate the two cases the hunt asks about - a same-distribution pair sits within a few per cent of
+/// 1, an unrelated tensor sits near 0 and many sigma away - and not enough to read a cosine as a measurement.
+constexpr int kChainProj = 32;
+/// Projections reduced per pass of the tree.  Bounds the kernel's shared-memory footprint; must divide
+/// `kChainProj`, which `qsa_chain_parity` asserts.
+constexpr int kChainProjChunk = 8;
+/// What `qsa_chain_cosine` returns for a pair it cannot grade - an unrecorded side, or one whose sketch is empty.
+/// Deliberately outside `[-1, 1]` so a caller cannot read it as a poor score rather than as no answer.
+constexpr float kChainCosineNa = 2.0f;
 
 /// The components, in the order the data path walks them.  The first eight exist in EVERY mode - the lead's own
 /// path is the reference the other two chains are diffed against - and they are what makes a gate-off boot worth
@@ -67,11 +79,53 @@ enum QsaChainSlot : int {
 /// One component's fingerprint.  Three figures, because they answer different questions: `hash` says whether the
 /// bits moved at all, `sum` says by how much when they did (which is what separates a rounding drift from a wrong
 /// buffer), and `maxabs` catches the scale errors and the overflow a cancelling sum would hide.
+///
+/// THE PROJECTION SKETCH, and why the three figures above are not enough for the cross-boot question. A hash
+/// answers a yes/no question about exact bits, so across boots it is useless here: the engine's prefill kernels
+/// accumulate in a schedule-dependent order, two passes of ONE boot already disagree, and a cross-boot hash diff
+/// compares noise against noise (the retraction in `progress-tp2slice-verdict.md` §8). What survives that is a
+/// DIRECTION, and a direction is exactly what the corruptions this hunt is about change - a stale wire set, an
+/// imported span cell landing where the attention does not look, a column block that fails to tile: the tensor keeps
+/// its scale but points elsewhere. So each component also carries `kChainProj` fixed projections of its sampled
+/// window against a fixed set of Rademacher signs (`qsa_chain_sign`): a Johnson-Lindenstrauss sketch, spelled once
+/// in this header so the kernel that fills it and the host that reads it cannot disagree. A cosine between two
+/// components then comes from the two log lines alone - no buffer crosses to the host, which is what keeps this a
+/// log line rather than a dump. Read it as shape, never as bits: `hash` remains the only claim about exactness, and
+/// it stays good only WITHIN one boot and one pass.
 struct QsaChainFp {
     uint32_t hash = kChainUnrecorded;
     float sum = 0.0f;
     float maxabs = 0.0f;
+    /// The sketch: `proj[p] = sum over the sampled window of value * qsa_chain_sign(p, row, col)`. Zero when
+    /// unrecorded, which is why `hash` (not these) is the unrecorded test.
+    float proj[kChainProj] = {};
 };
+
+/// The Rademacher sign of projection `p` on element (`row`, `col`). Any cheap, well-mixed function of the three
+/// indices would do; this one is the value-hash above WITHOUT the value's bits, so a projection cannot accidentally
+/// weight itself. Independent across `p`, which is what the error bound assumes.
+QSA_CHAIN_HD inline float qsa_chain_sign(int p, uint32_t row, uint32_t col) {
+    uint32_t x = (row * 0x27D4EB2Du) ^ (col * 0x165667B1u) ^ (uint32_t)(p * 0x9E3779B9u);
+    x ^= x >> 15; x *= 0x2545F491u;
+    x ^= x >> 13; x *= 0x9E3779B1u;
+    x ^= x >> 16;
+    return (x & 1u) ? 1.0f : -1.0f;
+}
+
+/// The cosine of two components' sampled windows, read off their sketches. Returns `kChainCosineNa` when either side
+/// was never recorded or one of them has no direction, so an absent component is never mistaken for an orthogonal
+/// one - the failure mode that would make a mode which skipped a layer read as the corruption.
+QSA_CHAIN_HD inline float qsa_chain_cosine(const QsaChainFp& a, const QsaChainFp& b) {
+    if (a.hash == kChainUnrecorded || b.hash == kChainUnrecorded) return kChainCosineNa;
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    for (int p = 0; p < kChainProj; ++p) {
+        dot += (double)a.proj[p] * (double)b.proj[p];
+        na += (double)a.proj[p] * (double)a.proj[p];
+        nb += (double)b.proj[p] * (double)b.proj[p];
+    }
+    if (na <= 0.0 || nb <= 0.0) return kChainCosineNa;
+    return (float)(dot / (std::sqrt(na) * std::sqrt(nb)));
+}
 
 /// The slot's name as it appears in the log, and the word the CPU diff greps for.  One table, so a line and a
 /// grep can drift apart only by editing this file.

@@ -156,11 +156,26 @@ from the lead in every mode (so a gate-off boot is a reference), `pub`/`stepsr`/
 per layer, indexed by MODEL layer. Lead `mix` against peer `pub` is the read on a stale wire set; `steps` against
 `stepsr` on the shipped-positions class; `kspan`/`vspan` against the lead's `kpool`/`vpool` on the import, the one
 path whose in-context form has never been validated end to end. `--------` is a slot nobody recorded, which is an
-answer rather than a gap, and is why both arrays are cleared to the sentinel per chunk. Three boots of one prompt,
-three chains, one diff: see `progress-tp2slice-verdict.md` §8 for the commands and what each divergence shape means.
+answer rather than a gap, and is why both arrays are cleared to the sentinel per chunk. Comparisons are only valid
+WITHIN one pass of one boot: across boots the engine's own kernels are not reproducible (measured - 16 of 180 `mix`
+layer-lines differ between pass 0 and pass 1 of a single `=1` boot), so cross-boot diffs are void, as
+`progress-tp2slice-verdict.md` §8 records. The correctness question itself moved to that file's §8a, the CPU
+differential, where the arithmetic is exact and nothing is schedule-dependent.
 The fingerprint is one block per component with a fixed reduction tree, not an atomic, because a sum in a
 schedule-dependent order would print different figures every boot and be read as corruption; `qsa_chain_parity` grades
 it against `qsa_chain_ref`, the host rule in the same header, at the arm's real widths.
+
+Beside the three figures each component carries a DIRECTION SKETCH - `kChainProj` fixed Rademacher projections of the
+same sampled window, a Johnson-Lindenstrauss sketch whose rules live in the header so kernel and host reference
+cannot drift, and which prints into the same log line. It is what makes one cross-boot comparison legitimate: a
+reduction-order difference between boots rotates a window by ulps and leaves its direction alone, so a cosine taken
+between two boots' sketches separates "same distribution" from "another layer's tensor" where the hash cannot
+(`progress-tp2slice-cosine.md`). It is read as shape only - its estimator error is ~1/sqrt(kChainProj), and `hash`
+remains the sole claim about exact bits. Price, measured: ~48 us per component without it, ~138 us with
+(`qsa_chain_parity`'s line). `qsa_chain_parity`'s CPU contract, which runs with no card, both anchors the sketch (a
+window against itself is 1.0) and falsifies it (a structureless window below 0.5, a 0.02% perturbation above 0.999,
+an unrecorded or all-zero side reading `kChainCosineNa` rather than a misreadable 0 or 1), so a unity cosine is a
+finding and not a sketch that never filled.
 
 The attention has no decode fallback, unlike the lead's: that fallback exists for shapes this arm already refused
 above, and it would need scratch the walk does not fund. A refusal there is an error naming itself, not a slow path.

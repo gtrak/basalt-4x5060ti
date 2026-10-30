@@ -16,6 +16,9 @@ __global__ void qsa_chain_kernel(QsaChainFp* __restrict__ dst, const uint32_t* _
     __shared__ uint32_t sh[kChainBlock];
     __shared__ float sf[kChainBlock];
     __shared__ float sm[kChainBlock];
+    // One chunk of the sketch at a time: `kChainProj` rows of `kChainBlock` floats would blow the static shared
+    // budget, and the instrument may not pay for dynamic shared allocation to be allowed to exist.
+    __shared__ float sp[kChainProjChunk][kChainBlock];
     const int tid = threadIdx.x;
     const int64_t sampled = qsa_chain_sampled(rows);
     const int64_t total = sampled * stride_words;
@@ -34,7 +37,7 @@ __global__ void qsa_chain_kernel(QsaChainFp* __restrict__ dst, const uint32_t* _
 
     // The reduction is a fixed tree, not an atomic: the chain's whole value is that two boots of one prompt
     // print the same figures unless something really moved, and a float sum accumulated in a schedule-dependent
-    // order would print different figures every boot.
+    // order would print different figures every boot. The sketch reduces in the same order, chunk by chunk.
     sh[tid] = h; sf[tid] = s; sm[tid] = mx;
     __syncthreads();
     for (int off = kChainBlock / 2; off > 0; off >>= 1) {
@@ -49,6 +52,30 @@ __global__ void qsa_chain_kernel(QsaChainFp* __restrict__ dst, const uint32_t* _
         dst->hash = sh[0];
         dst->sum = sf[0];
         dst->maxabs = sm[0];
+    }
+
+    // THE SKETCH, in one walk of the window. `kChainProj` register accumulators per thread keep the window read
+    // once however large the sketch is (re-walking it per chunk of projections cost 5x the base fingerprint, which
+    // a debug flag may not); the tree then reduces it `kChainProjChunk` rows at a time to bound shared memory.
+    float pr[kChainProj];
+    for (int p = 0; p < kChainProj; ++p) pr[p] = 0.0f;
+    for (int64_t e = tid; e < total; e += kChainBlock) {
+        const int64_t r = e / stride_words, c = e % stride_words;
+        const int64_t row = qsa_chain_row((int) r, rows);
+        const float v = __uint_as_float(w[(size_t) row * (size_t) stride_words + c]);
+        for (int p = 0; p < kChainProj; ++p)
+            pr[p] += v * qsa_chain_sign(p, (uint32_t) r, (uint32_t) c);
+    }
+    for (int base = 0; base < kChainProj; base += kChainProjChunk) {
+        for (int q = 0; q < kChainProjChunk; ++q) sp[q][tid] = pr[base + q];
+        __syncthreads();
+        for (int off = kChainBlock / 2; off > 0; off >>= 1) {
+            if (tid < off)
+                for (int q = 0; q < kChainProjChunk; ++q) sp[q][tid] += sp[q][tid + off];
+            __syncthreads();
+        }
+        if (tid == 0)
+            for (int q = 0; q < kChainProjChunk && base + q < kChainProj; ++q) dst->proj[base + q] = sp[q][0];
     }
 }
 
@@ -93,6 +120,31 @@ QsaChainFp qsa_chain_ref(const uint32_t* words, int64_t rows, int64_t stride_wor
             sm[t] = qsa_chain_max(sm[t], sm[t + off]);
         }
     fp.hash = sh[0]; fp.sum = sf[0]; fp.maxabs = sm[0];
+
+    // The sketch, mirroring the kernel chunk for chunk: same window, same per-thread strided walk, same
+    // increasing-`e` accumulation, same tree. `qsa_chain_parity` holds both sides and fails on any drift, which is
+    // the only reason a cosine read off two boots' log lines means anything.
+    for (int base = 0; base < kChainProj; base += kChainProjChunk) {
+        float sp[kChainProjChunk][kChainBlock];
+        for (int t = 0; t < kChainBlock; ++t) {
+            float pr[kChainProjChunk];
+            for (int q = 0; q < kChainProjChunk; ++q) pr[q] = 0.0f;
+            for (int64_t e = t; e < total; e += kChainBlock) {
+                const int64_t r = e / stride_words, c = e % stride_words;
+                const int64_t row = qsa_chain_row((int) r, rows);
+                const uint32_t bits = words[(size_t) row * (size_t) stride_words + c];
+                float v;
+                std::memcpy(&v, &bits, sizeof v);
+                for (int q = 0; q < kChainProjChunk; ++q)
+                    pr[q] += v * qsa_chain_sign(base + q, (uint32_t) r, (uint32_t) c);
+            }
+            for (int q = 0; q < kChainProjChunk; ++q) sp[q][t] = pr[q];
+        }
+        for (int off = kChainBlock / 2; off > 0; off >>= 1)
+            for (int t = 0; t < off; ++t)
+                for (int q = 0; q < kChainProjChunk; ++q) sp[q][t] += sp[q][t + off];
+        for (int q = 0; q < kChainProjChunk && base + q < kChainProj; ++q) fp.proj[base + q] = sp[q][0];
+    }
     return fp;
 }
 
@@ -130,6 +182,20 @@ std::string qsa_chain_field(int slot, const QsaChainFp& fp) {
     char buf[64];
     std::snprintf(buf, sizeof buf, "%08x/%.8g/%.8g", fp.hash, fp.sum, fp.maxabs);
     out += buf;
+    // THE SKETCH, printed as fixed-width hex so two boots' lines can be compared by eye and parsed by a script
+    // without a float parser. The chain line is a debug instrument behind `--exp qsa_dump_chain=1`; it is not a
+    // line the server parses. It costs ~1.9 KiB of log per component (`kChainProj` × 8 hex digits + separators),
+    // so a full sliced boot prints a few MB - the price of the only cross-boot comparison this instrument can make
+    // that kernel nondeterminism cannot confound.
+    out += '/';
+    for (int p = 0; p < kChainProj; ++p) {
+        uint32_t bits;
+        std::memcpy(&bits, &fp.proj[p], sizeof bits);
+        char pb[16];
+        std::snprintf(pb, sizeof pb, "%08x", bits);
+        if (p) out += ',';
+        out += pb;
+    }
     return out;
 }
 
