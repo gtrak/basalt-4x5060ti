@@ -134,6 +134,45 @@ The q-source is stated explicitly because everything downstream grades against i
 the peer's own projections of the lead's FP16 mixed rows**; the lead ships its indexer projections
 rather than the peer recomputing those, so the selection stays the lead's.
 
+## 2c. Item (1) landed: the span is SIZED, and the sizer corrects my hand estimate
+
+`Prefill::PeerQsaSpan` (`include/basalt/prefill/prefill.hpp`, implemented beside `Prefill::peer_bytes`) prices
+what the partner's card must hold resident for its half of the attention. One `Alloc` count walk produces both
+the reserve and, later, the carve, so the tier cannot be sized for a different amount than `set_peer`
+allocates. `peer_bytes` takes an optional `const PeerQsaSpan*`; the call sites are unwired until the arm
+exists, because reserving tier for an arm that refuses would tax the partner for nothing.
+
+Pinned by `tests/cuda/peer_qsa_span_test.cpp` (CPU-labelled, no device touched), which prints what it measures:
+
+    wire   104.9 MB a QSA layer           (the filed 104.8, confirmed -- and it does NOT shrink with the split)
+    span   1.69 GiB fp16 / 0.96 GiB int8  6 QSA layers of KV + indexer pooled, at 262144 cells
+    total  1.58 GiB int8                  span + wire + the partner's per-chunk scratch
+
+Three things this settles, each of which was an estimate before:
+
+- **My 1.006 GiB was high; 0.96 GiB is the sizer's number.** I priced int8 K at "~1 B + per-64 scales" by hand
+  and the layout is slightly tighter. **0.96 GiB int8 supersedes 1.006 everywhere in this file**, including in
+  §2b's catch-up arithmetic -- the supervisor's adoption of my figure stands as to method (per turn, indexed
+  by `span_valid`, KV *and* V, indexer table included) but the byte count is now the sizer's, not mine. The
+  span catch-up moves the same 0.96 GiB at full staleness, so §2b's ~254 ms is a hair pessimistic; it stays
+  as the filed number until the window measures the copy.
+- **The tier cost of the slice is 1.58 GiB, not 1.2 GiB.** Ruling B was taken on 1.2 GiB (~7.6% of the
+  15.8 GiB half-depth carve). The honest reserve is span + wire + scratch = **1.58 GiB, ~10% of the carve**,
+  because the partner also needs the wire's staging and its own shard-width attention scratch (0.55 GiB at
+  an 8192-token chunk, which the split halves -- a 16-head partner prices 0.63 GiB). Restated here rather
+  than discovered at a boot.
+- **Units, because the ledger mixed them:** the wire figures are 10^6 bytes, the tier figures 2^30. The test
+  asserts both explicitly so a future comparison cannot silently mix them; the filed 104.8 MB wire and the
+  ~1 GiB span were always consistent.
+
+Also checked, because the share flags make it live: an uneven cut (`qsa_lead_heads` at the fired falsifier's
+2.61 / 0.98 ratio puts 16 heads on the partner) is still priced, its scratch grows with its heads, and a
+cut straddling a KV group is *priced* but refused for the kernels by `qsa_shard_whole_groups` -- sizing is not
+where a bad ratio gets silently dropped.
+
+**Not yet done for item (1):** the call sites (`peer_prompt_bytes` / `pair_prompt_bytes`, generate.cpp:3104 and
+:3111) do not pass a span yet, so `stage_room` leaves no room. Wiring them belongs with the arm that fills it.
+
 ## 2b. The span catch-up, priced per TURN (P3, with the correction applied)
 
 The catch-up is **once per prompt run**, covering `[span_valid, p0)`, not per layer and not per

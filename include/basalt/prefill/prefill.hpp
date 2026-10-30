@@ -145,10 +145,28 @@ public:
     /// and the partner's own quantize, for the same A/B.
     bool set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_share, bool peer_ram_rows,
                   bool peer_rows_fp32, bool peer_acts_fp32, std::string& err);
+    /// The partner card's prompt-attention span (`--exp tp_prompt_attn`, TP2PP2-NOTES RUN 25): what the partner holds
+    /// resident on its own card to run its half of the prompt QSA attention - its KV span and indexer pooled table for
+    /// every QSA layer of the stage, the wire's staging, and its own attention scratch.  `peer_bytes` adds it, so the
+    /// partner's expert tier is sized to leave the room free (`pair_prompt_bytes` / `stage_room`).  Default off: with
+    /// the gate closed the partner reserves nothing and its tier is byte-identical to before the slice existed.
+    struct PeerQsaSpan {
+        const core::ModelGeometry* g = nullptr;
+        int64_t max_cells = 0;    ///< the sequence capacity the span must cover (the session's, not a chunk's)
+        int64_t lb = 0, le = 0;   ///< the stage's layer range, [lb, le)
+        core::QsaHeadShard heads; ///< the PARTNER's shard: which query heads and KV heads it runs
+        bool on = false;
+        /// QSA layers of this stage: `qsa_interval` over [lb, le).
+        int64_t n_qsa_layers() const;
+        /// The bytes this spans, split so the boot line can name each part.  Zero with `on` false or a geometry it
+        /// cannot price.  `T`: the widest chunk the partner can be given, which sizes the wire and the scratch.
+        void bytes(int64_t T, uint64_t* span, uint64_t* wire, uint64_t* scratch, uint64_t* total) const;
+    };
+
     /// The bytes `set_peer` takes on the peer card for chunks of up to `chunk` tokens (0: no peer share); the peer tier
-    /// leaves them free when it sizes itself.
+    /// leaves them free when it sizes itself.  `qsa` adds the prompt-attention span above.
     static uint64_t peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_rows, bool peer_rows_fp32,
-                               bool peer_acts_fp32);
+                               bool peer_acts_fp32, const PeerQsaSpan* qsa = nullptr);
     /// --peer-exclusive: experts only `peer` holds have no host copy; the prompt path copies them from its memory
     /// through host staging into the ring.  Independent of set_peer.
     void set_ring_peer(core::PeerExperts* peer);

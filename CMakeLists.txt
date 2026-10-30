@@ -1231,6 +1231,13 @@ if(BUILD_TESTING)
   target_link_libraries(prefill_route_count_test PRIVATE prefill ${_gpu_runtime_target})
   basalt_gpu_test(NAME prefill_route_count_test COMMAND prefill_route_count_test)
   set_tests_properties(prefill_route_count_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+  # the partner's prompt-attention span (--exp tp_prompt_attn) against its sizing: the figures the partner's
+  # expert tier is shrunk by, pinned without a device (qsa_prompt_state_bytes and the count walk are arithmetic)
+  add_executable(peer_qsa_span_test tests/cuda/peer_qsa_span_test.cpp)
+  target_link_libraries(peer_qsa_span_test PRIVATE prefill engine ${_gpu_runtime_target})
+  basalt_cpu_test(NAME peer_qsa_span_test COMMAND peer_qsa_span_test)
+  set_tests_properties(peer_qsa_span_test PROPERTIES TIMEOUT 120)
+
   # the prompt path's buffer layout against its sizing (no device memory), once per expert layout
   add_executable(prefill_layout_test tests/cuda/prefill_layout_test.cpp)
   target_link_libraries(prefill_layout_test PRIVATE prefill ${_gpu_runtime_target})

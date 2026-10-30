@@ -2056,8 +2056,69 @@ static bool peer_fp4_possible(bool streamed_share) {
     return peer_fp4_gate(streamed_share) == nullptr;
 }
 
+/// The partner's prompt-attention span (`--exp tp_prompt_attn`).  ONE walk prices it: `bytes` counts through the
+/// same `Alloc` the arm will carve from later, so the reserve the tier leaves free cannot drift from what
+/// `set_peer` allocates - the failure mode where a boot survives sizing and dies in the allocation.
+int64_t Prefill::PeerQsaSpan::n_qsa_layers() const {
+    if (!g || le <= lb) return 0;
+    int64_t n = 0;
+    for (int64_t l = lb; l < le; ++l) if (core::is_qsa_layer(*g, l)) ++n;
+    return n;
+}
+
+void Prefill::PeerQsaSpan::bytes(int64_t T, uint64_t* span, uint64_t* wire, uint64_t* scratch,
+                                 uint64_t* total) const {
+    if (span) *span = 0;
+    if (wire) *wire = 0;
+    if (scratch) *scratch = 0;
+    if (total) *total = 0;
+    if (!on || !g || T <= 0 || max_cells <= 0 || !heads.ok()) return;
+    const int64_t nl = n_qsa_layers();
+    if (nl <= 0) return;
+
+    // 1. the span: the partner's own QSA state a QSA layer, at its shard - its KV heads' pools, its page table,
+    // and the indexer's pooled table / tail / spare / block position it re-runs the indexer against.  The
+    // session's own sizer prices it, so a KV format change (--kv int8 / q4_0 / k8v4) moves this with it instead
+    // of needing a second ledger to be updated by hand.
+    uint64_t sp = 0;
+    for (int64_t i = 0; i < nl; ++i) sp += core::qsa_prompt_state_bytes(*g, max_cells, heads);
+
+    // 2. the wire: what lands on the partner's card per chunk, plus its partial on the way back.  The mix RUN 25
+    // settled on: the lead's FP16 mixed rows (the SAME bits its own attn_q read, so the partner's q is its own
+    // half of the lead's q), and the lead's indexer projections, which keep the selection the lead's.
+    const int64_t N = g->n_embd;
+    const basalt::kernels::QsaShapes s = core::qsa_shard_shapes(*g, heads);
+    uint64_t w = 0;
+    w += (uint64_t) T * N * 2;                                  // in: the lead's FP16 m.mixed_h
+    w += (uint64_t) T * s.idx_n_head * s.idx_dim * 4;           // in: q_idx (the lead's indexer q projection)
+    w += (uint64_t) T * s.idx_dim * 4;                          // in: idx_raw (the lead's indexer k projection)
+    w += (uint64_t) T * N * 2;                                  // out: the o_proj partial, BF16
+
+    // 3. the scratch: the partner's own per-chunk buffers for the arm it runs - its q/k/v projections, its
+    // attention, and the selection its re-run indexer produces.  At the SHARD's widths, which is where the
+    // head split pays in VRAM as well as in time.
+    Alloc a;
+    a.count_only = true;
+    bool ok = true;
+    const int64_t cap = basalt::kernels::qsa_selection_width(basalt::kernels::kTopkMaxCells, s);
+    const int64_t max_blocks = max_cells / s.idx_block + 2;
+    a.take<float>((size_t) T * heads.nq() * 2 * s.head_dim, ok);   // Qf: its query heads and their gates
+    a.take<float>((size_t) T * heads.nq() * s.head_dim, ok);       // q: the query half, post split/norm/rope
+    a.take<float>((size_t) T * heads.nq() * s.head_dim, ok);       // attn: the attention's output
+    a.take<float>((size_t) T * heads.nkv() * s.head_dim, ok);      // Kc
+    a.take<float>((size_t) T * heads.nkv() * s.head_dim, ok);      // Vc
+    a.take<int32_t>((size_t) T * cap, ok);                         // its selection
+    a.take<float>(256 * (size_t) max_blocks, ok);                  // the block scores, one selection batch
+    if (!ok) return;
+
+    if (span) *span = sp;
+    if (wire) *wire = w;
+    if (scratch) *scratch = a.used;
+    if (total) *total = sp + w + a.used;
+}
+
 uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_rows, bool peer_rows_fp32,
-                            bool peer_acts_fp32) {
+                            bool peer_acts_fp32, const PeerQsaSpan* qsa) {
     if (!mmq_plan().any) return 0;
     const basalt::kernels::cpu::ExpertLayout& lay = basalt::kernels::cpu::expert_layout();
     PeerPrefill pp;
@@ -2077,6 +2138,13 @@ uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_r
     pp.ram_rows = peer_ram_rows && tf > 0;
     uint64_t sum = 0;
     peer_layout(pp, Tp, tf, mmq_plan(), [&](size_t bytes) -> void* { sum += (bytes + 255) & ~size_t(255); return nullptr; });
+    // the prompt-attention span the partner holds resident for its half of the attention (RUN 25); null, or the
+    // gate closed, adds nothing and the partner's tier is what it was before the slice existed
+    if (qsa) {
+        uint64_t tot = 0;
+        qsa->bytes(Tp, nullptr, nullptr, nullptr, &tot);
+        sum += tot;
+    }
     return sum;
 }
 
