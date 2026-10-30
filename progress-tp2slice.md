@@ -226,7 +226,7 @@ the predictions and their re-basing). They were split out to keep each file unde
 The headline figures, restated so this file is usable on its own:
 
     wire traffic   104.9 MB a QSA layer        both modes; what the +10/+20 gates grade
-    tier reserve   1.67 GiB int8               span 0.96 + wire 0.21 (2 sets) + scratch 0.55
+    tier reserve   1.82 GiB int8               span 0.96 + wire 0.20 + scratch 0.52 + weights 0.05 + gemm 0.09
     span copy      <= 0.96 GiB per TURN        zero on a fresh prompt; ~254 ms worst case
     predictions    serialized -2/-4 ms         pipelined +18/+15 ms as an UPPER BOUND (no-extra-eviction)
 

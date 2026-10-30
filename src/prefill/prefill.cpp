@@ -2066,11 +2066,13 @@ int64_t Prefill::PeerQsaSpan::n_qsa_layers() const {
     return n;
 }
 
-void Prefill::PeerQsaSpan::bytes(int64_t T, uint64_t* span, uint64_t* wire, uint64_t* scratch,
-                                 uint64_t* total) const {
+void Prefill::PeerQsaSpan::bytes(int64_t T, uint64_t* span, uint64_t* wire, uint64_t* scratch, uint64_t* weights,
+                                 uint64_t* gemm, uint64_t* total) const {
     if (span) *span = 0;
     if (wire) *wire = 0;
     if (scratch) *scratch = 0;
+    if (weights) *weights = 0;
+    if (gemm) *gemm = 0;
     if (total) *total = 0;
     if (!on || !g || T <= 0 || max_cells <= 0 || !heads.ok()) return;
     const int64_t nl = n_qsa_layers();
@@ -2125,10 +2127,32 @@ void Prefill::PeerQsaSpan::bytes(int64_t T, uint64_t* span, uint64_t* wire, uint
     a.take<float>(256 * (size_t) max_blocks, ok);                  // the block scores, one selection batch
     if (!ok) return;
 
+    // 4. the projections, RESIDENT on the partner's card (the RUN 25 ruling).  The partner projects its own q, k
+    // and v from the lead's FP16 mixed rows, so it needs its shard's rows of `attn_q` and its KV head's rows of
+    // `attn_k`/`attn_v`, plus the q/k RMS norms those projections are normalized by.  Copied once at boot, so a
+    // QSA layer moves no weight bytes across the link: P2P weight reads were rejected precisely because they
+    // would put an unpriced ~weight-sized transfer on every chunk and void the 104.9 MB the gates grade against.
+    // The bytes-per-row come from the pack (this sizer sees geometry only); with the caller never having read
+    // them, nothing is priced here rather than guessed at a block layout the pack may not use.
+    uint64_t wt = 0;
+    if (q_row_bytes > 0 && kv_row_bytes > 0) {
+        const core::QsaHeadRun qr = core::qsa_q_rows(heads, s.head_dim);
+        const core::QsaHeadRun kr = core::qsa_kv_rows(heads, s.head_dim);
+        wt += (uint64_t) nl * ((uint64_t) qr.len * q_row_bytes + 2u * (uint64_t) kr.len * kv_row_bytes);
+        wt += (uint64_t) nl * 2u * (uint64_t) s.head_dim * 4;   // attn_q_norm, attn_k_norm (FP32 vectors)
+    }
+
+    // 5. the partner's OWN GEMM context: `Gemm::native` dequantizes each weight's GGUF blocks into a scratch on
+    // the device the product runs on, and the partner's products run on the partner.  It cannot borrow the lead's
+    // scratch or workspace across the link, so the pair's second card needs its own of both.
+    const uint64_t gm = (uint64_t) GEMM_SCRATCH * 2 + GEMM_WS;
+
     if (span) *span = sp;
     if (wire) *wire = w;
     if (scratch) *scratch = a.used;
-    if (total) *total = sp + w + a.used;
+    if (weights) *weights = wt;
+    if (gemm) *gemm = gm;
+    if (total) *total = sp + w + a.used + wt + gm;
 }
 
 uint64_t Prefill::PeerQsaSpan::wire_one_set(int64_t T) const {
@@ -2164,7 +2188,7 @@ uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_r
     // gate closed, adds nothing and the partner's tier is what it was before the slice existed
     if (qsa) {
         uint64_t tot = 0;
-        qsa->bytes(Tp, nullptr, nullptr, nullptr, &tot);
+        qsa->bytes(Tp, nullptr, nullptr, nullptr, nullptr, nullptr, &tot);
         sum += tot;
     }
     return sum;

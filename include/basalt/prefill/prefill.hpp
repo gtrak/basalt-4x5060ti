@@ -156,6 +156,13 @@ public:
         int64_t lb = 0, le = 0;   ///< the stage's layer range, [lb, le)
         core::QsaHeadShard heads; ///< the PARTNER's shard: which query heads and KV heads it runs
         bool on = false;
+        /// Bytes ONE row of `attn_q`, and of `attn_k`/`attn_v`, occupies in the pack's native GGUF blocks, as the
+        /// caller read them from the `WeightRef`s.  The RUN 25 ruling put the partner's projections RESIDENT on the
+        /// partner's card (boot-time cost, zero per-layer link traffic; P2P weight reads are rejected because they
+        /// would add unpriced per-chunk bytes and invalidate the ledger the gates grade against).  This sizer sees
+        /// geometry only, and the block geometry is the pack's, so the figures come from the caller: zero means the
+        /// pack was never consulted, and `bytes` prices NO weights rather than inventing a quantization table.
+        int64_t q_row_bytes = 0, kv_row_bytes = 0;
         /// QSA layers of this stage: `qsa_interval` over [lb, le).
         int64_t n_qsa_layers() const;
         /// How many resident sets of the wire's staging.  Two: the pipelined gate puts layer l+1's inbound on the
@@ -165,7 +172,10 @@ public:
         /// The bytes this spans, split so the boot line can name each part.  Zero with `on` false or a geometry it
         /// cannot price.  `T`: the widest chunk the partner can be given, which sizes the wire and the scratch.
         /// `wire` reports the RESIDENT bytes (`kWireSets` sets); one set is the per-layer traffic figure.
-        void bytes(int64_t T, uint64_t* span, uint64_t* wire, uint64_t* scratch, uint64_t* total) const;
+        /// `weights` is the resident shard copies of the projections and the q/k norms, `gemm` the partner's own
+        /// dequant scratch and cuBLAS workspace.  Any of them may be null.
+        void bytes(int64_t T, uint64_t* span, uint64_t* wire, uint64_t* scratch, uint64_t* weights,
+                   uint64_t* gemm, uint64_t* total) const;
         /// One set of the wire: the bytes a QSA layer actually moves across the pair's link, which is what the
         /// ledger prices and what the +10/+20 gates are graded against.
         uint64_t wire_one_set(int64_t T) const;

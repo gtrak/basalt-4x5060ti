@@ -30,6 +30,7 @@ int g_fail = 0;
 const ModelGeometry g;   // the artifact's geometry: 48 layers, 12 QSA, 24 heads, 2 KV heads, 256 dims
 constexpr int64_t CELLS = 262144;   // the shipped context, which is what the tier is sized for
 constexpr int64_t T = 8192;         // the chunk the ledger is priced at
+constexpr int64_t max_cells_for_test = CELLS;
 
 Prefill::PeerQsaSpan span_for(int64_t lb, int64_t le, int64_t lead_heads, int rank, bool on = true) {
     Prefill::PeerQsaSpan sp;
@@ -43,10 +44,10 @@ Prefill::PeerQsaSpan span_for(int64_t lb, int64_t le, int64_t lead_heads, int ra
 }
 
 uint64_t part(const Prefill::PeerQsaSpan& s, int which) {
-    uint64_t a = 0, b = 0, c = 0, t = 0;
+    uint64_t a = 0, b = 0, c = 0, w = 0, g = 0, t = 0;
     s.bytes(T, which == 0 ? &a : nullptr, which == 1 ? &b : nullptr, which == 2 ? &c : nullptr,
-            which == 3 ? &t : nullptr);
-    return which == 0 ? a : which == 1 ? b : which == 2 ? c : t;
+            which == 3 ? &w : nullptr, which == 4 ? &g : nullptr, which == 5 ? &t : nullptr);
+    return which == 0 ? a : which == 1 ? b : which == 2 ? c : which == 3 ? w : which == 4 ? g : t;
 }
 
 // The ledger's "MB" are 10^6 bytes (how the wire figures are quoted) and its "GiB" are 2^30 (how the tier
@@ -57,16 +58,16 @@ constexpr double GiB = 1024.0 * MiB;
 
 void test_gate_closed() {
     const Prefill::PeerQsaSpan off = span_for(0, 24, 12, 1, /*on=*/false);
-    CHECK(part(off, 3) == 0);
+    CHECK(part(off, 5) == 0);
     CHECK(part(off, 0) == 0);
     // a span the caller never turned on must not shrink a tier
     const Prefill::PeerQsaSpan bad = span_for(0, 24, 12, 1);
     Prefill::PeerQsaSpan no_geom = bad;
     no_geom.g = nullptr;
-    CHECK(part(no_geom, 3) == 0);
+    CHECK(part(no_geom, 5) == 0);
     Prefill::PeerQsaSpan no_shard = bad;
     no_shard.heads = QsaHeadShard{};
-    CHECK(part(no_shard, 3) == 0);
+    CHECK(part(no_shard, 5) == 0);
 }
 
 void test_layer_count() {
@@ -133,15 +134,15 @@ void test_wire_is_the_filed_mix() {
 
 void test_total_is_the_sum_of_parts() {
     const Prefill::PeerQsaSpan s = span_for(0, 24, 12, 1);
-    const uint64_t a = part(s, 0), b = part(s, 1), c = part(s, 2), t = part(s, 3);
-    CHECK(t == a + b + c);
+    const uint64_t a = part(s, 0), b = part(s, 1), c = part(s, 2), t = part(s, 5);
+    CHECK(t == a + b + c + part(s, 3) + part(s, 4));   // every term, so none can go unpriced
     CHECK(a > 0 && b > 0 && c > 0);
     // the span dominates, and it is the term the partner's tier pays for the slice: 6 QSA layers of KV + indexer
     CHECK(a > b && a > c);
     std::printf("fp16: span %.2f GiB  wire %.1f MB  scratch %.1f MB  total %.2f GiB\n", (double) a / GiB,
                 (double) b / MB, (double) c / MB, (double) t / GiB);
     // the reservation delta the second wire set buys: honest about what the overlap costs the partner's tier
-    const uint64_t single = a + s.wire_one_set(T) + c;
+    const uint64_t single = a + s.wire_one_set(T) + c + part(s, 3) + part(s, 4);
     std::printf("        second wire set costs %+.0f MB of tier (%.2f -> %.2f GiB total)\n",
                 (double) (t - single) / MB, (double) single / GiB, (double) t / GiB);
     CHECK(t > single);
@@ -150,13 +151,52 @@ void test_total_is_the_sum_of_parts() {
     CHECK((double) a / GiB > 1.6 && (double) a / GiB < 1.85);
     // the shipped boot: --kv int8, which is what RUN 25's adopted ~1.0 GiB figure prices
     qsa_set_kv_int8(true);
-    const uint64_t i_a = part(s, 0), i_t = part(s, 3);
+    const uint64_t i_a = part(s, 0), i_t = part(s, 5);
     qsa_set_kv_int8(false);
     CHECK(i_a < a);   // int8 really did narrow it; a format the sizer ignored would fail here
-    CHECK(i_t == i_a + b + c);
-    std::printf("int8: span %.2f GiB  total %.2f GiB (RUN 25 adopted 1.006)\n", (double) i_a / GiB,
-                (double) i_t / GiB);
+    CHECK(i_t == i_a + b + c + part(s, 3) + part(s, 4));
+    std::printf("int8: span %.2f GiB  wire %.2f GiB  scratch %.2f GiB  weights %.2f GiB  gemm %.2f GiB  "
+                "TOTAL %.2f GiB\n",
+                (double) i_a / GiB, (double) b / GiB, (double) c / GiB, (double) part(s, 3) / GiB,
+                (double) part(s, 4) / GiB, (double) i_t / GiB);
     CHECK((double) i_a / GiB > 0.90 && (double) i_a / GiB < 1.12);
+    // the partner's own GEMM context: it cannot borrow the lead's dequant scratch or cuBLAS workspace across
+    // the link, so the pair's second card pays for its own of both
+    CHECK(part(s, 4) == (uint64_t) (32ll << 20) * 2 + (32u << 20));
+    CHECK(part(s, 4) > GiB * 0.09 && part(s, 4) < GiB * 0.10);
+}
+
+void test_resident_projections_are_priced() {
+    // The RUN 25 ruling: the partner's projections are resident on the partner's card, copied at boot, so a QSA
+    // layer moves no weight bytes.  With the pack never consulted the sizer prices NOTHING rather than invent a
+    // block layout - a guessed quantization table would put a wrong number on the tier figure.
+    Prefill::PeerQsaSpan s = span_for(0, 24, 12, 1);
+    CHECK(part(s, 3) == 0);
+    const int64_t qrow = 1280, kvrow = 1280;   // a Q2_0-class row of n_embd 2560
+    s.q_row_bytes = qrow;
+    s.kv_row_bytes = kvrow;
+    // 6 layers x (12 heads x 2 x 256 rows of attn_q  +  1 KV head x 256 rows each of attn_k and attn_v)
+    // the row runs are asserted as literals, not via qsa_q_rows, so a wrong run would show here
+    const uint64_t per_layer = (6144ull * qrow) + 2ull * (256ull * kvrow) + 2ull * 256ull * 4ull;
+    CHECK(part(s, 3) == 6ull * per_layer);
+    std::printf("resident projections: %.3f GiB over 6 QSA layers (attn_q rows 6144, attn_k/v rows 256)\n",
+                (double) part(s, 3) / GiB);
+    // half the heads is half the attn_q residency, but the norms are not halved away
+    Prefill::PeerQsaSpan narrow = span_for(0, 24, 20, 1);   // the partner takes 4 heads
+    narrow.q_row_bytes = qrow;
+    narrow.kv_row_bytes = kvrow;
+    CHECK(part(narrow, 3) < part(s, 3));
+    // an uneven ratio gives the partner MORE heads and therefore more resident weight
+    Prefill::PeerQsaSpan heavy = span_for(0, 24, 8, 1);     // the partner takes 16 heads
+    heavy.q_row_bytes = qrow;
+    heavy.kv_row_bytes = kvrow;
+    CHECK(part(heavy, 3) > part(s, 3));
+    CHECK(part(heavy, 5) > part(s, 5));   // and the tier figure carries it, one honest number
+    // residency, not traffic: the projections do not grow with the chunk length or the context, only the span
+    // does -- which is what makes them a boot-time cost rather than a per-layer one
+    Prefill::PeerQsaSpan twice = s;
+    twice.max_cells = max_cells_for_test * 2;   // a longer context grows the SPAN, not the weights
+    CHECK(part(twice, 3) == part(s, 3));
 }
 
 void test_uneven_ratio_stays_funded() {
@@ -170,7 +210,7 @@ void test_uneven_ratio_stays_funded() {
     // a ratio that is not a whole KV group is still priced (the attention kernels refuse it elsewhere, at
     // qsa_shard_whole_groups, and the sizing must not be the place that silently drops it)
     const Prefill::PeerQsaSpan straddle = span_for(0, 24, 10, 1);
-    CHECK(part(straddle, 3) > 0);
+    CHECK(part(straddle, 5) > 0);
     CHECK(!qsa_shard_whole_groups(straddle.heads));
 }
 
@@ -183,6 +223,7 @@ int main() {
     test_shard_narrows_kv_only();
     test_wire_is_the_filed_mix();
     test_total_is_the_sum_of_parts();
+    test_resident_projections_are_priced();
     test_uneven_ratio_stays_funded();
     if (g_fail == 0) std::printf("peer_qsa_span_test: ok\n");
     else std::printf("peer_qsa_span_test: %d FAILED\n", g_fail);

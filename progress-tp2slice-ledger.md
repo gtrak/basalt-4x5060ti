@@ -84,6 +84,40 @@ was about the *source* (the peer's expert tier — not `--peer-reserve-mib`, not
 (the shrink priced in share-v2's model rather than hidden in a reserve). Neither moved when the figure did.
 What moved is the arithmetic the projections carry: see §3a.
 
+## 2e. The resident projections and the partner's own GEMM context (RUN 25 rulings)
+
+**(2) ruled: RESIDENT COPIES, P2P weight reads rejected.** The partner projects its own q/k/v, so its shard's
+rows of `attn_q`, its KV head's rows of `attn_k`/`attn_v`, and the q/k RMS norms live resident on the partner's
+card, copied at boot: a boot-time cost and **zero per-layer link traffic**. P2P reads of the lead's weights were
+rejected because they would put an unpriced weight-sized transfer on every chunk, invalidating the 104.9 MB the
+gates grade against, and re-introduce the move-data-inefficiently pattern this campaign exists to delete.
+
+The sizer sees geometry only and block geometry belongs to the pack, so `q_row_bytes`/`kv_row_bytes` come from
+the caller's `WeightRef`s; **with them unset the sizer prices no weights at all rather than inventing a
+quantization table.** The test pins the row runs as literals — 6144 rows of `attn_q` (12 heads x 2 x 256) and
+256 rows each of `attn_k`/`attn_v` at the symmetric cut, x 6 layers, plus the two norms — so a wrong row run
+shows up rather than quietly under-funding the tier.
+
+**(1) settled from the API: the partner runs its own `Gemm`.** `Gemm::native` dequantizes each weight's GGUF
+blocks into a scratch **on the device the product runs on**, and the partner's products run on the partner, so
+it cannot borrow the lead's scratch or cuBLAS workspace across the link. The span therefore carries a second
+card's worth of both: `GEMM_SCRATCH * 2 + GEMM_WS` = **0.093 GiB**. This is why the partner's arm will hold its
+own `Gemm` rather than share `Impl::gemm`.
+
+The tier figure, one honest number, int8 shipped boot (`--kv int8`, 262144 cells, 8192-token chunk):
+
+    span     0.96 GiB   KV span + indexer pooled, 6 QSA layers at the shard
+    wire     0.20 GiB   2 sets (traffic stays 104.9 MB a layer)
+    scratch  0.52 GiB   shard-width q/k/v/attn + selection, one set
+    weights  0.05 GiB   resident projections at a Q2_0-class row (pack-dependent: 6 x 6144 x q_row_bytes + ...)
+    gemm     0.09 GiB   the partner's own dequant scratch + cuBLAS workspace
+    TOTAL    1.82 GiB   ~11.5% of the 15.8 GiB half-depth carve
+
+1.77 GiB is the figure with the projections unpriced (the test's default, pack not consulted); 1.82 GiB is with
+them priced at a Q2_0-class 1280 B row. **The boot reads the real row bytes from the pack, so the boot line must
+print this total** — the projection term is the only one that depends on the quantization type, and a heavier
+type moves the tier figure without moving anything else.
+
 ## 3. Predictions, filed before measuring
 
 Graded against the task's dual rule on the same boot, vs EP+PP without the slice.
