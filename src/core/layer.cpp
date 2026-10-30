@@ -563,12 +563,15 @@ bool qsa_shard_ready(const QsaState& st, const QsaBuffers& b, int64_t layer, std
     return true;
 }
 
-uint64_t qsa_pair_bytes(const WeightTable& tables, const ModelGeometry& g, const QsaHeadShard& heads) {
+uint64_t qsa_pair_bytes(const WeightTable& tables, const ModelGeometry& g, const QsaHeadShard& heads, int64_t lb,
+                        int64_t le) {
     std::string ignore;
     if (!qsa_shard_runs(heads, ignore) || heads.whole()) return 0;
+    lb = std::max<int64_t>(lb, 0);
+    le = std::min<int64_t>(le, g.n_layers);
     const QsaHeadRun cols = qsa_out_cols(heads, g.head_dim);
     uint64_t total = 0;
-    for (int64_t l = 0; l < g.n_layers; ++l) {
+    for (int64_t l = lb; l < le; ++l) {
         if (!is_qsa_layer(g, l)) continue;
         const WeightRef* w = LayerView(tables, l).get("attn_output.weight");
         if (w == nullptr) continue;   // qsa_layer reports a missing tensor; sizing stays conservative
@@ -678,11 +681,18 @@ static bool qsa_prepare_one(QsaPair& p, const WeightRef& w, const std::string& n
 }
 
 bool qsa_pair_prepare(QsaPair& p, const WeightTable& tables, const ModelGeometry& g, const QsaHeadShard& heads,
-                      basalt::kernels::Tp2Pair& pair, int dev, int peer_dev, std::string& err) {
+                      basalt::kernels::Tp2Pair& pair, int dev, int peer_dev, int64_t lb, int64_t le,
+                      std::string& err) {
     qsa_pair_free(p);
     if (!qsa_shard_runs(heads, err)) return false;
     if (heads.whole()) { err = "qsa: a whole layer needs no pair; the shard is what the pair is for"; return false; }
     if (!pair.valid()) { err = "qsa: the stage pair is not open"; return false; }
+    if (lb < 0 || le > g.n_layers || lb >= le) {
+        err = "qsa: the pair's layer range [" + std::to_string((long long) lb) + ", " +
+              std::to_string((long long) le) + ") is not inside the model's [0, " +
+              std::to_string((long long) g.n_layers) + ")";
+        return false;
+    }
     if (dev != pair.device(0) && dev != pair.device(1)) {
         err = "qsa: CUDA" + std::to_string(dev) + " is not one of the stage pair's cards";
         return false;
@@ -698,7 +708,7 @@ bool qsa_pair_prepare(QsaPair& p, const WeightTable& tables, const ModelGeometry
     p.rank = heads.rank;
     p.device = dev;
     p.peer_dev = peer_dev;
-    for (int64_t l = 0; l < g.n_layers; ++l) {
+    for (int64_t l = lb; l < le; ++l) {
         if (!is_qsa_layer(g, l)) continue;
         const LayerView v(tables, l);
         const WeightRef* w = v.get("attn_output.weight");
@@ -707,13 +717,26 @@ bool qsa_pair_prepare(QsaPair& p, const WeightTable& tables, const ModelGeometry
             qsa_pair_free(p);
             return false;
         }
+        if (qsa_native_bytes(*w) == 0 && !qsa_weight_has_planes(*w)) {
+            // THE SHAPE OF THIS REFUSAL MATTERS.  A stage card holds the attention projections of its own layers
+            // in one form or the other; a layer of the OTHER stage has neither (its canonical bytes were skipped
+            // and its native image belongs to the other stage's range), so asking for it here is the caller
+            // handing a stage-scoped table a whole-model range - not a pack that cannot be cut.
+            err = v.name("attn_output.weight") +
+                  " carries neither canonical planes nor a native image on this card: a stage's table holds its "
+                  "own layers' projections, so the pair must be prepared over the stage's range";
+            qsa_pair_free(p);
+            return false;
+        }
         if (!qsa_prepare_one(p, *w, v.name("attn_output.weight"), cols.start, cols.len, l, dev, err)) {
             qsa_pair_free(p);
             return false;
         }
     }
-    basalt::log::info("basalt tp2", "CUDA%d holds rank %d's attn_output columns, %llu MiB over %zu layers", dev,
-            heads.rank, (unsigned long long) (qsa_pair_bytes(tables, g, heads) / 1048576), p.owned.size());
+    basalt::log::info("basalt tp2",
+                      "CUDA%d holds rank %d's attn_output columns, %llu MiB over layers [%lld, %lld), %zu buffers",
+                      dev, heads.rank, (unsigned long long) (qsa_pair_bytes(tables, g, heads, lb, le) / 1048576),
+                      (long long) lb, (long long) le, p.owned.size());
     return true;
 }
 

@@ -392,14 +392,25 @@ struct QsaPair {
     std::vector<void*> owned;
 };
 
-/// Pack every QSA layer's `attn_output` columns for `heads` and put them on `dev`.  This is the only weight copy
-/// the head split needs - the q/k/v projections are cut on their output axis and are pointer views.
+/// Pack the stage's QSA layers' `attn_output` columns for `heads` and put them on `dev`.  This is the only weight
+/// copy the head split needs - the q/k/v projections are cut on their output axis and are pointer views.
+///
+/// THE RANGE IS THE STAGE, NOT THE MODEL.  A stage card's table carries the attention projections for its OWN
+/// layers only: the loader skips their canonical bytes and `NativeDense` attaches the native images inside a
+/// per-stage layer range, so `attn_output` of another stage's layer has NEITHER form on this card.  Asking for
+/// the whole model was therefore a refusal by construction - and it refused at the first QSA layer of the OTHER
+/// stage, which reads like a pack problem and is not one.  `o_cols` stays indexed by ABSOLUTE layer number so a
+/// caller can ask for a layer by the number the kernels use; entries outside the range stay `!ok`, and running
+/// one is what `qsa_shard_ready` refuses.
 /// On failure nothing is left half-built.
 bool qsa_pair_prepare(QsaPair& p, const WeightTable& tables, const ModelGeometry& g, const QsaHeadShard& heads,
-                      basalt::kernels::Tp2Pair& pair, int dev, int peer_dev, std::string& err);
+                      basalt::kernels::Tp2Pair& pair, int dev, int peer_dev, int64_t lb, int64_t le,
+                      std::string& err);
 void qsa_pair_free(QsaPair& p);
-/// The device bytes `qsa_pair_prepare` will allocate: what the caller's arena or budget must cover.
-uint64_t qsa_pair_bytes(const WeightTable& tables, const ModelGeometry& g, const QsaHeadShard& heads);
+/// The device bytes `qsa_pair_prepare` will allocate over `[lb, le)`: what the caller's arena or budget must
+/// cover.  One expression with the prepare, so the tier's reserve and the allocation cannot drift.
+uint64_t qsa_pair_bytes(const WeightTable& tables, const ModelGeometry& g, const QsaHeadShard& heads, int64_t lb,
+                        int64_t le);
 
 /// The native image's whole bytes for a tensor, or 0 when it has no native projection.  One row's figure is
 /// `native_mmvq_weight_bytes(type, ne0, 1)`; this multiplies by the rows.  Shared with the partner's span sizer

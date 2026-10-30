@@ -2232,12 +2232,12 @@ bool peer_qsa_pair_up(PeerPrefill& P, const core::ModelGeometry& g, const core::
     // swapped pair fails here instead of silently reducing two copies of one card's half.
     const core::QsaHeadShard lead_sh = core::qsa_pair_shard(g.n_head, g.n_head_kv, lead_heads, /*rank*/ 0);
     const core::QsaHeadShard peer_sh = core::qsa_pair_shard(g.n_head, g.n_head_kv, lead_heads, /*rank*/ 1);
-    if (!core::qsa_pair_prepare(qs.lead_cols, wt, g, lead_sh, qs.pair, lead_dev, P.dev, err)) {
+    if (!core::qsa_pair_prepare(qs.lead_cols, wt, g, lead_sh, qs.pair, lead_dev, P.dev, lb, le, err)) {
         err = "prefill peer: the lead's attn_output columns did not build: " + err;
         qs.pair.close();
         return false;
     }
-    if (!core::qsa_pair_prepare(qs.peer_cols, wt, g, peer_sh, qs.pair, P.dev, lead_dev, err)) {
+    if (!core::qsa_pair_prepare(qs.peer_cols, wt, g, peer_sh, qs.pair, P.dev, lead_dev, lb, le, err)) {
         err = "prefill peer: the partner's attn_output columns did not build: " + err;
         core::qsa_pair_free(qs.lead_cols);
         qs.pair.close();
@@ -2262,7 +2262,7 @@ bool peer_qsa_pair_up(PeerPrefill& P, const core::ModelGeometry& g, const core::
     }
     if (built == 0) { err = "prefill peer: the stage holds no QSA layer, so there is nothing to reduce"; return false; }
     if (qs.lead_cols.o_cols.size() != (size_t) g.n_layers || qs.peer_cols.o_cols.size() != (size_t) g.n_layers) {
-        err = "prefill peer: the packed columns were not built over the whole model";
+        err = "prefill peer: the packed columns are not indexed by absolute layer number";
         return false;
     }
     // The columns reduce; these are what the arm PROJECTS with.  Filled here, once, so a QSA layer's arm never
@@ -3148,7 +3148,11 @@ uint64_t Prefill::lead_qsa_bytes(const core::ModelGeometry& g, const core::Weigh
     // figure `peer_bytes` books for the partner's - and it is a `Tp2Pair::open` allocation, not the arm's walk,
     // exactly as the partner's is.
     const uint64_t staging = ((uint64_t) chunk * (uint64_t) g.n_embd * 4u + 255) & ~uint64_t(255);
-    return staging + core::qsa_pair_bytes(wt, g, lead_sh);
+    // The whole model's range, deliberately: the tier's reserve is struck before the boot knows which stage's
+    // lead it is pricing, and `qsa_pair_bytes` prices only layers the TABLE can price - a stage-scoped table
+    // holds neither canonical bytes nor a native image for another stage's layer, so those terms come out 0 and
+    // the figure is that stage's own.  A whole-model table therefore over-reserves, which is the ruled direction.
+    return staging + core::qsa_pair_bytes(wt, g, lead_sh, 0, g.n_layers);
 }
 
 bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_share, bool peer_ram_rows,

@@ -330,6 +330,66 @@ void test_uneven_ratio_stays_funded() {
 
 }  // namespace
 
+namespace basalt::core {
+/// Builds a `WeightTable` row by row (the friend the shape-check test uses, defined again in this TU) so the
+/// pair's column sizer can be exercised on a table shaped like a STAGE's: the attention projections the shipped
+/// artifact serves from its GGUF section exist as a native image only for the layers that stage was given
+/// (`NativeDense::set_layer_range(st.lo, st.hi)`), and carry neither form anywhere else.
+struct WeightTableFixture {
+    static void put(WeightTable& t, const std::string& name, const WeightRef& r) { t.table_[name] = r; }
+};
+}  // namespace basalt::core
+
+namespace {
+
+/// The pair's packed `attn_output` columns, priced over a LAYER RANGE, on a table that only carries the stage's
+/// own layers.  The first gated boot died here: `qsa_pair_prepare` walked the whole model and refused on the
+/// other stage's first QSA layer, whose `attn_output` has no bytes at all on this card - it read as a pack that
+/// could not be cut (`native 0 B`) and was really a stage-scoped table asked for a whole-model range.
+void test_the_pair_prices_its_stages_layers() {
+    const int64_t Q6K_ROW = 210 * 24;   // one row of the artifact's Q6_K attn_output
+    const uint64_t image = (uint64_t) Q6K_ROW * 2560;
+    std::vector<uint8_t> dummy(1);      // never read: the sizer prices, it does not dereference
+    auto native_only = [&](WeightRef& r) {
+        r.ne0 = 24 * 256;
+        r.ne1 = 2560;
+        r.kind = WeightKind::Verbatim;
+        r.code_bits = 8;   // quantized metadata, but no canonical bytes: what the index records for this pack
+        r.group_elems = 32;
+        r.resident = false;
+        r.data = nullptr;
+        r.bytes = r.codes_bytes = r.scales_bytes = r.offset_bytes = 0;
+        r.has_offset = false;
+        r.native_data = dummy.data();
+        r.native_type = 14;   // Q6_K
+    };
+    WeightTable stage_a;
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        if (!is_qsa_layer(g, l)) continue;
+        WeightRef r;
+        if (l < 24) native_only(r);   // stage A's table: its own layers have images, the rest have nothing
+        else { r.ne0 = 24 * 256; r.ne1 = 2560; r.resident = false; }   // no planes, no native image
+        WeightTableFixture::put(stage_a, "blk." + std::to_string(l) + ".attn_output.weight", r);
+    }
+    const QsaHeadShard rank1 = qsa_pair_shard(g.n_head, g.n_head_kv, g.n_head / 2, /*rank*/ 1);
+    const uint64_t one_layer = (uint64_t) (6451200ull + 15) & ~uint64_t(15);
+    CHECK(qsa_weight_cols_bytes(*LayerView(stage_a, 3).get("attn_output.weight"), 12 * 256, 12 * 256, image) ==
+          6451200ull);
+    // the stage's range prices six layers; the other stage's prices nothing, and the whole model is the same
+    // figure rather than double it - the property `lead_qsa_bytes` relies on when it reserves over [0, n_layers)
+    CHECK(qsa_pair_bytes(stage_a, g, rank1, 0, 24) == 6 * one_layer);
+    CHECK(qsa_pair_bytes(stage_a, g, rank1, 24, 48) == 0);
+    CHECK(qsa_pair_bytes(stage_a, g, rank1, 0, g.n_layers) == qsa_pair_bytes(stage_a, g, rank1, 0, 24));
+    // a range with no QSA layer in it prices nothing rather than under-flowing, and one that leaves the model is
+    // clamped rather than reading rows that do not exist
+    CHECK(qsa_pair_bytes(stage_a, g, rank1, 4, 6) == 0);
+    CHECK(qsa_pair_bytes(stage_a, g, rank1, -8, 60) == qsa_pair_bytes(stage_a, g, rank1, 0, 24));
+    std::printf("pair columns: %.1f MiB a QSA layer, %.1f MiB over a stage of 6\n", one_layer / MiB,
+                (6.0 * one_layer) / MiB);
+}
+
+}  // namespace
+
 int main() {
     test_the_reserve_refuses_a_wider_split_by_name();
     test_o_cols_and_types_are_funded();
@@ -341,6 +401,7 @@ int main() {
     test_total_is_the_sum_of_parts();
     test_resident_projections_are_priced();
     test_uneven_ratio_stays_funded();
+    test_the_pair_prices_its_stages_layers();
     if (g_fail == 0) std::printf("peer_qsa_span_test: ok\n");
     else std::printf("peer_qsa_span_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;
