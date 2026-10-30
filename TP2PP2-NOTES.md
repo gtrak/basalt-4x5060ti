@@ -2412,7 +2412,15 @@ start); prompt-sourced short matches still need `min_match`.
 5. Kill criterion check: if reseeded acc < 55% of fresh-session acc, close P2-4 as "tail distribution
    resists re-seeding" — do not iterate.
 
-## RUN 24 — the link's real shape: one ~7.8 GiB/s pool for four cards, and the AR's floor (step 0, no engine change)
+## RUN 24 — the link's real shape: one ~7.8 GiB/s pool for four cards, and the AR's floor
+**Topology correction (owner, post-run):** the four cards share ONE x16 uplink, bifurcated
+x4 per card. The ~7.8 GiB/s pool is the d2d (peer round-trip through the root) face of that
+link; the h2d face (RAM->card tier streaming) can use the whole x16 concurrently
+(~24-30 GB/s observed; the split's 18.4 GiB/s aggregate is this face). The two faces
+CONTEND: tier fill and the AR compete for the same silicon, which is Finding 2's queueing
+seen from the other side. Utilization arithmetic must use the right face per flow: streaming
+wall = bytes / (h2d face x util), AR wall = bytes / (~8.6 GiB/s d2d face), not one pool.
+ (step 0, no engine change)
 
 Scope (reviewer, mid-run): **TP=4 is dropped**. The target is PP=2 + true TP=2 — 2 stages × 24 layers, every
 expert sharded 2-way, attention head-split. Quarter-width / 640-sliceability analysis and the 4-deep
