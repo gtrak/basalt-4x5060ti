@@ -5457,7 +5457,7 @@ int main(int argc, char** argv) {
                         // blobs another card's cache holds: borrowed pointers, one per QSA layer of the stage in
                         // layer order, which is the order the partner's states were carved in.  Without it a
                         // second prompt on a session that decoded would fail rather than guess at its own cache.
-                        hand_peer_qsa_lead(st.sp, st.ss, basalt::program::pair_lead_dev(i, o.tp_size));
+                        hand_peer_qsa_lead(st.sp, st.ss, st.dev);   // the card its Prefill runs on
                     }
                 }
             }
