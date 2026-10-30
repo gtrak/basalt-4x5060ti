@@ -2422,7 +2422,17 @@ CONTEND: tier fill and the AR compete for the same silicon, which is Finding 2's
 seen from the other side. Utilization arithmetic must use the right face per flow: streaming
 wall = bytes / (h2d face x util), AR wall = bytes / (~8.6 GiB/s d2d face), not one pool.
 
-Scope (reviewer, mid-run): **TP=4 is dropped**. The target is PP=2 + true TP=2 — 2 stages × 24 layers, every
+Scope note, CORRECTED (owner, 04:40 UTC): an earlier mid-run scope line said "TP=4 is dropped" — that was the
+supervisor's over-reading of the owner's "we don't need the bench anymore" (which cancelled only the pre-substrate
+overlap-cadence bench). **TP=4 remains on the table.** The amended sequence: TP=2/PP=2 first (its milestone is in
+flight; the slice, the AR transport, the stagger scheduler and the sharding precision gate are shared substrate),
+then TP=4's go/no-go re-priced from TP=2's MEASURED coefficients. TP=4's own outstanding measurements: the 640-wide
+pack inspection (cheap; 1280 proved a pure-offset view, so 640 = four contiguous runs is plausible but unverified),
+the quarter-width MMQ sweep (the 1.2-1.4x efficiency penalty, unmeasured at 640), and the 4-deep rendezvous cadence
+(the cancelled bench — revisit only if TP=2's measured cadence data does not transfer). Original scope line kept
+below for the audit trail.
+
+Scope (reviewer, mid-run): ~~TP=4 is dropped~~ (see correction above). The target is PP=2 + true TP=2 — 2 stages × 24 layers, every
 expert sharded 2-way, attention head-split. Quarter-width / 640-sliceability analysis and the 4-deep
 overlap cadence are out. What step 0 had to settle before any substrate work: the small-payload AR latency
 floor, whether a 1280-wide N-slice of gate/up is a pure-offset view, and the per-path byte ledger with each
