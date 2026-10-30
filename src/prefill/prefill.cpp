@@ -795,6 +795,18 @@ struct PeerPrefill {
         basalt::kernels::Tp2Pair pair;
         core::QsaPair lead_cols, peer_cols;
 
+        /// THE PAIR-AGREEMENT RING (`--exp tp_prompt_attn`): `basalt::kernels::kTp2Samples` floats of each card's
+        /// SUMMED `o_proj` partial for each sliced QSA layer of the chunk, one ring per card, both zeroed at the
+        /// chunk's start.  After a collective both cards hold the same sum - each added its own partial and its
+        /// peer's, and IEEE addition commutes - so the two rings must match element for element when the chunk
+        /// ends.  Nothing else in the engine can see a pair that disagreed about what it summed: a partial taken
+        /// from the peer's NEXT layer, or one the spin budget abandoned, reaches the model as a plausible token.
+        /// Compared where the chunk's other collective verdict is read (the `timed_out()` read in `prefill.cpp`),
+        /// which fails the request and names the layer.  Allocated beside the pair rather than by the tier's walk,
+        /// and priced with it, because it is the pair's own bookkeeping.
+        float* chk[2] = {nullptr, nullptr};   // [0] the lead card's ring, [1] the partner's
+        int chk_layers = 0;                   // ring length in layers: the stage's QSA layer count
+
         Gemm gemm;                    // this card's own (see the header note)
         uint16_t* gscratch = nullptr;
         void* gws = nullptr;
@@ -875,6 +887,13 @@ struct PeerPrefill {
         // than with `owned`, which is the walk's bookkeeping and must stay exactly 68 allocations.
         core::qsa_pair_free(qsa.lead_cols);
         core::qsa_pair_free(qsa.peer_cols);
+        // The agreement rings are the pair's own allocations, like its staging: not the walk's, so not `owned`.
+        // The lead's ring lives on the LEAD's card, so it goes while that card is current, as the lead's events do.
+        if (qsa.chk[1]) cudaFree(qsa.chk[1]);
+        qsa.chk[1] = nullptr;
+        { const core::OnDevice on_lead(prim);
+          if (qsa.chk[0]) cudaFree(qsa.chk[0]);
+          qsa.chk[0] = nullptr; }
         qsa.pair.close();
         // The two lead-side proofs belong to the LEAD's context, where they were created (`make_peer`), so they
         // are destroyed while it is current; the arm's own stream and `ev_out` belong to this card.
@@ -2264,6 +2283,22 @@ bool peer_qsa_pair_up(PeerPrefill& P, const core::ModelGeometry& g, const core::
         return false;
     }
 
+    // THE PAIR-AGREEMENT RINGS, one per card, each on its own card: what each side summed, sampled per layer and
+    // compared at the chunk boundary.  `kTp2Samples` floats a layer over the stage's QSA layers - a few hundred
+    // bytes a card, so it is priced beside the pair's staging rather than through the tier's 68-allocation walk.
+    qs.chk_layers = (int) qs.span.n_qsa_layers();
+    for (int r = 0; r < 2 && qs.chk_layers > 0; ++r) {
+        const core::OnDevice on(r == 0 ? lead_dev : P.dev);
+        if (cudaMalloc((void**) &qs.chk[r], (size_t) qs.chk_layers * basalt::kernels::kTp2Samples * 4) !=
+            cudaSuccess) {
+            qs.chk[r] = nullptr;
+            err = "prefill peer: the pair's agreement ring on CUDA" +
+                  std::to_string(r == 0 ? lead_dev : P.dev) + " would not allocate";
+            qs.pair.close();
+            return false;
+        }
+    }
+
     // Each card's columns, packed by the code the decode shard path already uses, at the rank each card holds in
     // THIS pair.  `qsa_pair_prepare` derives rank from the device it is given and refuses a mismatch, so a
     // swapped pair fails here instead of silently reducing two copies of one card's half.
@@ -2722,6 +2757,21 @@ bool peer_qsa_finish(PeerPrefill& P, Gemm& lead_gemm, cudaStream_t lead_cs, cons
     if (!basalt::kernels::tp2_all_reduce(qs.pair, lead_partial, T, N, lead_cs, P.dev, /*rank*/ 0, err, w)) {
         err = "prefill: the lead's half of layer " + std::to_string(layer) + ": " + err;
         return false;
+    }
+    // ---- THE PAIR-AGREEMENT SAMPLE: each card records a few elements of the sum it ended up with, on the stream
+    // that produced it.  Both cards added the same two partials and IEEE addition commutes, so the two rings must
+    // agree element for element when the chunk ends (`PeerPrefill::Qsa::chk`) - the one thing an outside reader
+    // cannot tell from a half reduce or a neighbouring layer's partial, both of which arrive as plausible tokens.
+    // The comparison rides with the chunk's other collective verdict, where a run can still be failed.
+    if (qs.chk[0] != nullptr && qs.chk[1] != nullptr && li < qs.chk_layers) {
+        std::string serr;
+        if (!basalt::kernels::tp2_sample_partial(qs.chk[1] + (size_t) li * basalt::kernels::kTp2Samples,
+                                                qs.part_f32[w], T, N, qs.s, serr) ||
+            !basalt::kernels::tp2_sample_partial(qs.chk[0] + (size_t) li * basalt::kernels::kTp2Samples,
+                                                lead_partial, T, N, lead_cs, serr)) {
+            err = "peer QSA: the pair's agreement sample: " + serr;
+            return false;
+        }
     }
     // The two proofs the next layer's publish and push wait on, recorded after the two adds were enqueued - each
     // on the card whose stream it records into, which is where each event was created (`make_peer`).
@@ -3249,9 +3299,14 @@ uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_r
         // of counted by `last_takes()` - the 68 allocations are the arm's, and adding to them would pin a number
         // that does not describe them.  Sized from the same chunk the span is, so the tier and the pair cannot
         // disagree about the widest partial in flight.  The lead's own staging is the lead card's budget to make.
-        if (qsa->on && qsa->g)
+        if (qsa->on && qsa->g) {
             sum += (uint64_t) ((Tp * qsa->g->n_embd * 4 + 255) & ~size_t(255)) *
                    (uint64_t) (qsa->staging_sets > 1 ? qsa->staging_sets : 1);
+            // ... and this card's pair-agreement ring: `kTp2Samples` floats a QSA layer, what the card summed per
+            // layer so the pair can be asked, at the chunk's end, whether the two cards summed the same thing.
+            // Allocated with the pair, so priced with it rather than through the walk's allocation count.
+            sum += (uint64_t) ((qsa->n_qsa_layers() * basalt::kernels::kTp2Samples * 4 + 255) & ~size_t(255));
+        }
     }
     return sum;
 }
@@ -3785,6 +3840,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // Did any layer of this chunk go through the pair?  The chunk's timeout read is only owed by a chunk that
         // used the collective; a chunk that ran whole owes it nothing and must not pay a sync for it.
         bool qsa_sliced = false;
+        // THE PAIR-AGREEMENT RINGS start zeroed, on the streams that will fill them: a layer that sampled on one
+        // card and not the other is then a mismatch at the chunk's end rather than two slots of stale bytes that
+        // happened to agree (and never a pair that had nothing to say agreeing with itself).
+        if (m.pp && m.pp->qsa.live && m.pp->qsa.chk[0] != nullptr && m.pp->qsa.chk[1] != nullptr &&
+            m.pp->qsa.chk_layers > 0) {
+            const size_t rb = (size_t) m.pp->qsa.chk_layers * basalt::kernels::kTp2Samples * 4;
+            { const core::OnDevice on_lead(m.pp->qsa.lead_dev);
+              if (cudaMemsetAsync(m.pp->qsa.chk[0], 0, rb, m.cs) != cudaSuccess) {
+                  err = "prefill: the lead's agreement ring would not be cleared";
+                  m.qsa_refused = true;
+                  return false;
+              } }
+            { const core::OnDevice on_partner(m.pp->dev);
+              if (cudaMemsetAsync(m.pp->qsa.chk[1], 0, rb, m.pp->qsa.s) != cudaSuccess) {
+                  err = "prefill: the partner's agreement ring would not be cleared";
+                  m.qsa_refused = true;
+                  return false;
+              } }
+        }
         // this chunk's stream - every non-resident expert of every layer, layer by layer in id order (entry
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
@@ -4305,12 +4379,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // before this point, so the partner's add of l - what the publish's wait waits on - can
                         // always run.
                         //
-                        // THE EVENT'S INDEX IS THE STAGING SET, NOT THE WIRE SET, on both sides of this wait.
-                        // Under the serialized gate the arm records its end-of-layer proof on `ev_out[0]` for every
-                        // layer - one staging set, so one proof - so waiting here on `ev_out[wire]` made every ODD
-                        // layer wait on an event nothing had ever recorded, which CUDA answers immediately: half the
-                        // mode ran pipelined while its boot line, its documentation and its own measurement said
-                        // `serialized`.  One figure, one spelling: `peer_qsa_finish`'s `w`.
+                        // THE INDEX IS THE STAGING SET, NOT THE WIRE SET, on both sides of this wait.  Under the
+                        // serialized gate the arm records its proof on `ev_out[0]` every layer (one staging set,
+                        // so one proof), and waiting on `ev_out[wire]` here would make every ODD layer wait on an
+                        // event nothing had recorded - which CUDA answers immediately, so half the layers would
+                        // run pipelined while the boot line said `serialized` and the mode's own measurement read
+                        // as serialized.  Same figure, one spelling: `peer_qsa_finish`'s `w`.
                         if (sap->qsa.pipeline < 2 &&
                             cudaStreamWaitEvent(m.cs, sap->qsa.ev_out[sap->qsa.pipeline >= 2 ? wire : 0], 0) !=
                                 cudaSuccess) {
@@ -5425,6 +5499,41 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                       "and the pair is not used again";
                 m.qsa_refused = true;   // the pair is disarmed; the next prompt runs unsliced on a live engine
                 return false;
+            }
+            // THE PAIR-AGREEMENT VERDICT (`--exp tp_prompt_attn`).  A collective leaves BOTH cards holding the sum
+            // of the same two partials, and IEEE addition commutes, so the elements each card sampled of its own
+            // sum must be bit-identical.  This is the only read that can see the failure mode this slice keeps
+            // meeting - a reduce that took the peer's NEXT layer's partial, or a sum one card's spin budget
+            // abandoned - because neither is an error anywhere else: the logits come out shaped, the tokens
+            // plausible, and the acceptance stays at 100%.  The rings were zeroed at the chunk's start, so a layer
+            // sampled on one card and not the other fails here too rather than agreeing by silence.  Exact
+            // equality, with NaN agreeing with NaN: an overflowed partial is not the thing being hunted, and a
+            // false alarm at this site would bury the real one.
+            if (m.pp->qsa.chk[0] != nullptr && m.pp->qsa.chk[1] != nullptr && m.pp->qsa.chk_layers > 0) {
+                const size_t rn = (size_t) m.pp->qsa.chk_layers * basalt::kernels::kTp2Samples;
+                std::vector<float> la(rn), lb(rn);
+                cudaError_t c0 = cudaSuccess, c1 = cudaSuccess;
+                { const core::OnDevice on_lead(m.pp->qsa.lead_dev);
+                  c0 = cudaMemcpy(la.data(), m.pp->qsa.chk[0], rn * sizeof(float), cudaMemcpyDeviceToHost); }
+                { const core::OnDevice on_partner(m.pp->dev);
+                  c1 = cudaMemcpy(lb.data(), m.pp->qsa.chk[1], rn * sizeof(float), cudaMemcpyDeviceToHost); }
+                if (c0 != cudaSuccess || c1 != cudaSuccess) {
+                    err = std::string("prefill: the prompt-attention pair's agreement rings: ") +
+                          cudaGetErrorString(c0 != cudaSuccess ? c0 : c1);
+                    m.qsa_refused = true;
+                    return false;
+                }
+                for (size_t i = 0; i < rn; ++i) {
+                    if (la[i] == lb[i] || (std::isnan(la[i]) && std::isnan(lb[i]))) continue;
+                    err = "prefill: the prompt-attention pair disagreed about what it summed at QSA layer " +
+                          std::to_string(i / (size_t) basalt::kernels::kTp2Samples) + ", sample " +
+                          std::to_string(i % (size_t) basalt::kernels::kTp2Samples) + ": the lead's card holds " +
+                          std::to_string(la[i]) + ", the partner's " + std::to_string(lb[i]) +
+                          "; a pair that disagrees took the wrong partial somewhere, so the run stops here rather "
+                          "than sending it to the model";
+                    m.qsa_refused = true;
+                    return false;
+                }
             }
             // The partner appended this chunk's cells into its OWN pools, for every QSA layer of the stage, so
             // `[., p0 + T)` is now a span it holds first-hand and the proof advances with the prompt.  Without

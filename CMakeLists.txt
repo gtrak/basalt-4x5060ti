@@ -777,6 +777,14 @@ target_link_libraries(tp2_allreduce_parity PRIVATE kernels ${_gpu_runtime_target
 basalt_gpu_test(NAME tp2_allreduce_parity COMMAND tp2_allreduce_parity --selftest)
 set_tests_properties(tp2_allreduce_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 
+# the prompt-attention arm's per-layer pair protocol at the depth each gate runs it: the publish's rows, both
+# partials and their reduce, two cards, the lead running ahead the way the pipelined gate lets it (two cards)
+add_executable(tp2_staging_depth tests/kernels/tp2_staging_depth.cu)
+target_include_directories(tp2_staging_depth PRIVATE ${_gpu_include_directories})
+target_link_libraries(tp2_staging_depth PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME tp2_staging_depth COMMAND tp2_staging_depth --selftest)
+set_tests_properties(tp2_staging_depth PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
 add_executable(elementwise_parity tests/kernels/elementwise_parity.cpp)
 target_include_directories(elementwise_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(elementwise_parity PRIVATE kernels ${_gpu_runtime_target})

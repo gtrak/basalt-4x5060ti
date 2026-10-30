@@ -23,6 +23,14 @@
 #include <cstdint>
 #include <string>
 
+// The sample rule below is read by the host that grades a pair and by the kernel that takes the sample, so it is
+// spelled once and compiled both ways (`f16_bits.hpp` does the same for the bit helpers).
+#if defined(__CUDACC__)
+#define TP2_HD __host__ __device__
+#else
+#define TP2_HD
+#endif
+
 namespace basalt::kernels {
 
 // ================================ the pure parts (no CUDA, no device, testable as they stand) ================================
@@ -74,6 +82,30 @@ inline uint64_t tp2_staging_elems(int64_t max_elems, int sets) {
 
 /// Is `set` one of the regions a pair opened with `sets` has?  Pure, so the refusal's rule reads without a device.
 inline bool tp2_staging_set_ok(int set, int sets) { return set >= 0 && set < (sets > 0 ? sets : 1); }
+
+/// THE PAIR-AGREEMENT SAMPLE.  After a collective both cards hold the SAME sum: each added its own partial and its
+/// peer's, and IEEE addition commutes, so element for element the two buffers must be bit-identical.  Nothing else
+/// in the engine can see a pair that disagreed - a sum built from the peer's NEXT layer's partial, or one the spin
+/// budget abandoned, is a plausible token, not an error - so the engine samples a few elements of each card's
+/// summed partial and compares them where it can still fail the run.
+///
+/// EIGHT elements, spread over both axes: the rows the sum is taken over, and the columns, which is what makes a
+/// wrong landing-region offset visible rather than merely possible.  One rule, here, read by the kernel and by the
+/// host that grades it: two spellings of a sample index is one way for the check to pass for the wrong reason.
+constexpr int kTp2Samples = 8;
+TP2_HD inline int64_t tp2_sample_index(int k, int64_t rows, int64_t stride) {
+    if (k < 0 || k >= kTp2Samples || rows <= 0 || stride <= 0) return -1;
+    const int64_t r = kTp2Samples > 1 ? (rows - 1) * k / (kTp2Samples - 1) : 0;
+    const int64_t c = (k * 37) % stride;   // coprime-ish step, so the columns are not all one residue class
+    return r * stride + c;
+}
+
+/// What the host expects to find at sample `k`, given both cards' partials: the same element of each, added in the
+/// order the kernel adds them.  Reference-shaped, so the parity test can grade the kernel without a pair.
+inline float tp2_sample_ref(const float* a, const float* b, int k, int64_t rows, int64_t stride) {
+    const int64_t i = tp2_sample_index(k, rows, stride);
+    return i < 0 ? 0.0f : a[i] + b[i];
+}
 
 /// The two cards of a stage pair, in the order the engine opens them: rank 0 is the stage's lead card, rank 1 its
 /// partner.  Pure, so the sequence bookkeeping below can be reasoned about (and tested) without a device.
@@ -179,5 +211,15 @@ inline bool tp2_all_reduce(Tp2Pair& pair, float* buf, int64_t rows, int64_t stri
     }
     return pair.all_reduce(buf, rows, stride, stream, peer_dev, rank, err, set);
 }
+
+/// Copy the pair-agreement sample of a summed partial into `dst` (`kTp2Samples` floats), on `stream`, so the caller
+/// can compare what its card summed against what its peer's card summed.  Issued on the collective's stream, which
+/// is the point: the sample sees exactly that layer's sum, and nothing a later layer writes into the buffer.
+/// `dst` is device memory on the card `src` is on; the engine zeroes it at the chunk's start, so a layer that
+/// sampled on one card and not the other is a mismatch rather than a coincidence of stale bytes.
+///
+/// The kernel is in src/kernels/cuda/tp2_collective.cu; the indices it reads are `tp2_sample_index` above, which is
+/// what lets the host grade it (and what `tp2_allreduce_parity` compares it against).
+bool tp2_sample_partial(float* dst, const float* src, int64_t rows, int64_t stride, void* stream, std::string& err);
 
 }  // namespace basalt::kernels

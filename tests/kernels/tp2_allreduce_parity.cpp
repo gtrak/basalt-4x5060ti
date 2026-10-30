@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <random>
 #include <string>
 #include <vector>
@@ -123,6 +124,40 @@ void pure_contract() {
 // ---------------------------------- the device path ----------------------------------
 
 bool bit_eq(const float* x, const float* y, size_t n) { return std::memcmp(x, y, n * sizeof(float)) == 0; }
+
+/// The pair-agreement sampler: the indices are one rule shared with the kernel, so both halves are checked - that
+/// the rule stays inside the partial and spreads over both axes, and that the kernel reads exactly it.  The
+/// engine's chunk-boundary verdict compares the two cards' rings element for element, so a sampler that read an
+/// index the host did not use would make a broken pair look sound.
+void sampler_contract() {
+    const int64_t rows = 64, stride = 2048;
+    int64_t row_of[kTp2Samples], col_of[kTp2Samples];
+    for (int k = 0; k < kTp2Samples; ++k) {
+        const int64_t i = tp2_sample_index(k, rows, stride);
+        CHECK(i >= 0 && i < rows * stride);
+        row_of[k] = i / stride;
+        col_of[k] = i % stride;
+    }
+    CHECK(row_of[0] == 0 && row_of[kTp2Samples - 1] == rows - 1);   // spread over the rows, not clustered
+    for (int k = 1; k < kTp2Samples; ++k) CHECK(row_of[k] >= row_of[k - 1]);
+    {
+        int distinct = 0;
+        for (int k = 0; k < kTp2Samples; ++k)
+            if (std::find(col_of, col_of + kTp2Samples, col_of[k]) == col_of + k) ++distinct;
+        CHECK(distinct > 1);   // ...and over the columns: a wrong region offset shifts elements along a row
+    }
+    CHECK(tp2_sample_index(-1, rows, stride) == -1);
+    CHECK(tp2_sample_index(kTp2Samples, rows, stride) == -1);
+    CHECK(tp2_sample_index(0, 0, stride) == -1);
+    {
+        std::vector<float> a((size_t) rows * stride), b((size_t) rows * stride);
+        for (size_t i = 0; i < a.size(); ++i) { a[i] = (float) (i % 97) * 0.5f; b[i] = (float) (i % 13) * 2.0f; }
+        for (int k = 0; k < kTp2Samples; ++k) {
+            const int64_t i = tp2_sample_index(k, rows, stride);
+            CHECK(tp2_sample_ref(a.data(), b.data(), k, rows, stride) == a[i] + b[i]);
+        }
+    }
+}
 
 int device_path(int dev_a, int dev_b) {
     const int64_t max_elems = 64 * 4096;
@@ -244,6 +279,33 @@ int device_path(int dev_a, int dev_b) {
         cudaFree(db);
     }
 
+    // ---- the sampler, on the card: what the kernel wrote must be what the host's rule says, or the pair's
+    // agreement check is grading a different sample than it thinks it is.
+    {
+        const int64_t rows = 64, stride = 2048, n = rows * stride;
+        std::vector<float> a((size_t) n), b((size_t) n);
+        for (size_t i = 0; i < a.size(); ++i) { a[i] = (float) (i % 97) * 0.5f; b[i] = (float) (i % 13) * 2.0f; }
+        cudaSetDevice(dev_a);
+        float* da = dev_alloc(dev_a, n);
+        float* dchk = dev_alloc(dev_a, kTp2Samples);
+        if (da == nullptr || dchk == nullptr) { std::printf("SKIP tp2 pair: out of memory\n"); return 77; }
+        cudaMemcpyAsync(da, a.data(), n * 4, cudaMemcpyHostToDevice, s_a);
+        cudaStreamSynchronize(s_a);
+        std::string se;
+        CHECK(tp2_sample_partial(dchk, da, rows, stride, s_a, se));
+        float got[kTp2Samples];
+        cudaMemcpy(got, dchk, sizeof(got), cudaMemcpyDeviceToHost);
+        for (int k = 0; k < kTp2Samples; ++k)
+            CHECK(got[k] == a[(size_t) tp2_sample_index(k, rows, stride)]);   // the buffer holds this card's own
+        CHECK(tp2_sample_ref(a.data(), b.data(), 0, rows, stride) ==
+              a[(size_t) tp2_sample_index(0, rows, stride)] + b[(size_t) tp2_sample_index(0, rows, stride)]);
+        CHECK(!tp2_sample_partial(nullptr, da, rows, stride, s_a, se));   // nowhere to write
+        CHECK(!tp2_sample_partial(dchk, nullptr, rows, stride, s_a, se)); // nothing to read
+        CHECK(!tp2_sample_partial(dchk, da, 0, stride, s_a, se));         // a partial with no element in it
+        CHECK(!se.empty());                                               // and it says so
+        cudaFree(da); cudaFree(dchk);
+    }
+
     // ---- the microbench line: one shape, many collectives, both ranks in lockstep
     {
         const Shape& sh = kShapes[1];
@@ -313,6 +375,7 @@ int main(int argc, char** argv) {
     }
 
     pure_contract();
+    sampler_contract();
 
     int devs = 0;
     if (cudaGetDeviceCount(&devs) != cudaSuccess || devs < 2) {

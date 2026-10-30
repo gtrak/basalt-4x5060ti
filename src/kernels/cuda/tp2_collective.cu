@@ -64,7 +64,35 @@ __global__ void tp2_add_wait(float* __restrict__ buf, const float* __restrict__ 
         buf[i] = buf[i] + peer_partial[i];   // mine + the peer's: the order tp2_all_reduce_ref states
 }
 
+/// The pair-agreement sample: `kTp2Samples` elements of a summed partial, at the indices the host uses too.  One
+/// warp, indices from the header's one rule, so a check and the thing it checks cannot drift.
+__global__ void tp2_sample_kernel(float* __restrict__ dst, const float* __restrict__ src, int64_t rows,
+                                  int64_t stride) {
+    const int k = threadIdx.x;
+    if (k >= kTp2Samples) return;
+    const int64_t i = tp2_sample_index(k, rows, stride);
+    dst[k] = i >= 0 ? src[i] : 0.0f;
+}
+
 }  // namespace
+
+bool tp2_sample_partial(float* dst, const float* src, int64_t rows, int64_t stride, void* stream, std::string& err) {
+    if (dst == nullptr || src == nullptr || stream == nullptr) {
+        err = "tp2 sample: no buffer or no stream";
+        return false;
+    }
+    if (tp2_sample_index(0, rows, stride) < 0 || tp2_sample_index(kTp2Samples - 1, rows, stride) < 0) {
+        err = "tp2 sample: a " + std::to_string(rows) + " x " + std::to_string(stride) +
+              " partial has no sample to take";
+        return false;
+    }
+    tp2_sample_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(dst, src, rows, stride);
+    if (const cudaError_t le = cudaGetLastError(); le != cudaSuccess) {
+        err = std::string("tp2 sample: the sampling kernel did not launch: ") + cudaGetErrorString(le);
+        return false;
+    }
+    return true;
+}
 
 Tp2Pair::~Tp2Pair() { close(); }
 
