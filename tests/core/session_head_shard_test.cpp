@@ -153,6 +153,43 @@ void the_prompt_session_shards_too() {
     CHECK(prompt_session_bytes(g, CELLS, 24, 48, a) < prompt_session_bytes(g, CELLS, 24, 48));
 }
 
+// An UNEVEN cut on the artifact's own geometry can only be made by STRADDLING a KV group (12 heads is the unit the
+// kernels move), and a straddling pair holds the boundary group twice: 16 heads on the lead, 8 on the partner, and
+// 3 KV heads of pool between them for a 2-head cache.  The run gate refuses such a pair (`who_may_run_a_shard`),
+// so this checks the CARVE, which is what a pair that generalizes the kernels would be sized for.
+void an_uneven_cut_carves_by_its_own_head_count() {
+    const QsaHeadShard a = qsa_pair_shard(g.n_head, g.n_head_kv, 16, 0);
+    const QsaHeadShard b = qsa_pair_shard(g.n_head, g.n_head_kv, 16, 1);
+    CHECK(a.ok() && b.ok());
+    CHECK(a.nq() == 16 && a.nkv() == 2 && b.nq() == 8 && b.nkv() == 1);
+    CHECK(qsa_pair_tiles(a, b));
+    CHECK(!qsa_shard_whole_groups(a) && !qsa_shard_whole_groups(b));
+    // the boundary KV head is held twice over
+    CHECK(qsa_shard_kv_cell_bytes(a, g.head_dim) + qsa_shard_kv_cell_bytes(b, g.head_dim) ==
+          3ull * g.head_dim * 2 * 2);
+    // the two cards are no longer the same size, and each follows its own head count
+    const int64_t whole = session_bytes(g, CELLS, K, 0, -1);
+    const int64_t sa = session_bytes(g, CELLS, K, 0, -1, a), sb = session_bytes(g, CELLS, K, 0, -1, b);
+    CHECK(sb < sa && sa < whole);
+    // the identity, per card: what the shard saved is exactly the QSA state and scratch it saved
+    for (const QsaHeadShard* c : {&a, &b}) {
+        const int64_t s = c == &a ? sa : sb;
+        const int64_t dstate =
+            (qsa_state_bytes(g, CELLS, true, 0, shard(0, 1)) - qsa_state_bytes(g, CELLS, true, 0, *c)) +
+            (qsa_states(0, g.n_layers) - 1) *
+                (qsa_state_bytes(g, CELLS, false, 0, shard(0, 1)) - qsa_state_bytes(g, CELLS, false, 0, *c));
+        const int64_t dbuf = qsa_buffers_bytes(g, CELLS, shard(0, 1)) - qsa_buffers_bytes(g, CELLS, *c);
+        CHECK(std::abs((whole - s) - (dstate + dbuf)) <= ALIGN_SLACK);
+    }
+    // the pools follow the KV run, the position rows the query run
+    const int64_t cells = ((CELLS + 511) / 512) * 512;   // qsa_real_shapes()'s page granule
+    const int64_t pos_a = a.nq() * 4, pos_b = b.nq() * 4;
+    CHECK(pos_a == 2 * pos_b);
+    CHECK((int64_t) (qsa_state_bytes(g, CELLS, true, 0, a) - qsa_state_bytes(g, CELLS, true, 0, b)) ==
+          cells * (int64_t) (qsa_shard_kv_cell_bytes(a, g.head_dim) - qsa_shard_kv_cell_bytes(b, g.head_dim)) +
+              (pos_a - pos_b));
+}
+
 void the_shapes_come_from_one_place() {
     const QsaShapes w = qsa_real_shapes(g);
     CHECK(w.n_head == g.n_head && w.n_head_kv == g.n_head_kv && w.head_dim == g.head_dim);
@@ -187,6 +224,24 @@ void who_may_run_a_shard() {
     err.clear();
     CHECK(!qsa_shard_runs(QsaHeadShard{g.n_head, 3, 0, 2}, err));             // 3 KV heads do not cut in two
     CHECK(err.find("not a well-formed split") != std::string::npos);
+
+    // ---- an UNEVEN cut: runnable when each card's run is whole KV groups, refused when it cuts one
+    err.clear();
+    CHECK(qsa_shard_runs(qsa_pair_shard(24, 8, 9, 0), err));   // 9 heads = 3 groups, the lead's end of the axis
+    CHECK(err.empty());
+    CHECK(qsa_shard_runs(qsa_pair_shard(24, 8, 9, 1), err));   // 15 heads = 5 groups
+    err.clear();
+    CHECK(!qsa_shard_runs(qsa_pair_shard(g.n_head, g.n_head_kv, 16, 0), err));   // 16 of 24 cuts a group of 12
+    CHECK(err.find("KV group") != std::string::npos);
+    err.clear();
+    CHECK(!qsa_shard_runs(qsa_pair_shard(24, 8, 10, 1), err));   // 14 heads is not whole groups either
+    CHECK(err.find("KV group") != std::string::npos);
+    err.clear();
+    CHECK(!qsa_shard_runs(QsaHeadShard{24, 8, 0, 2, 6, 6}, err));   // the lead's run starts at head 0
+    CHECK(err.find("query axis") != std::string::npos);
+    err.clear();
+    CHECK(!qsa_shard_runs(qsa_pair_shard(24, 2, 0, 0), err));       // a card with no heads is not a pair
+    CHECK(!err.empty());
 
     // ---- the "may it run HERE" half: no pair, no shard
     QsaState st{};
@@ -237,6 +292,7 @@ int main() {
     the_scratch_keeps_the_indexer_and_the_selection();
     a_copy_between_shards_is_refused();
     the_prompt_session_shards_too();
+    an_uneven_cut_carves_by_its_own_head_count();
     the_shapes_come_from_one_place();
     who_may_run_a_shard();
     if (g_fail != 0) { std::printf("session head shard test failed: %d\n", g_fail); return 1; }

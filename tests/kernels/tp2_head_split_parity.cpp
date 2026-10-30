@@ -99,7 +99,17 @@ int main(int argc, char** argv) {
     const k::QsaShapes full = k::qsa_real_shapes();
     const int64_t D = full.head_dim, P = full.page_size, NH = full.n_head, NKV = full.n_head_kv;
     if (NKV % 2 != 0 || NH % NKV != 0) { std::printf("this geometry does not split two ways\n"); return 77; }
-    const QsaHeadShard r0{NH, NKV, 0, 2}, r1{NH, NKV, 1, 2};
+    // The shards are the ones the RATIO API produces, so the kernels are compared through the same plumbing a
+    // stage's --exp qsa_ratio_stage_* hands it.  At this geometry the only runnable cut is the symmetric one (the
+    // attention kernels move a whole KV group at a time), so an uneven ratio is refused at setup rather than run
+    // here; a geometry whose group is narrower than a card's run cuts unevenly and lands in this parity too.
+    const QsaHeadShard r0 = basalt::core::qsa_pair_shard(NH, NKV, basalt::core::qsa_lead_heads(NH, 0.5), 0);
+    const QsaHeadShard r1 = basalt::core::qsa_pair_shard(NH, NKV, basalt::core::qsa_lead_heads(NH, 0.5), 1);
+    if (!(r0.ok() && r1.ok()) || !basalt::core::qsa_shard_whole_groups(r0) ||
+        !basalt::core::qsa_shard_whole_groups(r1) || !basalt::core::qsa_pair_tiles(r0, r1)) {
+        std::printf("this geometry does not split two ways for the attention kernels\n");
+        return 77;
+    }
     const k::QsaShapes s0 = basalt::core::qsa_shard_shapes(full, r0), s1 = basalt::core::qsa_shard_shapes(full, r1);
     const int64_t pages = max_cells / P;
     const int64_t n_kv = pages * P - 1;             // one short of full, so a mask bug has somewhere to hide

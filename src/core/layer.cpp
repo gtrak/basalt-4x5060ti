@@ -506,6 +506,22 @@ bool qsa_shard_runs(const QsaHeadShard& heads, std::string& err) {
               " ways; the engine's tensor-parallel pair is two, and the collective is a pair's";
         return false;
     }
+    if (!qsa_shard_whole_groups(heads)) {
+        err = "qsa: the head shard runs query heads " + std::to_string(heads.q0()) + "-" +
+              std::to_string(heads.q0() + heads.nq()) + ", which cuts a KV group of " +
+              std::to_string(heads.rep()) + "; the QSA attention kernels hold one group's heads together, so a "
+              "card's run must start and end on a group boundary (the ratio moves " + std::to_string(heads.rep()) +
+              " heads at a time)";
+        return false;
+    }
+    // A span must be the END of the axis its rank owns: the lead's run starts at head 0, the partner's ends at
+    // the last head, which is what makes the two runs tile the axis with no gap and no overlap.
+    if (heads.span() && (heads.rank == 0 ? heads.q0() != 0 : heads.q0() + heads.nq() != heads.n_head)) {
+        err = "qsa: the head shard's run " + std::to_string(heads.q0()) + "-" +
+              std::to_string(heads.q0() + heads.nq()) + " of " + std::to_string(heads.n_head) +
+              " is not rank " + std::to_string(heads.rank) + "'s end of the query axis";
+        return false;
+    }
     return true;
 }
 

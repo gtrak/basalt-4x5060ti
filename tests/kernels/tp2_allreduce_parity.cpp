@@ -5,6 +5,7 @@
 // Needs two cards.  With fewer it exits 77, which ctest reads as a skip (the label is `gpu`; the CPU parts of the
 // contract - the byte figure, the geometry check, the reference's order - run here regardless).
 #include "basalt/kernels/tp2_collective.hpp"
+#include "basalt/core/qsa_head_split.hpp"
 
 #include <cuda_runtime.h>
 
@@ -92,6 +93,31 @@ void pure_contract() {
     std::vector<float> c2 = a;
     tp2_all_reduce_ref(c2.data(), c2.data(), b.data(), rows, stride);
     for (int64_t i = 0; i < rows * stride; ++i) CHECK(c2[i] == want[i]);
+
+    // UNEQUAL halves do not change what the collective moves.  A rank's o_proj partial is a FULL-WIDTH row: the
+    // projection sums its OWN columns into all of n_embd, so the head cut decides which terms a rank adds, never
+    // how many bytes cross or in what order the two ranks' rows are summed.  The runs below are an uneven cut.
+    {
+        using basalt::core::qsa_lead_heads;
+        using basalt::core::qsa_out_cols;
+        using basalt::core::qsa_pair_shard;
+        using basalt::core::QsaHeadRun;
+        const int64_t lead_heads = qsa_lead_heads(24, 2.0 / 3.0);
+        const auto lead = qsa_pair_shard(24, 2, lead_heads, 0);
+        const auto peer = qsa_pair_shard(24, 2, lead_heads, 1);
+        CHECK(lead.ok() && peer.ok() && lead.nq() == 16 && peer.nq() == 8);
+        const QsaHeadRun c0 = qsa_out_cols(lead, 256), c1 = qsa_out_cols(peer, 256);
+        CHECK(c0.start == 0 && c0.len == 16 * 256 && c1.start == 16 * 256 && c1.len == 8 * 256);
+        CHECK(c0.len + c1.len == 24 * 256);   // the two partials' columns make the whole row
+        const int64_t wide = 2048;            // n_embd: the partial's width, which no head cut changes
+        CHECK(tp2_all_reduce_bytes(rows, wide) == rows * wide * 4ull);
+        CHECK(tp2_all_reduce_ok(rows, wide, (uint64_t) rows * wide * 4));
+        std::vector<float> pa((size_t) rows * wide, 0.25f), pb((size_t) rows * wide, -0.5f);
+        std::vector<float> po((size_t) rows * wide), pr((size_t) rows * wide);
+        for (int64_t i = 0; i < rows * wide; ++i) pr[i] = pa[i] + pb[i];
+        tp2_all_reduce_ref(po.data(), pa.data(), pb.data(), rows, wide);
+        for (int64_t i = 0; i < rows * wide; ++i) CHECK(std::memcmp(&po[i], &pr[i], sizeof(float)) == 0);
+    }
 }
 
 // ---------------------------------- the device path ----------------------------------

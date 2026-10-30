@@ -146,6 +146,92 @@ void the_projection_runs() {
 // The packer the engine will use for a shard's weights: gdn_head_split.hpp's row and column gathers, which are
 // generic over a row-major matrix.  A card's weight must be the SAME BYTES the whole layer would have read for
 // that head range - otherwise the shard is a different model, not the same model's half.
+// An UNEVEN cut: the two cards run different numbers of query heads.  The same two things must hold - the runs
+// tile the query axis exactly once, and every running head's KV head is on its own card - and the second one is
+// what makes a cut INSIDE a KV group cost both cards that group's KV.  24 heads over 8 KV heads is the geometry
+// that cuts unevenly into whole groups (3 groups to the lead, 5 to the partner), which is also what the attention
+// kernels can run; 24 over 2 only moves 12 heads at a time, so its uneven cuts straddle.
+void an_uneven_cut_is_still_one_model() {
+    const QsaHeadShard a = qsa_pair_shard(24, 8, 9, 0), b = qsa_pair_shard(24, 8, 9, 1);
+    CHECK(a.ok() && b.ok());
+    CHECK(a.rep() == 3);
+    CHECK(a.q0() == 0 && a.nq() == 9 && a.kv0() == 0 && a.nkv() == 3);
+    CHECK(b.q0() == 9 && b.nq() == 15 && b.kv0() == 3 && b.nkv() == 5);
+    CHECK(qsa_shard_whole_groups(a) && qsa_shard_whole_groups(b));   // whole groups: the kernels run this pair
+    CHECK(qsa_pair_tiles(a, b));
+    // the runs tile the axis once, from either shard's point of view
+    const std::vector<QsaHeadRun> runs = qsa_head_runs(a);
+    CHECK(runs.size() == 2 && runs[0].start == 0 && runs[0].len == 9 && runs[1].start == 9 && runs[1].len == 15);
+    CHECK(qsa_head_runs(b).size() == 2 && qsa_head_runs(b)[0].start == runs[0].start &&
+          qsa_head_runs(b)[0].len == runs[0].len && qsa_head_runs(b)[1].start == runs[1].start &&
+          qsa_head_runs(b)[1].len == runs[1].len);
+    // the group rule, head by head, with no KV head held twice: whole groups do not overlap
+    std::set<int64_t> q, kv;
+    for (const QsaHeadShard* c : {&a, &b}) {
+        CHECK(c->q0() % c->rep() == 0 && c->nq() % c->rep() == 0);
+        for (int64_t h = c->q0(); h < c->q0() + c->nq(); ++h) {
+            CHECK(q.insert(h).second);                                  // one card runs each query head
+            CHECK(h / c->rep() >= c->kv0() && h / c->rep() < c->kv0() + c->nkv());
+        }
+        for (int64_t h = c->kv0(); h < c->kv0() + c->nkv(); ++h) CHECK(kv.insert(h).second);
+    }
+    CHECK(q.size() == 24 && kv.size() == 8);
+    // the KV bytes split with the heads, and the two cards together are exactly the whole cache
+    CHECK(qsa_shard_kv_cell_bytes(a, HEAD_DIM) == (uint64_t) 3 * HEAD_DIM * 2 * 2);
+    CHECK(qsa_shard_kv_cell_bytes(a, HEAD_DIM) + qsa_shard_kv_cell_bytes(b, HEAD_DIM) ==
+          (uint64_t) 8 * HEAD_DIM * 2 * 2);
+    // and the projection runs follow the uneven head counts
+    CHECK(qsa_q_rows(a, HEAD_DIM).len == 9 * 2 * HEAD_DIM && qsa_q_rows(b, HEAD_DIM).len == 15 * 2 * HEAD_DIM);
+    CHECK(qsa_out_cols(a, HEAD_DIM).start == 0 && qsa_out_cols(a, HEAD_DIM).len == 9 * HEAD_DIM);
+    CHECK(qsa_out_cols(b, HEAD_DIM).start == 9 * HEAD_DIM && qsa_out_cols(b, HEAD_DIM).len == 15 * HEAD_DIM);
+    CHECK(qsa_out_cols(a, HEAD_DIM).len + qsa_out_cols(b, HEAD_DIM).len == 24 * HEAD_DIM);
+    // an uneven cut is still on the block boundaries a quantized o_proj needs
+    for (int64_t blk : {32ll, 64ll, 128ll}) {
+        CHECK(qsa_shard_cols_aligned(a, HEAD_DIM, blk));
+        CHECK(qsa_shard_cols_aligned(b, HEAD_DIM, blk));
+    }
+    // the narrow geometry: half the heads is still the pair everyone builds
+    CHECK(qsa_pair_shard(N_HEAD, N_HEAD_KV, 12, 0) == QsaHeadShard{N_HEAD, N_HEAD_KV, 0, 2});
+    CHECK(qsa_pair_shard(N_HEAD, N_HEAD_KV, 12, 1) == QsaHeadShard{N_HEAD, N_HEAD_KV, 1, 2});
+}
+
+// A cut inside a KV group: the arithmetic is still self-consistent - the runs tile the axis, every running head
+// still finds its KV head on its own card - but the boundary group is now on BOTH cards, and the attention
+// kernels, which hold one group's heads together, cannot run such a shard.
+void a_cut_inside_a_group_costs_both_cards_that_group() {
+    const QsaHeadShard a = qsa_pair_shard(24, 2, 16, 0), b = qsa_pair_shard(24, 2, 16, 1);
+    CHECK(a.ok() && b.ok());
+    CHECK(a.q0() == 0 && a.nq() == 16 && a.kv0() == 0 && a.nkv() == 2);   // heads 12-15 read KV head 1
+    CHECK(b.q0() == 16 && b.nq() == 8 && b.kv0() == 1 && b.nkv() == 1);   // ... and so do heads 16-23
+    CHECK(qsa_pair_tiles(a, b));
+    CHECK(!qsa_shard_whole_groups(a) && !qsa_shard_whole_groups(b));      // the kernels refuse this pair
+    // the boundary group is held twice: the two cards' KV bytes are MORE than the whole cache, by one head
+    CHECK(qsa_shard_kv_cell_bytes(a, HEAD_DIM) + qsa_shard_kv_cell_bytes(b, HEAD_DIM) ==
+          (uint64_t) 3 * HEAD_DIM * 2 * 2);
+    // every query head still reads a KV head its own card holds
+    for (const QsaHeadShard* c : {&a, &b})
+        for (int64_t h = c->q0(); h < c->q0() + c->nq(); ++h)
+            CHECK(h / c->rep() >= c->kv0() && h / c->rep() < c->kv0() + c->nkv());
+
+    // the ratio form, and what a ratio outside the axis means
+    CHECK(qsa_lead_heads(24, 0.5) == 12);
+    CHECK(qsa_lead_heads(24, 0.6) == 14);
+    CHECK(qsa_lead_heads(24, 0.02) == 1);
+    CHECK(qsa_lead_heads(24, 0.99) == 23);
+    CHECK(qsa_lead_heads(24, 0.0) == 1);
+    CHECK(qsa_lead_heads(24, 1.5) == 23);
+    CHECK(qsa_lead_heads(0, 0.5) == 0);
+    CHECK(!qsa_pair_shard(24, 2, 0, 0).ok());     // a card with no heads is not a pair
+    CHECK(!qsa_pair_shard(24, 2, 24, 1).ok());
+
+    // what the tiling check refuses: a gap, an overlap, two leads, a mismatched geometry
+    const QsaHeadShard lead = qsa_pair_shard(24, 8, 9, 0);
+    CHECK(!qsa_pair_tiles(lead, qsa_pair_shard(24, 8, 9, 0)));   // the same card twice
+    CHECK(!qsa_pair_tiles(lead, QsaHeadShard{24, 8, 1, 2}));     // the partner's symmetric run is heads 12-23
+    CHECK(!qsa_pair_tiles(lead, qsa_pair_shard(24, 6, 9, 1)));   // different geometries
+    CHECK(qsa_pair_tiles(lead, qsa_pair_shard(24, 8, 9, 1)));
+}
+
 void the_weight_slices_are_the_whole_layers_bytes() {
     const int64_t dim = HEAD_DIM, n_embd = 8;   // 8 rows of output; columns are the head axis
     const QsaHeadShard r0{N_HEAD, N_HEAD_KV, 0, 2}, r1{N_HEAD, N_HEAD_KV, 1, 2};
@@ -179,6 +265,33 @@ void the_weight_slices_are_the_whole_layers_bytes() {
     // an odd head_dim cannot be cut on blocks: the packer must be refused, not silently mis-read
     CHECK(!qsa_shard_cols_aligned(QsaHeadShard{N_HEAD, N_HEAD_KV, 0, 2}, 100, 128));
     CHECK(qsa_shard_cols_aligned(QsaHeadShard{N_HEAD, N_HEAD_KV, 0, 2}, 100, 100));
+
+    // the same, cut UNEVENLY (24 heads over 8 KV heads, 3 groups to the lead and 5 to the partner): the runs
+    // still tile the column axis and the gathered bytes are still the whole weight's, in order
+    {
+        const QsaHeadShard u0 = qsa_pair_shard(24, 8, 9, 0), u1 = qsa_pair_shard(24, 8, 9, 1);
+        const int64_t block = 64;
+        std::vector<float> full((size_t) n_embd * 24 * dim);
+        for (size_t i = 0; i < full.size(); ++i) full[i] = (float) i * 0.5f;
+        const QsaHeadRun d0 = qsa_out_cols(u0, dim), d1 = qsa_out_cols(u1, dim);
+        CHECK(d0.start == 0 && d0.len == 9 * dim && d1.start == 9 * dim && d1.len == 15 * dim);
+        std::vector<float> q0((size_t) n_embd * d0.len), q1((size_t) n_embd * d1.len);
+        gdn_gather_cols(full.data(), n_embd, 24 * dim, block, (size_t) block * sizeof(float), {{d0.start, d0.len}},
+                q0.data());
+        gdn_gather_cols(full.data(), n_embd, 24 * dim, block, (size_t) block * sizeof(float), {{d1.start, d1.len}},
+                q1.data());
+        bool same = true;
+        for (int64_t row = 0; row < n_embd && same; ++row)
+            for (int64_t c = 0; c < d0.len; ++c)
+                if (q0[(size_t) row * d0.len + c] != full[(size_t) row * 24 * dim + c]) same = false;
+        for (int64_t row = 0; row < n_embd && same; ++row)
+            for (int64_t c = 0; c < d1.len; ++c)
+                if (q1[(size_t) row * d1.len + c] != full[(size_t) row * 24 * dim + d1.start + c]) same = false;
+        CHECK(same);
+        // and the uneven q rows: the lead's 9 heads' query+gate rows, then the partner's 15
+        const QsaHeadRun ur0 = qsa_q_rows(u0, dim), ur1 = qsa_q_rows(u1, dim);
+        CHECK(ur0.start == 0 && ur0.len == 9 * 2 * dim && ur1.start == 9 * 2 * dim && ur1.len == 15 * 2 * dim);
+    }
 
     // ---- attn_k / attn_v / attn_q: whole rows per head, so gdn_gather_rows on the head axis
     // attn_k is [n_head_kv * head_dim rows][n_embd columns]; the card takes whole rows, so this is a row gather
@@ -217,6 +330,8 @@ int main() {
     the_indexer_stays_whole();
     what_is_refused();
     the_projection_runs();
+    an_uneven_cut_is_still_one_model();
+    a_cut_inside_a_group_costs_both_cards_that_group();
     the_weight_slices_are_the_whole_layers_bytes();
     shards_are_comparable();
     if (g_fail != 0) { std::printf("qsa head split test failed: %d\n", g_fail); return 1; }

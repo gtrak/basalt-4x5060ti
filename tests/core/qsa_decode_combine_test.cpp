@@ -172,12 +172,93 @@ void the_compact_positions_are_the_whole_ones() {
     CHECK(compact.size() == (size_t) T_ROW * nq);
 }
 
+// The three contracts again for an UNEVEN cut.  The 24-heads-over-8-KV-heads geometry cuts into whole KV groups
+// unevenly - 3 groups (9 heads) to the lead, 5 (15 heads) to the partner - which is the shape the attention
+// kernels run; the artifact's own 24-over-2 cut at 16 heads straddles a group, which the arithmetic still
+// describes and the kernels refuse.  What must not change when the halves are unequal: a running head reads the
+// KV head its own card holds, the two o_proj partials still close to the whole layer, and each card's compact
+// position table is sized by its OWN running head count.
+void an_uneven_cut_closes_the_same_way() {
+    // ---- (a) whole-group uneven pair, read out of a pool that is 8 KV heads wide
+    Pool p8;
+    p8.nk = 8;
+    p8.k.resize((size_t) STEPS * 8 * HEAD_DIM);
+    p8.v.resize((size_t) STEPS * 8 * HEAD_DIM);
+    for (size_t i = 0; i < p8.k.size(); ++i) p8.k[i] = frac(i) - 0.5f;
+    for (size_t i = 0; i < p8.v.size(); ++i) p8.v[i] = frac(i + 7919ull) - 0.5f;
+    const QsaHeadShard a = qsa_pair_shard(24, 8, 9, 0), b = qsa_pair_shard(24, 8, 9, 1);
+    CHECK(a.ok() && b.ok() && a.nq() == 9 && b.nq() == 15);
+    CHECK(qsa_shard_whole_groups(a) && qsa_shard_whole_groups(b));
+    for (const QsaHeadShard* c : {&a, &b})
+        for (int64_t h = 0; h < c->nq(); ++h) {
+            const int64_t gh = c->q0() + h;
+            std::vector<float> q((size_t) HEAD_DIM);
+            for (int64_t d = 0; d < HEAD_DIM; ++d) q[(size_t) d] = frac(gh * 100000ull + (uint64_t) d) - 0.5f;
+            // the card reads running head h at its own first KV head plus the group h falls in
+            const std::vector<float> mine = head_attention(q.data(), p8, c->kv0() + h / c->rep());
+            const std::vector<float> whole = head_attention(q.data(), p8, gh / 3);    // the layer's: q / rep
+            bool same = true;
+            for (int64_t d = 0; d < HEAD_DIM && same; ++d)
+                if (mine[(size_t) d] != whole[(size_t) d]) same = false;
+            CHECK(same);
+        }
+
+    // ---- (b) the o_proj partials, of unequal width, still close to the whole layer's row
+    const int64_t n_embd = 12, dim = HEAD_DIM;
+    const QsaHeadRun c0 = qsa_out_cols(a, dim), c1 = qsa_out_cols(b, dim);
+    CHECK(c0.len == 9 * dim && c1.len == 15 * dim);
+    CHECK(c0.start + c0.len == c1.start && c1.start + c1.len == 24 * dim);   // disjoint and complete
+    std::vector<float> W((size_t) n_embd * 24 * dim);
+    for (size_t i = 0; i < W.size(); ++i) W[i] = (frac(i) - 0.5f) * 0.05f;
+    std::vector<float> attn((size_t) T_ROW * 24 * dim);
+    for (size_t i = 0; i < attn.size(); ++i) attn[i] = (frac(i + 31ull) - 0.5f) * 0.1f;
+    for (int64_t t = 0; t < T_ROW; ++t)
+        for (int64_t r = 0; r < n_embd; ++r) {
+            float full = 0.f, p0 = 0.f, p1 = 0.f;
+            for (int64_t c = 0; c < 24 * dim; ++c)
+                full += W[(size_t) r * 24 * dim + (size_t) c] * attn[(size_t) t * 24 * dim + (size_t) c];
+            for (int64_t c = 0; c < c0.len; ++c)
+                p0 += W[(size_t) r * 24 * dim + c0.start + (size_t) c] *
+                      attn[(size_t) t * 24 * dim + c0.start + (size_t) c];
+            for (int64_t c = 0; c < c1.len; ++c)
+                p1 += W[(size_t) r * 24 * dim + c1.start + (size_t) c] *
+                      attn[(size_t) t * 24 * dim + c1.start + (size_t) c];
+            CHECK(std::fabs((p0 + p1) - full) <= 1e-4f * (1.f + std::fabs(full)));
+        }
+
+    // ---- (c) each card's compact positions, sized by its own running head count, read the q post's way
+    for (const QsaHeadShard* c : {&a, &b}) {
+        const int64_t nq = c->nq();
+        std::vector<int32_t> compact((size_t) T_ROW * nq);
+        for (int64_t t = 0; t < T_ROW; ++t)
+            for (int64_t h = 0; h < nq; ++h) compact[(size_t) t * nq + (size_t) h] = (int32_t) (1000 + t);
+        CHECK(compact.size() == (size_t) T_ROW * nq);
+        for (int64_t t = 0; t < T_ROW; ++t)
+            for (int64_t h = 0; h < nq; ++h)
+                CHECK(compact[(size_t) t * nq + (size_t) h] == 1000 + (int32_t) t);   // one copy per running head
+    }
+
+    // ---- (d) the artifact's straddling cut: heads 12-15 run on the lead and 16-23 on the partner, and both
+    // groups' KV is on both cards, so the cache is held twice over by one head and the kernels refuse the pair
+    const QsaHeadShard s0 = qsa_pair_shard(N_HEAD, N_HEAD_KV, 16, 0), s1 = qsa_pair_shard(N_HEAD, N_HEAD_KV, 16, 1);
+    CHECK(s0.nq() == 16 && s1.nq() == 8 && s0.nkv() == 2 && s1.nkv() == 1);
+    CHECK(!qsa_shard_whole_groups(s0) && !qsa_shard_whole_groups(s1));
+    for (const QsaHeadShard* c : {&s0, &s1})
+        for (int64_t h = 0; h < c->nq(); ++h) {
+            const int64_t owner = (c->q0() + h) / (N_HEAD / N_HEAD_KV);   // the group its head belongs to
+            CHECK(owner >= c->kv0() && owner < c->kv0() + c->nkv());      // and that group is on this card
+        }
+    CHECK(qsa_shard_kv_cell_bytes(s0, HEAD_DIM) + qsa_shard_kv_cell_bytes(s1, HEAD_DIM) ==
+          3u * (uint64_t) HEAD_DIM * 2 * 2);   // two KV heads plus the boundary head held twice
+}
+
 }  // namespace
 
 int main() {
     the_shard_reads_the_whole_pool();
     the_partials_close_to_the_whole_layer();
     the_compact_positions_are_the_whole_ones();
+    an_uneven_cut_closes_the_same_way();
     if (g_fail != 0) { std::printf("qsa decode combine test failed: %d\n", g_fail); return 1; }
     std::printf("qsa decode combine test ok\n");
     return 0;

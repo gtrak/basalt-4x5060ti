@@ -392,6 +392,78 @@ void the_artifacts_geometry_cuts_cleanly() {
     CHECK(vq.codes == (const uint8_t*) q.canon.data() + (uint64_t) qr.start * (q.codes_bytes / (uint64_t) q.ne1));
 }
 
+/// The same claim with the pair cut UNEVENLY: the lead runs 16 of the 24 query heads and the partner 8.  The two
+/// packed views are different sizes now, so what has to hold is that they concatenate to the whole row of every
+/// plane, in order, and that a cut still lands on the blocks the form quantizes - a head is `head_dim` columns,
+/// and head_dim is a multiple of every block width the pack uses, so any head-aligned cut is legal.
+void an_uneven_cut_of_the_artifacts_o_proj() {
+    FakeWeight o;
+    o.ne0 = 24 * 256;
+    o.ne1 = 4096;
+    o.group = 32;
+    o.bits = 4;
+    o.native_row = 24 * 256 / 2;
+    o.build();
+    const QsaHeadShard lead = qsa_pair_shard(24, 2, 16, 0), peer = qsa_pair_shard(24, 2, 16, 1);
+    CHECK(lead.ok() && peer.ok());
+    const QsaHeadRun c0 = qsa_out_cols(lead, 256), c1 = qsa_out_cols(peer, 256);
+    CHECK(c0.start == 0 && c0.len == 16 * 256 && c1.start == 16 * 256 && c1.len == 8 * 256);
+    CHECK(qsa_weight_cols_fits(o.w, c0.start, c0.len, o.native_all()));
+    CHECK(qsa_weight_cols_fits(o.w, c1.start, c1.len, o.native_all()));
+    const uint64_t n0 = qsa_weight_cols_bytes(o.w, c0.start, c0.len, o.native_all());
+    const uint64_t n1 = qsa_weight_cols_bytes(o.w, c1.start, c1.len, o.native_all());
+    const uint64_t whole = qsa_weight_cols_bytes(o.w, 0, o.ne0, o.native_all());
+    CHECK(n0 + n1 == whole);                       // unequal halves, one whole weight between them
+    CHECK(n0 == 2 * n1);                           // 16 heads against 8
+    std::vector<uint8_t> d0((size_t) n0), d1((size_t) n1);
+    const QsaShardWeight a = qsa_pack_weight_cols(o.w, c0.start, c0.len, o.native_all(), d0.data());
+    const QsaShardWeight b = qsa_pack_weight_cols(o.w, c1.start, c1.len, o.native_all(), d1.data());
+    CHECK(a.ok && b.ok && a.ne0 == c0.len && b.ne0 == c1.len);
+    struct P {
+        const void* x;
+        uint64_t nx;      // the lead's bytes of this plane (16 heads)
+        const void* y;
+        uint64_t ny;      // the partner's (8 heads)
+        const void* w;
+        uint64_t total;   // the whole weight's (24 heads)
+    };
+    const uint8_t* codes = (const uint8_t*) o.w.data;
+    const P planes[4] = {{a.codes, a.codes_bytes, b.codes, b.codes_bytes, codes, o.codes_bytes},
+                         {a.scales, a.scales_bytes, b.scales, b.scales_bytes, codes + o.codes_bytes, o.scales_bytes},
+                         {a.offset, a.offset_bytes, b.offset, b.offset_bytes,
+                          codes + o.codes_bytes + o.scales_bytes, o.offset_bytes},
+                         {a.native, a.native_bytes, b.native, b.native_bytes, o.native.data(), o.native_all()}};
+    for (const P& p : planes) {
+        if (!p.x) continue;
+        const uint8_t* x = (const uint8_t*) p.x;
+        const uint8_t* y = (const uint8_t*) p.y;
+        const uint8_t* w = (const uint8_t*) p.w;
+        const size_t rowx = p.nx / (size_t) o.ne1, rowy = p.ny / (size_t) o.ne1;
+        const size_t wrow = p.total / (size_t) o.ne1;   // the whole weight's row of this plane
+        CHECK(rowx + rowy == wrow);                      // 16 heads then 8 heads make the row
+        CHECK(rowx == 2 * rowy);                         // and the cut is uneven by exactly that
+        bool same = true;
+        for (int64_t r = 0; r < o.ne1 && same; ++r) {
+            if (std::memcmp(x + (size_t) r * rowx, w + (size_t) r * wrow, rowx) != 0) same = false;
+            if (std::memcmp(y + (size_t) r * rowy, w + (size_t) r * wrow + rowx, rowy) != 0) same = false;
+        }
+        CHECK(same);
+    }
+    // a cut between two heads is on every block width the pack uses; a cut inside a head is not
+    CHECK(qsa_weight_cols_fits(o.w, 15 * 256, 9 * 256, o.native_all()));
+    CHECK(!qsa_weight_cols_fits(o.w, 15 * 256 + 16, 9 * 256, o.native_all()));
+    // and the row views follow the uneven head counts too: q rows 2 head_dim per head, K/V rows 1 per KV head
+    const QsaHeadRun qr = qsa_q_rows(lead, 256);
+    CHECK(qr.start == 0 && qr.len == 16 * 2 * 256);
+    FakeWeight q;
+    q.ne0 = 4096;
+    q.ne1 = 24 * 2 * 256;
+    q.build();
+    CHECK(qsa_weight_rows(q.w, qr.start, qr.len, q.native_all()).ok);
+    const QsaHeadRun kr = qsa_kv_rows(peer, 256);   // heads 16-23 read KV head 1 only
+    CHECK(kr.start == 256 && kr.len == 256);
+}
+
 }  // namespace
 
 int main() {
@@ -403,6 +475,7 @@ int main() {
     what_is_refused();
     the_sizes_agree_with_the_packer();
     the_artifacts_geometry_cuts_cleanly();
+    an_uneven_cut_of_the_artifacts_o_proj();
     if (g_fail != 0) { std::printf("tp2 shard weights test failed: %d\n", g_fail); return 1; }
     std::printf("tp2 shard weights test ok\n");
     return 0;
