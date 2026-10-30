@@ -1027,6 +1027,10 @@ struct Prefill::Impl {
     basalt::kernels::QsaChainFp* chain[2] = {nullptr, nullptr};   // [0] the lead's card, [1] the partner's
     int64_t chain_n = 0;        // fingerprints per card: n_layers * basalt::kernels::kChainCount
     int chain_peer_dev = -1;    // whose context the partner's array was allocated in, so release frees it there
+    /// The stream the partner's array is cleared and read on.  Kept here rather than read through `m.pp` each time:
+    /// `set_peer` can drop the peer at runtime, and an instrument that dereferenced a retired arm would take a
+    /// working boot down with it - the one thing a debug flag may never do.
+    cudaStream_t chain_peer_stream = nullptr;
     /// Is a chunk of this Prefill in flight?  The pair's two wire sets, the two collective sets and the chain's
     /// arrays are all indexed by the QSA layer ordinal of ONE chunk of THIS Prefill, so a second chain driving the
     /// same arm would alias them - and the pair would still agree with itself, both cards adding the same two wrong
@@ -4032,6 +4036,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     return false;
                 }
                 m.chain_peer_dev = m.pp->dev;
+                m.chain_peer_stream = m.pp->qsa.s;   // the arm's stream, remembered: see the field's note
                 m.pp->qsa.chain[0] = m.chain[0];   // the arm records into the same device memory; it owns none
                 m.pp->qsa.chain[1] = m.chain[1];
             }
@@ -4045,9 +4050,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 err = "prefill: the prompt-attention chain's lead array would not be cleared";
                 return false;
             }
-            if (m.chain[1] != nullptr) {
+            if (m.chain[1] != nullptr && m.chain_peer_stream != nullptr) {
                 const core::OnDevice on_partner(m.chain_peer_dev);
-                if (cudaMemsetAsync(m.chain[1], 0xFF, cb, m.pp->qsa.s) != cudaSuccess) {
+                if (cudaMemsetAsync(m.chain[1], 0xFF, cb, m.chain_peer_stream) != cudaSuccess) {
                     err = "prefill: the prompt-attention chain's partner array would not be cleared";
                     return false;
                 }
@@ -5775,9 +5780,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             cudaError_t c0 = cudaSuccess, c1 = cudaSuccess;
             if (cudaStreamSynchronize(m.cs) != cudaSuccess) c0 = cudaGetLastError();
             if (c0 == cudaSuccess) c0 = cudaMemcpy(lh.data(), m.chain[0], cb, cudaMemcpyDeviceToHost);
-            if (m.chain[1] != nullptr) {
+            if (m.chain[1] != nullptr && m.chain_peer_stream != nullptr) {
                 ph.assign((size_t) m.chain_n, basalt::kernels::QsaChainFp{});
-                if (cudaStreamSynchronize(m.pp->qsa.s) != cudaSuccess) c1 = cudaGetLastError();
+                if (cudaStreamSynchronize(m.chain_peer_stream) != cudaSuccess) c1 = cudaGetLastError();
                 if (c1 == cudaSuccess) {
                     const core::OnDevice on_partner(m.chain_peer_dev);
                     c1 = cudaMemcpy(ph.data(), m.chain[1], cb, cudaMemcpyDeviceToHost);
