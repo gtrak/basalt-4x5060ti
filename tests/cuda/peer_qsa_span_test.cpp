@@ -201,6 +201,26 @@ void test_resident_projections_are_priced() {
     const int expect_takes = 6 /*states*/ + 4 * Prefill::PeerQsaSpan::kWireSets + 10 /*scratch*/ + 7 * 6 + 2;
     std::printf("the walk made %d allocations, as counted\n", s.last_takes());
     CHECK(s.last_takes() == expect_takes);
+    // The PIPELINED gate (`--exp tp_prompt_attn=2`) holds a second `o_proj` staging set, so the walk takes ONE
+    // more buffer and the tier must have left its bytes free: an arm that allocates what the reserve did not
+    // price is an allocation failure at the first gated prompt, not a slower boot.
+    {
+        Prefill::PeerQsaSpan pip = span_for(0, 24, 12, 1);
+        pip.staging_sets = 1;
+        pip.bytes(T, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        const int serial_takes = pip.last_takes();
+        pip.staging_sets = Prefill::PeerQsaSpan::kStagingSets;
+        const uint64_t pipelined_scratch = part(pip, 2);
+        const uint64_t row = ((uint64_t) T * 2560ull * 4ull + 255) & ~uint64_t(255);   // rows x n_embd x FP32
+        pip.bytes(T, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        const int pipelined_takes = pip.last_takes();
+        pip.staging_sets = 1;
+        const uint64_t serial_scratch = part(pip, 2);
+        CHECK(pipelined_scratch == serial_scratch + row);
+        CHECK(pipelined_takes == serial_takes + 1);
+        std::printf("pipelined staging: %d allocations against %d, +%.2f GiB for the second o_proj set\n",
+                    pipelined_takes, serial_takes, (double) (pipelined_scratch - serial_scratch) / GiB);
+    }
     std::printf("resident projections: %.3f GiB over 6 QSA layers (attn_q rows 6144, attn_k/v rows 256)\n",
                 (double) part(s, 3) / GiB);
     // half the heads is half the attn_q residency, but the norms are not halved away

@@ -179,6 +179,13 @@ public:
         /// Why `make_peer_qsa_span` refused, when it did: which tensor of which layer, and what the pack did not
         /// say about it.  A refusal that only says "no figure" costs a boot to diagnose; this one does not.
         std::string why;
+        /// How many `o_proj` staging buffers the partner holds: 1 for the SERIALIZED gate, 2 for the PIPELINED one
+        /// (`--exp tp_prompt_attn=2`).  The collective has no back-pressure of its own - it counts its collectives,
+        /// it does not credit them back - so a partner that runs a layer ahead must not write its next partial
+        /// over one the lead's add has not read: the second buffer is what makes that legal, and the tier pays for
+        /// it (`rows x n_embd x 4`).  Priced by the same walk that allocates it, and 1 keeps the serialized arm's
+        /// footprint exactly what run 25 measured.
+        int staging_sets = 1;
         /// How many allocations the last `bytes()` call walked.  Diagnostics for the sizing test, which pins it:
         /// the byte figures alone do not catch a tensor taken once where it should be taken once a QSA layer.
         mutable int m_takes_ = 0;
@@ -189,6 +196,9 @@ public:
         /// link under layer l's compute, which one set cannot do (the lead would wait on the partner's read of
         /// the previous layer).  The per-layer traffic the ledger prices is ONE set; this is resident bytes.
         static constexpr int kWireSets = 2;
+        /// The most `o_proj` staging sets the partner can be given: see `staging_sets`.  Sized like the wire's so
+        /// the two are indexed by the same `qsa_ord % sets` and one layer's buffers all belong to one set.
+        static constexpr int kStagingSets = 2;
         /// The bytes this spans, split so the boot line can name each part.  Zero with `on` false or a geometry it
         /// cannot price.  `T`: the widest chunk the partner can be given, which sizes the wire and the scratch.
         /// `wire` reports the RESIDENT bytes (`kWireSets` sets); one set is the per-layer traffic figure.

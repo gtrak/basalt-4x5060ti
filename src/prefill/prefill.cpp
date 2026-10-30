@@ -772,7 +772,7 @@ struct PeerPrefill {
         int32_t* sel_ids = nullptr;
         float* sel_scores = nullptr;
         int32_t* steps = nullptr;     // the lead's per-query step counts, shipped: same bits, same selection
-        float* part_f32 = nullptr;    // the o_proj partial as the product leaves it, before the BF16 conversion
+        float* part_f32[2] = {};    // the o_proj partial as the product leaves it, before the BF16 conversion
 
         // The projections this card owns: its shard's rows of attn_q, its KV head's rows of attn_k/attn_v, and
         // the two RMS norms those projections are normalized by.  Boot-time copies, no per-layer traffic.
@@ -800,13 +800,24 @@ struct PeerPrefill {
         void* gws = nullptr;
 
         cudaStream_t s = nullptr;     // this card's attention stream, behind its expert-row stream
-        cudaEvent_t ev_in = nullptr;  // the lead published this layer's rows
-        cudaEvent_t ev_out = nullptr; // this card's partial has landed for the lead
+        /// ONE event PER WIRE SET, indexed the way the wire buffers are (`qsa_ord % kWireSets`).  Under the
+        /// pipelined gate a pair keeps two layers in flight, and one event would be re-recorded by layer l+1
+        /// before anything had finished waiting on layer l's; per set, "the partner's layer that last READ this
+        /// set" is still a thing that exists two layers later.  The serialized gate records and waits on index 0
+        /// for every layer, exactly as it did before the second set existed.
+        cudaEvent_t ev_in[2] = {};   // the lead published this layer's rows; recorded on the LEAD's stream
+        cudaEvent_t ev_out[2] = {};  // this card's whole layer landed; recorded on the arm's stream
         /// The lead's reduce of a layer has read this card's push out of the LEAD's staging.  The partner's next
-        /// push is issued behind it, which is what keeps a rank from overwriting the peer's staging while the
-        /// peer's add of the previous layer is still reading it (`tp2_collective.hpp` has no back-pressure of
-        /// its own: it counts collectives, it does not credit them back).
-        cudaEvent_t ev_red = nullptr;  // ... recorded on the lead's compute stream
+        /// push into the SAME set is issued behind it, which is what keeps a rank from overwriting the peer's
+        /// staging while the peer's add of a previous layer is still reading it (`tp2_collective.hpp` has no
+        /// back-pressure of its own: it counts collectives, it does not credit them back).
+        cudaEvent_t ev_red[2] = {};  // ... recorded on the lead's compute stream
+        /// 1 = serialized: the lead's stream waits for the partner's whole layer before the next layer's work is
+        /// queued on it.  2 = pipelined: it waits only for the partner's layer that last READ the wire set this
+        /// publish is about to overwrite - two layers back - so the two cards' halves of one layer's attention
+        /// run at the same time on the two cards and the pair meets at the reduce, which is the rendezvous the
+        /// run-25 peer-wait term measures.  From `--exp tp_prompt_attn`; 0 never reaches an arm.
+        int pipeline = 1;
         int card = -1;                 // the CUDA device this arm runs on (cuBLAS needs it current)
         bool live = false;
 
@@ -868,9 +879,12 @@ struct PeerPrefill {
         // The two lead-side proofs belong to the LEAD's context, where they were created (`make_peer`), so they
         // are destroyed while it is current; the arm's own stream and `ev_out` belong to this card.
         { const core::OnDevice on_lead(prim);
-          if (qsa.ev_in) cudaEventDestroy(qsa.ev_in);
-          if (qsa.ev_red) cudaEventDestroy(qsa.ev_red); }
-        if (qsa.ev_out) cudaEventDestroy(qsa.ev_out);
+          if (qsa.ev_in[0]) cudaEventDestroy(qsa.ev_in[0]);
+          if (qsa.ev_in[1]) cudaEventDestroy(qsa.ev_in[1]);
+          if (qsa.ev_red[0]) cudaEventDestroy(qsa.ev_red[0]);
+          if (qsa.ev_red[1]) cudaEventDestroy(qsa.ev_red[1]); }
+        if (qsa.ev_out[0]) cudaEventDestroy(qsa.ev_out[0]);
+        if (qsa.ev_out[1]) cudaEventDestroy(qsa.ev_out[1]);
         if (qsa.s) cudaStreamDestroy(qsa.s);
         for (cudaEvent_t e : copied) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : used) if (e) cudaEventDestroy(e);
@@ -2105,9 +2119,12 @@ void peer_qsa_layout(PeerPrefill::Qsa& qs, int64_t T, Take&& take, PeerQsaParts*
     qs.sel_scores = (float*) one_scratch(256 * (size_t) max_blocks * 4);
     qs.attn_h = (uint16_t*) one_scratch((size_t) T * sp.heads.nq() * sh.head_dim * 2);
     // The o_proj product leaves its partial in FP32 (`Gemm` has no BF16-output entry point), so it needs a
-    // home before the wire's BF16 conversion.  One set: the partial is produced and pushed inside one layer's
-    // arm, so it is not held across the overlap boundary that forces the wire's second set.
-    qs.part_f32 = (float*) one_scratch((size_t) T * N * 4);
+    // home before the wire's BF16 conversion.  ONE set under the serialized gate - the partial is produced and
+    // pushed inside one layer's arm, so it is not held across the overlap boundary that forces the wire's second
+    // set.  TWO under the pipelined gate: the partner runs a layer ahead, and its next partial must not land on
+    // one the lead's add has not read, since the collective credits nothing back (`PeerQsaSpan::staging_sets`).
+    for (int b = 0; b < Prefill::PeerQsaSpan::kStagingSets; ++b)
+        qs.part_f32[b] = b < sp.staging_sets ? (float*) one_scratch((size_t) T * N * 4) : nullptr;
     // The step counts the selection and the attention read per query.  They are pure position arithmetic that
     // the lead computes on the host and uploads, so the LEAD's copy crosses rather than the partner's own
     // recomputation: identical bits, so `width` and `active` cannot disagree between the two cards' selections.
@@ -2285,9 +2302,12 @@ bool peer_qsa_pair_up(PeerPrefill& P, const core::ModelGeometry& g, const core::
     }
     basalt::log::info("basalt prefill",
                       "peer prompt-attention pair CUDA%d+CUDA%d open, staging %lld floats; attn_output columns "
-                      "packed on both cards over %lld QSA layers (lead %d/%d, partner %d/%d heads)",
+                      "packed on both cards over %lld QSA layers (lead %d/%d, partner %d/%d heads; %s, %d o_proj "
+                      "staging set%s)",
                       lead_dev, P.dev, (long long) elems, (long long) built,
-                      (int) lead_sh.nq(), (int) g.n_head, (int) peer_sh.nq(), (int) g.n_head);
+                      (int) lead_sh.nq(), (int) g.n_head, (int) peer_sh.nq(), (int) g.n_head,
+                      P.qsa.pipeline >= 2 ? "pipelined" : "serialized", P.qsa.span.staging_sets,
+                      P.qsa.span.staging_sets == 1 ? "" : "s");
     return true;
 }
 
@@ -2464,7 +2484,7 @@ bool peer_qsa_publish(PeerPrefill& P, const uint16_t* mixed_h, const float* q_id
     // `ev_in` lives on the LEAD's context because it is recorded on the lead's compute stream; only
     // `cudaStreamWaitEvent` may reach across devices, `cudaEventRecord` may not (see `make_peer`).
     cudaError_t erec = cudaErrorUnknown;
-    { const core::OnDevice on_lead(P.prim); erec = cudaEventRecord(qs.ev_in, cs); }
+    { const core::OnDevice on_lead(P.prim); erec = cudaEventRecord(qs.ev_in[qs.pipeline >= 2 ? wire : 0], cs); }
     if (erec != cudaSuccess) {
         err = std::string("peer QSA: the publish would not be recorded on CUDA") + std::to_string(P.prim) + ": " +
               cudaGetErrorString(erec) + " (set " + std::to_string(wire) + ", " + std::to_string(T) +
@@ -2513,7 +2533,7 @@ bool peer_qsa_layer(PeerPrefill::Qsa& qs, int64_t li, int64_t wire, int64_t T, i
     // Wait for the lead's publish of THIS layer's rows, not for the lead's queue: three peer copies on the lead's
     // compute stream behind the kernels that made them, then this event.  Skipping the wait would let the arm read
     // a wire set the copies have not filled, which is last layer's rows - a plausible token, not an error.
-    if (cudaStreamWaitEvent(cs, qs.ev_in, 0) != cudaSuccess) { err = "peer QSA: the arm would not wait on the publish"; return false; }
+    if (cudaStreamWaitEvent(cs, qs.ev_in[qs.pipeline >= 2 ? wire : 0], 0) != cudaSuccess) { err = "peer QSA: the arm would not wait on the publish"; return false; }
 
     // ---- the projections, from the lead's own mixed rows, on this card's own weights
     // N = the card's output rows, K = n_embd; the same call the lead makes, at the shard's N
@@ -2609,7 +2629,8 @@ bool peer_qsa_finish(PeerPrefill& P, Gemm& lead_gemm, cudaStream_t lead_cs, cons
     if (T <= 0 || T > qs.rows_max) { err = "peer QSA: this chunk is wider than the arm was funded for"; return false; }
     if (sp.o_type < 0) { err = "peer QSA: the pack's attn_output type was never given to the span sizer"; return false; }
     if (li < 0 || li >= (int64_t) qs.states.size()) { err = "peer QSA: no state for layer index " + std::to_string(li); return false; }
-    if (lead_gated == nullptr || lead_partial == nullptr || qs.attn_h == nullptr || qs.part_f32 == nullptr) {
+    if (lead_gated == nullptr || lead_partial == nullptr || qs.attn_h == nullptr ||
+        qs.part_f32[qs.pipeline >= 2 ? wire : 0] == nullptr) {
         err = "peer QSA: a partial of this layer has nowhere to be written";
         return false;
     }
@@ -2638,13 +2659,16 @@ bool peer_qsa_finish(PeerPrefill& P, Gemm& lead_gemm, cudaStream_t lead_cs, cons
     }
     if (!qs.pair.valid()) { err = "peer QSA: the pair is not open, so this layer has no reduce"; return false; }
 
-    // The partner may not push THIS layer's partial into the lead's staging until the lead's add of the previous
-    // one has finished reading it: the collective counts its collectives, it does not credit them back.
-    if (cudaStreamWaitEvent(qs.s, qs.ev_red, 0) != cudaSuccess) { err = "peer QSA: the arm would not wait on the lead's reduce"; return false; }
+    // The partner may not push THIS layer's partial into its staging set until the lead's add of the layer that
+    // last used THAT set has finished reading it: the collective counts its collectives, it does not credit them
+    // back. Serialized (one set): the previous layer. Pipelined (two sets): the layer two back, which is what
+    // lets this card's product for l+1 be queued while the lead's add of l is still in flight.
+    const int w = qs.pipeline >= 2 ? (int) wire : 0;
+    if (cudaStreamWaitEvent(qs.s, qs.ev_red[w], 0) != cudaSuccess) { err = "peer QSA: the arm would not wait on the lead's reduce"; return false; }
 
     // ---- each card's partial, on its own card and its own stream.  cuBLAS wants its handle's card current, which
     // is why each product is scoped to its card rather than run from the lead's thread as things stand.
-    { const core::OnDevice on(P.dev); qs.gemm.native(qs.attn_h, sp.o_type, pc.native, qs.part_f32, T, N, pc.ne0); }
+    { const core::OnDevice on(P.dev); qs.gemm.native(qs.attn_h, sp.o_type, pc.native, qs.part_f32[w], T, N, pc.ne0); }
     if (const cudaError_t le = cudaGetLastError(); le != cudaSuccess) {
         err = std::string("peer QSA: the partner's o_proj product did not launch: ") + cudaGetErrorString(le);
         return false;
@@ -2659,7 +2683,7 @@ bool peer_qsa_finish(PeerPrefill& P, Gemm& lead_gemm, cudaStream_t lead_cs, cons
     // and returns WITHOUT adding: `tp2_all_reduce` refuses at entry when either word is already set, and the
     // driver reads `timed_out()` again at the chunk boundary, after its own stream sync, where the answer is
     // known.  Half a reduce must fail the run, never be a token.
-    if (!basalt::kernels::tp2_all_reduce(qs.pair, qs.part_f32, T, N, qs.s, P.prim, /*rank*/ 1, err)) {
+    if (!basalt::kernels::tp2_all_reduce(qs.pair, qs.part_f32[w], T, N, qs.s, P.prim, /*rank*/ 1, err)) {
         err = "peer QSA: the partner's half of layer " + std::to_string(layer) + ": " + err;
         return false;
     }
@@ -2670,8 +2694,8 @@ bool peer_qsa_finish(PeerPrefill& P, Gemm& lead_gemm, cudaStream_t lead_cs, cons
     // The two proofs the next layer's publish and push wait on, recorded after the two adds were enqueued - each
     // on the card whose stream it records into, which is where each event was created (`make_peer`).
     cudaError_t e_out = cudaErrorUnknown, e_red = cudaErrorUnknown;
-    { const core::OnDevice on_partner(P.dev); e_out = cudaEventRecord(qs.ev_out, qs.s); }
-    { const core::OnDevice on_lead(P.prim); e_red = cudaEventRecord(qs.ev_red, lead_cs); }
+    { const core::OnDevice on_partner(P.dev); e_out = cudaEventRecord(qs.ev_out[w], qs.s); }
+    { const core::OnDevice on_lead(P.prim); e_red = cudaEventRecord(qs.ev_red[w], lead_cs); }
     if (e_out != cudaSuccess || e_red != cudaSuccess) {
         err = std::string("peer QSA: the reduce would not be recorded: ") +
               cudaGetErrorString(e_out != cudaSuccess ? e_out : e_red);
@@ -2772,8 +2796,8 @@ bool peer_qsa_span_catch_up(PeerPrefill& P, int64_t p0, std::string& err) {
         peer_to(ps.idx_dead, ls.idx_dead, (size_t) sh.idx_dim * sizeof(float));
         peer_to(ps.idx_block_pos, ls.idx_block_pos, sizeof(int32_t));
     }
-    cudaEventRecord(qs.ev_out, qs.s);
-    cudaEventSynchronize(qs.ev_out);
+    cudaEventRecord(qs.ev_out[0], qs.s);
+    cudaEventSynchronize(qs.ev_out[0]);
     qs.last_import_ms = ms_since(t0);
     qs.last_import_cells = p0 - c0;
     ++qs.imports;
@@ -2824,12 +2848,13 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
     // requires the event and the stream to share a context; only `cudaStreamWaitEvent` is allowed to cross
     // devices, which is how the partner's stream consumes both.  `ev_out` is the reverse case - recorded on the
     // arm's own stream - so it is created with that stream below, on the partner's context.
-    if (pp->qsa.span.on &&
-        (cudaEventCreateWithFlags(&pp->qsa.ev_in, cudaEventDisableTiming) != cudaSuccess ||
-         cudaEventCreateWithFlags(&pp->qsa.ev_red, cudaEventDisableTiming) != cudaSuccess)) {
-        err = "prefill peer: the prompt-attention arm's lead-side event";
-        return false;
-    }
+    if (pp->qsa.span.on)
+        for (int b = 0; b < Prefill::PeerQsaSpan::kWireSets; ++b)
+            if (cudaEventCreateWithFlags(&pp->qsa.ev_in[b], cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreateWithFlags(&pp->qsa.ev_red[b], cudaEventDisableTiming) != cudaSuccess) {
+                err = "prefill peer: the prompt-attention arm's lead-side event";
+                return false;
+            }
     bool ok = true;
     if (relay) {   // the primary's side of the host relay
         int lo = 0, hi = 0;   // the rows' upload at the greatest priority: the layer's end waits for it
@@ -2864,9 +2889,10 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
         // may not take, so neither `T_max` nor `T_fp4` alone is the bound.
         pp->qsa.rows_max = Tp;
         pp->qsa.card = pp->dev;
-        if (ok) {   // `ev_in` and `ev_red` are the lead's, created above; only these two belong to this card
-            ok = cudaStreamCreateWithFlags(&pp->qsa.s, cudaStreamNonBlocking) == cudaSuccess &&
-                 cudaEventCreateWithFlags(&pp->qsa.ev_out, cudaEventDisableTiming) == cudaSuccess;
+        if (ok) {   // the lead-side events are created above; only these belong to this card
+            ok = cudaStreamCreateWithFlags(&pp->qsa.s, cudaStreamNonBlocking) == cudaSuccess;
+            for (int b = 0; ok && b < Prefill::PeerQsaSpan::kWireSets; ++b)
+                ok = cudaEventCreateWithFlags(&pp->qsa.ev_out[b], cudaEventDisableTiming) == cudaSuccess;
         }
         if (ok)
             ok = pp->qsa.gemm.init_external(pp->qsa.s, pp->qsa.gscratch, GEMM_SCRATCH, pp->qsa.gws, GEMM_WS, err);
@@ -3018,6 +3044,11 @@ Prefill::PeerQsaSpan Prefill::make_peer_qsa_span(const core::ModelGeometry& g, c
     sp.le = le;
     sp.heads = core::qsa_pair_shard(g.n_head, g.n_head_kv, lead_heads, /*rank*/ 1);
     sp.on = on && sp.heads.ok();
+    // The same flag `set_peer` refuses anything but 1 and 2 on, read here so the tier that reserves the partner's
+    // bytes and the arm that allocates them are priced from ONE decision (`PeerQsaSpan::staging_sets`): the pipelined
+    // gate holds a second `o_proj` staging set, and a tier that funded one under an arm that uses two is an
+    // allocation failure at the first gated prompt.
+    sp.staging_sets = core::exp_flag("tp_prompt_attn", 0.0) >= 2 ? 2 : 1;
     if (!sp.on) return sp;
     // The first QSA layer of the stage supplies the pack figures: the sizer prices one row and multiplies by the
     // stage's QSA layer count, so a pack that varied its quantization between layers would be priced wrong here
@@ -4218,10 +4249,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                    peer_qsa_finish(*sap, m.gemm, m.cs, m.attn_h, ZV, m.bo, qsa_ord, l, wire, T, err); }
                         if (!ok_arm) { m.qsa_refused = true; return false; }
                         qsa_sliced = true;
-                        // The next publish must not land in the wire set this layer's arm is still reading, nor
-                        // overwrite the partner's staging before its add has run: the lead's stream waits for the
-                        // partner's whole layer before anything of the next one is queued on it.
-                        if (cudaStreamWaitEvent(m.cs, sap->qsa.ev_out, 0) != cudaSuccess) {
+                        // THE WAIT, which is the whole difference between the two gates.
+                        // SERIALIZED (1): the lead's stream waits for the partner's WHOLE layer before anything of
+                        // the next one is queued. Safe by construction, and 67-80 ms a layer of it - it puts the
+                        // partner's attention on the lead's critical path on top of the lead's own (run 25).
+                        // PIPELINED (2): no wait here. What the lead may still not do is overwrite a wire set or a
+                        // staging the partner's reduce has not finished with, and those are the two per-set waits
+                        // the publish above and `peer_qsa_finish` take - two layers back, not one - so the cards
+                        // compute their halves of one layer at the same time and meet only at the reduce, the one
+                        // rendezvous the mode keeps. It cannot deadlock: the lead's add of layer l was queued
+                        // before this point, so the partner's add of l - what the publish's wait waits on - can
+                        // always run.
+                        if (sap->qsa.pipeline < 2 &&
+                            cudaStreamWaitEvent(m.cs, sap->qsa.ev_out[wire], 0) != cudaSuccess) {
                             err = "prefill: the lead would not wait for the partner's layer";
                             m.qsa_refused = true;
                             return false;
