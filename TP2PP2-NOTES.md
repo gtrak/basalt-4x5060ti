@@ -1742,7 +1742,7 @@ same bits, same rows, same combine. The gate is only required if the parity line
 | 128, FP32 → planes | 540 → 333 | 14 159 → 22 903 | 21 239 → 24 788 |
 
 Against run 18's measured 825-836 MiB/1024 tokens and ~19.3k crossover: the acts term is 24 x 10 240 B a token
-(240.0 MiB of those 825-836, against 33.8 MiB with the planes), so the boot line should print **618-629**, and the
+(240.0 MiB of those 825-836, against 33.8 MiB with the planes), so the boot line should print **619-630**, and the
 crossover moves up by the ratio of the two wires, ~19.3k → **~25.5k**, capped by the pack ceiling at **24 788**
 (the printed figure stays `min(chunk, crossover, ceiling)`, so at `--prefill 8192` it reads 8 192 either way — read
 the MiB field).
@@ -1773,7 +1773,7 @@ pair's lane got ~69 MiB a layer emptier, more of the RAM band moves to the partn
 4. **Prefill: 1905 → 1930-2050 t/s at 8192.** Flat is possible and would mean the peer's window overlaps the lead's
    work already; read (1)-(3), not the headline.
 5. **Boot lines**: `acts cross as the lead's FP4 planes` and `its activations as the lead's FP4 planes`;
-   618-629 MiB/1024 tokens; the band's `num/8` at or above the FP32-acts boot's, and `(peer read N from RAM)`
+   619-630 MiB/1024 tokens; the band's `num/8` at or above the FP32-acts boot's, and `(peer read N from RAM)`
    rises with it (more band moved). `--peer-acts-fp32` on the same boot must print the FP32 clauses and reproduce
    run 18's act/quant split — that is the A/B and the byte-identity control.
 6. **Decode is untouched** (this leg is prefill-only): solo t/s and acceptance should sit inside run 18's spread;
@@ -1800,7 +1800,7 @@ Other files: `include/basalt/prefill/prefill.hpp` (`set_peer`, `peer_bytes`), `i
 ### Reviewer checklist
 
 - [ ] Boot this build (the wire is chosen at `set_peer`; an old process keeps the FP32 acts).
-- [ ] Both stages' `peer fp4 crossover`: `acts cross as the lead's FP4 planes`, the 618-629 MiB field, the lanes
+- [ ] Both stages' `peer fp4 crossover`: `acts cross as the lead's FP4 planes`, the 619-630 MiB field, the lanes
       and `num/8` against the `--peer-acts-fp32` boot (prediction 5).
 - [ ] `grep "peer GPU"` says `its activations as the lead's FP4 planes` (and `FP32 (--peer-acts-fp32)` on the A/B).
 - [ ] Chunk lines both ways: `act`, `quant`, `comp`, `rows`, peer-wait/straggler (predictions 1-4).
