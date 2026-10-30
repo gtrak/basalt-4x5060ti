@@ -1,213 +1,199 @@
-# Continuation — 4x RTX 5060 Ti Basalt campaign
+# Continuation — the tp2 campaign on 4x RTX 5060 Ti
 
-State as of merge commit `8885ff1d`. Facts and explicit doubts; no interpretation dressed as fact.
+State as of `293ca647` (2026-10-30 ~01:30 UTC). Written as compaction insurance: a future
+session should be able to resume from this file plus TP2PP2-NOTES.md without archaeology.
+Facts, measured numbers, decisions, and the gated roadmap. Interpretations are labeled.
 
-## 1. Where the work stands
+## 1. Mission and constraints
 
-| | |
-|---|---|
-| Branch | `main`, local only |
-| HEAD | `8885ff1d` (merge of upstream `55548875`) |
-| Our commits | 21 (`b2fe96bf..cc809179`) + 1 merge |
-| Base | `b2fe96bf` (upstream) |
-| Remotes | `origin` = jesdga95/basalt (upstream), `fork` = gtrak/basalt-4x5060ti (pushed, force-pushed) |
-| Rescue refs | tag `pre-upstream-merge` and branch `fork-main-rescue` on the fork = upstream's 19 commits as they were before the force-push |
-| Uncommitted | none. `bin/basalt` is built post-merge and a server is running |
+- Engine: basalt (fork `gtrak/basalt-4x5060ti`, upstream jesdga95/basalt). Model:
+  Qwen3.8-Flash-Next NVFP4 MoE — 48 layers, 512 experts/layer, top-8 (~10 row-visits/
+  token/layer), **6B active params** (owner-stated; makes prefill weight-streaming-bound
+  and decode latency-bound). Expert shape gate/up 1280x2560 + down 2560x640.
+- Hardware: 4x RTX 5060 Ti 16 GB, PCIe GEN4 x4 each, NO NVLink; d2d ~6.6 GiB/s;
+  aggregate one-way ~26.4 GiB/s; NCCL 4-way 360 µs@1MB with `P2P_LEVEL=PIX`
+  (SYS was 658 µs — the sglang WORKLOG's key fix); FlashInfer PCIe-IPC AR +17.6%
+  decode conc 6. 60 GB RAM, tiers: VRAM experts + RAM page-locked + SSD.
+- Mandate: decode-first (agentic traffic: long cached contexts, 200-3k generations,
+  periodic 122k-token compactions). Owner decision (2026-10-30): **the tp2 topology is
+  KEPT**; the goal is now "prefill close to the split's 3,750-3,868 t/s AND faster decode,"
+  optimized by cost/benefit, with TP=4 as the primary candidate and TP=2/PP=2 the fallback.
+- Hard constraints: never modify swap; KV fixed at 2 slots x 262144; minimal fork diff;
+  flags over engine code; the production split tree `/home/gary/opt/basalt` untouched.
 
-## 2. Hardware and model (measured)
+## 2. Measured state (this box, tonight)
 
-- 4x RTX 5060 Ti, sm_120, 16311 MiB each, 180 W. **PCIe 4.0 x4 on all four** (GPU0 is x16-capable, negotiates x4).
-- h2d 7.2 GB/s, d2d 6.64 GiB/s, no NVLink. Peer access 12 of 12 ordered pairs enabled.
-- Ryzen 9 5900X, no AVX-512. 60.7 GiB RAM, 16 GiB swap. CUDA 13.2.
-- Model `models/Qwen3.8-FN-NVFP4.basalt`, 122 GiB on disk = experts 63.28 + gguf 55.60 + dense 1.43 + vision 0.86 + mtp 0.77. Actual weights ~69 GiB.
-- PLE `per_layer_token_embd.weight` is 50.66 GiB Q8_0, 320M rows, streamed from SSD, 90 B/row.
+| config | prefill (122,300 tok fresh) | decode |
+|---|---|---|
+| split production (PP=4, no AR, 4-way tiers) | **3,750-3,868 t/s** | 35.4-39.8 ms/windows, 74-90 t/s |
+| sglang TP=4 + PIX + PCIe-IPC (27B DENSE, owner's box) | ~2,000 sustained | allreduce-bound at conc |
+| **tp2 EP+PP current (`293ca647`)** | **1,993-1,998 t/s @ 8192** | **solo 78-80 t/s, window 19.4 ms; concurrent parity-to-win** |
+| tp2 at start of tonight | 1,393 t/s | — |
 
-## 3. Campaign outcomes
+Night's climb: 1,393 -> 1,406 (RAM-reader) -> 1,905 (BF16 rows + re-priced share)
+-> 1,993 (FP4-plane wire + early transport + phase separation) -> 1,998 (L2 warm-up).
+Every step attribution-confirmed by its own A/B.
 
-### Accepted (in the shipped config)
+Layer anatomy (stage A, 153.2 ms): **whole** attention 54.4 on the lead (NOT split —
+see §4 correction) + lead-experts 77.8 + peer-wait 11.0. Stage B inverted (lead 77.1,
+peer 92.2). Leads' PCIe RX ~7.5 GB/s during prefill (tier fill + uploads + returns).
 
-| Change | Measured effect |
-|---|---|
-| RAM complement skips every tier's experts | pinned copy 42 → 19 GiB; ~30 GiB RAM freed |
-| Top-up skip list; servable swap filter (2 duplication bugs) | removes duplicate resident copies |
-| Peer access on (12/12 pairs) | d2d 6.64 GiB/s; required for the split |
-| Adaptation candidates kept in the RAM complement | struct 117 → 196 t/s |
-| Tier-held experts copied d2d from owning card | prefill 1502 → 1621 t/s; 17161 → 0 file reads |
-| Layer split (`BASALT_FORCE_SPLIT=1`) as default | +46% prefill vs expert tier (2354 vs 1611) |
-| 2 live / 4 dormant default with parking | 5 conversations resumed, 2203/2349 tokens reused |
-| CPU governor → performance + EPP performance | cold 48k prefill 2103 → 2839 t/s (+35%) |
-| `--prefill 12288` | 200k read 50.8 s / 3934 t/s, best of 4096/8192/12288/16384 |
+## 3. Architecture: what "tp2" actually is
 
-The split is **not** an engine default — on this box the engine's own price model still picks the expert
-tier. `basalt-ctl` sets `BASALT_FORCE_SPLIT=1` (read at `generate.cpp:1466`) and clears it when
-`BASALT_SPLIT=0`. The engine-side `split_cap` controls the stage count *within* a split (see §4).
+TP=2/PP=2 in NAME only. Reality: **expert-parallel + pipeline-parallel** — stage A =
+layers 0-23 on pair [CUDA0 lead, CUDA1 partner], stage B = 24-47 on [CUDA2, CUDA3].
+Whole-expert continuation placement: lead holds the hottest ~2,900 (layer,expert) pairs,
+partner the continuation band, RAM tier the cold tail. Attention runs WHOLE on the lead
+in BOTH prefill and decode (the head-split machinery exists but the prompt path never
+calls it — run 9; the only wired piece is RUN 17's decode lead-side, flag-gated, refusing
+pending the peer item). The entire wire program (runs 8-21: crossover pricing, plane
+shipping, BF16 row returns, share models, phase scheduling) is the tax on whole-expert
+placement. TRUE tensor parallel (shard every expert 4- or 2-way, all-reduce partials)
+would DELETE that program and balance by construction — that is the TP=4/TP=2 roadmap.
 
-### Expert placement, read from the boot log
+## 4. What we tried — the complete lever ledger
 
-The split and the expert tier have **different VRAM shares, so the same `--resident-budget-gib` gives
-different spill on each.** Split: VRAM 37.3 GiB, complement (experts not in VRAM) 26.0 GiB. Peer tier:
-main VRAM 8.6 + peer cards 43.9, so the RAM copy is sized differently.
+Landed and measured (tonight, in order):
+1. Engagement fix (run 11): `Prefill::set_peer` was never called under tp2 (guarded on
+   expert-tier validity) — the partner was a ring source, never a row-computing peer.
+   Boot line now names crossover + share + wires. 1,384 -> 1,393.
+2. RAM-reader `--peer-ram-rows` (run 14): partner fetches RAM-band blobs over its own
+   lanes, computes those rows. Engaged (9,224 experts from RAM) but only +1%: the wall
+   moved to the return leg. Mechanism kept.
+3. BF16 return rows (run 16): `rows 114.6 -> 56.3 ms` = 50.9% ~= exactly BF16's
+   byte-weight — **the return-bytes diagnosis confirmed by its own A/B**. Share
+   re-priced per stage (4/8 -> 1/8). 1,406 -> 1,905.
+4. FP4-plane outgoing leg (run 21): the lead ships planes it already rounds for its own
+   experts (1,444 vs 10,240 B/token) — bit-identical by construction (parity test proves
+   shipped planes == the peer's own). Peer act 21.3 -> 2.8 ms. The "hoist" premise was
+   stale (quantize already preceded the enqueue) — enforced with a named guard instead.
+5. Phase separation (run 19): RAM-band rows first, activations cross when written
+   (ev_act), per-group row streaming (already existed). Peer-wait 36.3 -> 11.0 (A),
+   88.3 -> 27.4 (B). Worker self-caught an inverted sort comparator via a 4,000-placement
+   harness with negative controls.
+6. L2 warm-up coverage (run 20): the stage-split's trimmed routers were the uncovered
+   case; fixed. Warning gone; solo window 19.4 ms (best recorded).
+7. Chunk sweep re-mapped (run 18): 8192-16384 flat ~1,905-1,998 (peak); 2048 -> 826
+   (routed-only regime <= 2,559); 24576 -> 1,679; 32768 -> 1,897. Wall is
+   chunk-size-invariant — the streaming dividend hides behind copy streams.
+8. Decode instrumentation (run 12, fixed by reviewer): CUDA events inside captured graphs
+   are BROKEN (invalid argument) — replaced with device-side %globaltimer stamp kernels
+   (the prof_ mould); also fixed an OOB mask index (stage-end mask read at the event
+   index L*5 instead of the layer index L). Both stages now measure every window.
 
-Split boots (VRAM 37.3), from `engine.log`:
+Dead ends, corrections, and retracted claims (do not re-litigate):
+- The original TP=2-first ordering (kimi #2) — withdrawn in #3 when the "o_proj AR
+  already runs at 2-way scale" pillar proved false (no TP attention substrate exists at
+  any degree; test-only).
+- "AR hides under compute" (my inference, kimi #3 Finding 2): wrong in a streaming-bound
+  regime — AR bytes and tier bytes compete for the same links. The surviving mechanism is
+  4-way link-load splitting (aggregate throughput), not hiding.
+- "Quarter-expert coverage saves streaming bytes 4x" (my inference, kimi #4 killed):
+  coverage fraction is byte-limited; a quarter-expert miss makes all 4 cards fetch their
+  quarters — total fetched = the whole blob. TP=4 ADDS bytes (AR 144-360 GB/prompt,
+  H-dependent) and DELETES the wire program (~26 GiB).
+- "Prefill attention is already head-split" (my claim to the owner) — WRONG: whole
+  attention on the lead; the head-split is decode-side/test-only for the prompt path.
+- `mtp_preswap` (run 15): no measurable win; default off. Drafter cannot overlap the
+  next run (GPU-chain-bound). The combine-spin hypothesis (DECODE-NEXT item 1) KILLED:
+  decode runs zero collectives, per-stage wait 0.0.
+- The byte-inequality as a TP=4 kill gate (kimi #3) — DEMOTED by kimi #4: savings ~= 0
+  against AR bytes means it fails on volume trivially; the utilization reframe is the
+  correct wall model. Trace-replay demoted to parameter estimation.
 
-| `--resident-budget-gib` | serving reserve | RAM copy | SSD spill | RAM free |
-|---|---|---|---|---|
-| 29, 30, 32, 37 | 1.8 GiB (parking off) | 26.0 | **0.0** | 10.4 – 21.9 |
-| 34 | 1.8 | 22.6 | 3.3 | 13.8 |
-| 34 | 1.8 | 25.2 | 0.8 | 15.0 |
-| 27 | 10.2 (parking on) | 15.6 | 10.3 | 21.0 |
+## 5. The kimi review series (synthetic/hf:moonshotai/Kimi-K3) — evolution
 
-- **Zero spill on the split is reachable** — RAM copy 26.0 of the 26.0 GiB complement. Seen at budgets 29,
-  30, 32 and 37, all with the serving reserve at 1.79 GiB.
-- RAM copy = `min(budget, safe)` where `safe` is derived from `MemAvailable` at boot
-  (`generate.cpp:4714-4732`, `basalt::platform::max_safe_copy`). Identical budgets therefore land
-  differently across boots: budget 34 appears above as 22.6, 25.2 **and** 19.1 GiB of copy. Do not read a
-  budget as a guaranteed copy size.
-- **The live server currently has 10.3 GiB of SSD spill** (`resident-budget=26GiB`, log line: `RAM 15.6 GiB
-  (25%), file (SSD) 10.3 GiB (16%)`). This is the config in §6 and it does **not** meet the stated goal of
-  no SSD spill.
+- #2: bounded push + kill-switch; findings: chunk-passes lever, stage-serialization
+  check (ran: stages already pipeline ~90% of the 2-stage ceiling), comp-vs-return
+  confound (resolved: return-bytes), FP8-AR rejected, morph amortization weak.
+- #3: ratified gated TP=4-first; P1s: attention-slice net unproven ([-5,+25] ms/layer —
+  must ship with net-ms transport measured), ledger currency discipline (h2d vs d2d
+  paths), decode floors per step, MMQ bench needs 32- AND 64-row points.
+- #4 (final): corner arithmetic corrected — honest TP=4 band **2,000-3,140 t/s
+  (39-61 s)**, pessimistic corner = the sglang dense anchor exactly; the fourth limit is
+  **rendezvous-cadence utilization** (structurally harder than the split's trivially
+  parallel 4-deep overlap; must be measured on synthetic buffers first); FP4 pack
+  sliceability at 640-wide is a load-time question (three outcomes priced, runtime
+  dequant-slice = kill); byte-inequality demoted, overlap-cadence bench promoted.
 
-### Why reducing park *slots* would not empty the spill (code fact, not yet tested)
+## 6. What's next — the gated sequence (kimi #4's go/no-go package, owner-approved shape)
 
-`serve_growth_bytes` (`generate.cpp:857-871`) adds the park pool to the serving reserve as
-**`(uint64_t) o.conversation_cache_mib << 20`** (`generate.cpp:865`) — the *pool size*, not slots times a
-per-slot size. Slots
-divide that pool among conversations; they do not change the RAM the engine reserves for it. The
-measured result is consistent: park 8192/4sl, 4096/2sl and 2048/1sl at budget 33 all gave
-RAM 22.6 / SSD 3.3 GiB — the slot count moved nothing. **The lever for freeing that reserve is
-`BASALT_PARK_MIB` (the pool), not `BASALT_PARK_SLOTS`.** Not tested; see §7.
+Step 0 (in flight or next, cheapest-decisive first):
+1. Volume ledger close-out: pin H from geometry; fetched volume 744-960 GiB;
+   trace-replay demoted to miss-rate-vs-coverage refinement (NOT a kill gate).
+2. Ring matrix (worker `tp2-tpstep0` in flight): AR latency floor KiB->64 MB, per-link
+   BW under concurrent tier fill; pins H; answers d2d-vs-bridged per pair.
+3. **Overlap cadence bench (NEW, promoted ahead of MMQ)**: synthetic 4-card x {2,4}-deep
+   interleave, measure AR-hidden fraction + max-of-4 cadence inflation under injected
+   tier-fill jitter. **KILL TP=4 if hidden fraction < 70% at 4-deep** (wall flips
+   wire-exposed -> <= ~2,200, below the EP+PP+slice floor).
+4. Pack inspection: is a 640-wide N-slice self-contained in the on-disk FP4 pack (column
+   interleave may scatter)? Pure-offset view (free) / load-time repack (acceptable) /
+   runtime dequant-slice (KILL TP=4; evaluate TP=2 at 1280).
+5. MMQ sweep {2560 ref / 1280 / 640}: efficiency coefficient + parity (32-row AND 64-row
+   points — 64 prices the TP=2 fallback free).
+6. Wall-model recompute with measured coefficients. **GO criterion: projected TP=4 must
+   clear 2,600 t/s at the PESSIMISTIC corner** (beat EP+PP+slice end-state ~2,400-2,600
+   at worst case). Corner <= 2,600 -> TP=2/PP=2 (repriced free from items 3-5).
+7. If GO, milestone order: attention slice (peer-side prompt attention + o_proj AR —
+   ships only with net critical-path ms including transport; head ratios stay labeled
+   model predictions) -> MoE TP substrate on the parity harness (pinned EP+PP = oracle)
+   -> prefill wall vs the item-6 floor -> decode measured vs floors (solo >= 78 t/s,
+   acc within -3 pts, hit >= 89; the 8% sync estimate gates nothing until measured).
 
-### Decode, current config (split, adaptation on)
+Parked (formal): topology morph (split layout for compactions, tp2 for decode) —
+kimi #2 P2-5: net 3-13 s/compaction best case; trigger: post-TP=4 prefill < 2,600 AND
+switch <= 10 s with acc/hit unchanged. FP8-AR: rejected unless a ledger shows
+AR > 15% of layer time. Speculative-prefill: instrumentation spike only.
 
-conv ~117-120, struct ~193-196, prose ~98-101 t/s.
+In-flight at this writing (all blind-on-GPU, predictions filed):
+- `tp2pp2-balance` (run 753f6bbe/801595cb): share-v2 time-objective + parameterized
+  QsaHeadShard spans + unequal-span parity + decode contract rebase. Capped at one
+  iteration; kill: pair wall > 135 ms, prefill < 2,200, or the row-rate gap
+  (lead 2.26 vs peer 1.09 µs/row-visit — UNEXPLAINED) persists > 1.4x after balance
+  (that proves lead-side contention and deflates every TP estimate).
+- `tp2-tpstep0` (run 277918db): ledger + ring matrix + pack inspection (per §6.1-4).
+- `tp2-draftseed` (run 58be06ee): suffix-drafter re-seeding from the generated tail —
+  the 70k-generation class ran 40 t/s vs 78 (acceptance collapse, dl ~1.1 vs ~3.0).
+  kimi #2 P2-4: highest-EV parked item (~1.9x decode on a real workload class).
+  Kill: < 55% acceptance recovery after one session.
 
-### Prefill, current config
+## 7. Operational trivia (saves an hour)
 
-200k read ~3934 t/s; 231897-token read post-merge 59.7 s / 3882 t/s; first 30k ~1970 t/s.
-
-### Chunk sweep, real ~200k reads, performance governor
-
-| `--prefill` | 200k in | overall | first 30k | steady 100-200k |
-|---|---|---|---|---|
-| 4096 | 83.2 s | 2404 | 1642 | 2731 (plateaus) |
-| 8192 | 59.8 s | 3344 | 1734 | 3935 |
-| **12288** | **50.8 s** | **3934** | **1970** | **4767** |
-| 16384 | 55.2 s | 3625 | 1796 | 4195 |
-
-### Rejected, with the number that rejected it
-
-| Option | Result |
-|---|---|
-| `--mmap-experts` | slower |
-| d2d tier sourcing for repeated deep prefill | slower |
-| chunk 32768 | 655 t/s |
-| `--spec 10` / `--spec 12` | worse than `--spec 8` |
-| `--spec 4` under concurrency | worse |
-| peek row cap `kPeerFp4Tokens` 5120 → 32768 | 1106 vs 1611 t/s |
-| 4-stage prompt split (P1) | 1060 vs 1374 t/s (−23%) |
-| 4 live + park | 55.7 t/s at 20.6 GiB spill vs 2 live + park 77.5 t/s at 10.3 GiB |
-| KV streaming `--kv-resident` | mutually exclusive with `--parallel`/`--batch` |
-
-### Measurement errors found in this campaign
-
-1. **A 36k microbench favoured `--prefill 4096`** and it was shipped as default. On a real 201k read 4096 was strictly worse (647 → 2197 t/s). Per-chunk cost scales with prompt length; the cold-cache ramp does not.
-2. A `--prefill 8192` result was misread as "flat t/s" from the wrong log column.
-3. **The `basalt-ctl` comment block above `--resident-budget-gib` quotes spill figures taken from
-   *peer-tier* sessions** (VRAM 29.0), where budget 33 → RAM 21.6 / SSD 12.6. Those numbers are correct for
-   that architecture and wrong for the split the launcher actually runs. Left in place as-is; do not use
-   them to size the split.
-
-### Unresolved observations
-
-- **First ~30k tokens of every long read run 2-3x slower** (1206-1314 t/s vs 4767 steady) in *every* configuration. Not clocks (measured flat-high). Not chunk size (identical across all four). Attributed to cold expert cache + SSD spill. The spill explanation is untested against a zero-spill boot.
-- **`Mlocked: 0.0 GiB`** in `/proc/PID/smaps_rollup` while the engine log reports the RAM copy as "page-locked". Unconfirmed whether it is actually locked; if it is not, the copy is reclaimable.
-- Swap 8 GiB used and not drained — leftover from earlier 38 GiB-budget runs.
-- No quality number exists for any config (see §5).
-
-## 4. Upstream work that changes the calculus
-
-Upstream `main` = `55548875`, 19 commits past our base `b2fe96bf`. These were the fork's contents before the
-force-push and are preserved on `fork-main-rescue` and tag `pre-upstream-merge`.
-
-### Directly contradicts a local conclusion
-
-**`a4f4d06f` — the 4-stage prompt split is now default on alike cards.**
-
-```c
-const int split_cap = o.peer_devices.size() <= 1 ? 2 : split_alike ? (int) o.peer_devices.size() + 1 : 1;
-```
-
-- Was: `o.peer_devices.size() <= 1 ? 2 : (int) basalt::core::exp_flag("prompt_split", 1.0)`, i.e. 2 stages unless `--exp prompt_split` overrode it.
-- Now: 4 stages by default when the cards match in bandwidth and VRAM ("alike" — our four identical cards qualify).
-- Our P1 measured the 4-stage split at 1060 vs 1374 t/s (−23%) and rejected it. Commit `caf9450a` ("the prompt split price counts the host bandwidth every card streams over at once") changed the pricing that measurement was made against.
-
-### Adjacent to local work, not yet assessed against it
-
-- `b6125f60` (264 lines) — "elastic KV never takes the expert cache below a prompt chunk's loan; a request that cannot fit is refused, not fatal". Touches the resident-budget / spill path this doc's §3 describes.
-- `6e615677` — "a tier card slower than the main one takes no share of the hottest experts" (placement, which we rewrote for the RAM complement).
-- `db5f0741` — "a request's last round lands after its reply is out".
-- `4353ef35`, `7d8d0508` — deep-prompt split correctness: a split read plans the chunks the prompt path reads; the draft layer's rows of earlier chunks wait in hand-off buffers.
-- `88126657` — a long prompt part not read across the cards logs why, with its numbers.
-
-### Tooling
-
-- `4d4ff9e3`, `1cbf2212` — `/metrics` per-card and per-slot history, queue, best requests.
-- `4fca1326`, `851e6d59`, `e51f561e` — stats page reworked.
-- `4e4139dc` — bench uses the engine speculation default.
-- `81a4af0c`, `4a591d96` — vision cache borrowing; refused image logged.
-- `5a23e713` — a tier card without room declines the split at start.
-
-### Merge state
-
-One conflict, in the prompt-split stage setup: upstream dropped a redundant `size_t fb` redeclaration in the
-same block where we changed `set_ring_remote` → `set_ring_remotes`. Resolved by keeping our API call and
-upstream's removal (`fb` is declared above and read in the log line below). Merged tree builds clean.
-
-**Landing review at merge `8885ff1d`**: the merged binary booted with the live config and read a
-231897-token prompt in 59.7 s / 3882 t/s with prose decode at 81.4 t/s, consistent with the pre-merge
-figures above. **This is not an A/B** — the two builds were not run back to back on the same prompt
-contents, and no pre-merge reference run was taken at that prompt length.
-
-## 5. Blocked
-
-- **No quality number exists for any configuration.** PPL/KLD needs a llama.cpp Q8_0 KLD base (178 GiB Q8_0 GGUF; ~117 GiB free) and `wiki.test.raw`; the API exposes no `logprobs`. So KV formats, relaxed drafting and pack swaps are all unvalidated. `AGENTS.md` requires PPL/KLD through the decode path for any change that can alter numerics.
-- `--gpu-only-full` refused with multi-GPU (`generate.cpp:1796` after the merge; was 1736).
-- `--no-pool` cannot run (graphed paths need the residency table).
-
-## 6. Live configuration
-
-`basalt-ctl` env defaults: `BASALT_SPLIT=1`, `BASALT_PARALLEL=2`, `BASALT_PREFILL=12288`,
-`BASALT_RESIDENT_GIB=26`, `BASALT_CTX=262144`, `BASALT_KV=int8`, `BASALT_PARK_MIB=8192`,
-`BASALT_PARK_SLOTS=4`, `BASALT_PROMPT_CACHE=8`, port 8000, alias `local`. Also spec 8, ple-io direct,
-adapt-swaps 96, park 8192/4sl.
-
-- Engine-side, from the boot log: `prefill=12288 resident-budget=26GiB conversation-cache=8192MiB conversation-cache-slots=4 prompt-cache=8 spec=8`, `par=2 ctx/slot=262144 (slot-full-context)`, integer KV, 10.3 GiB SSD spill.
-- `--parallel` is a **server** flag; the engine flag is `--batch`. Passing `--parallel` to the engine binary errors.
-- `--kv-resident` is mutually exclusive with `--parallel`/`--batch`.
-- Boots take ~2 min. A running server starves bench boots (`hc8: staging the hyper-connection matrices failed`); `basalt-ctl bench` stops the server first.
-- `guard_host_memory` refuses to start below `MemAvailable` 14 GB or `SwapFree` 4 GB.
-- Greedy identity: A/A identical; single-card pinned old-vs-new identical; multi-card differs (placement-dependent, expected).
-
-## 7. Open questions
-
-1. **Zero spill with parking still on.** Unreached so far. Two untested candidates: lower `BASALT_RESIDENT_GIB`-independent `BASALT_PARK_MIB` (frees the serving reserve, per §3), and a higher budget on a boot where `MemAvailable` is high. The stated goal — no SSD spill, parking on, fewer slots — has no confirmed configuration.
-2. Does the 4-stage split perform differently now that pricing counts host bandwidth (`caf9450a`)? Decides whether P1's −23% still holds and whether split-vs-tier is still the right pick.
-3. Does `b6125f60` change the resident-budget / spill behaviour the local config depends on?
-4. Does `6e615677` conflict with our RAM-complement placement rewrite?
-5. Can the first-30k ramp be hidden (pre-warm request)? Would also test whether the ramp is really the spill.
-6. Is the RAM expert copy actually page-locked?
-7. Quality harness: none exists.
-
-## 8. Planned, not started
-
-**N-way prompt offload** — one runner per tier, ownership-then-spread split, held-anywhere skip table;
-~350 lines. Upstream's default 4-stage split may already cover this ground, so re-evaluate against it
-before building.
-
-## 9. References
-
-- `OPTIMIZATION-PLAN.md` — entries 1-15, per-entry detail and trade tables.
-- `WORKLOG.md` — campaign log.
-- Test harness: `/tmp/pp.py`, `/tmp/pp2.py`, `/tmp/fc*.py`, `/tmp/firstchunk.py`, `/tmp/paradecode.py` (scratch; `/tmp` is not durable).
-- Engine log `~/.cache/basalt/e51e4b1d90f2a2b3/engine.log` accumulates; use `tail`, not `grep`. The `resident RAM mode:` line and the `experts live in VRAM ... RAM ... file (SSD) ...` line are the pair to read for placement.
-- Local tooling is `basalt-ctl` and this doc; there is no `scripts/` directory.
+- Boot (tp2, from /home/gary/opt/basalt-tp2pp2):
+  `/home/gary/opt/basalt/.venv/bin/python -m serve.server --engine-bin bin/basalt
+  --model /home/gary/opt/basalt/models/Qwen3.8-FN-FP4Local.basalt --alias local
+  --host 127.0.0.1 --port 8000 --gpu 0,1,2,3 --parallel 2 --slot-full-context
+  --prefill 8192 --resident-budget-gib 37 --prompt-cache 8 --spec 8 --ple-io direct
+  --kv int8 --max-context 262144 --adapt-swaps 96 --resident-experts
+  --peer-reserve-mib 600 --decode-timing --suffix-draft 8 --grammar --short-read 512
+  --tp-size 2 --peer-ram-rows --exp decode_profile=1`
+  (--peer-rows-fp32 / --peer-acts-fp32 / --exp mtp_preswap=1 / --exp batch_lines=0 /
+  --exp decode_headsplit=1 / --exp l2warm_force=1 are the A/B gates.)
+- Logs: wrapper `/tmp/tp2-serve.log` (per-boot); engine
+  `~/.cache/basalt/5059bef732e5da6c/engine.log` (append-across-boots — find the current
+  boot at the last `peer GPU 1 computes` line). Grep: "peer chunk" (per-layer op
+  breakdown), "peer fp4 crossover" (boot state), "basalt decode profile" (per-window
+  stage phases), "s1 done" (request rates; NOTE: done-line t/s are wall-contaminated
+  under concurrency — read the live line's `total`).
+- Rules that bit us: NEVER run the GPU-labelled ctest suite while the server holds the
+  cards (OOM'd once; server survived; run GPU tests in the boot window after kill);
+  engine shutdown takes ~20 s (a fast re-boot races the port); engine.log is append-
+  across-boots; done-line ttft includes the other slot's prefill.
+- Worktrees: tp2pp2 (branch of record, balance worker in flight), tp2-fp4plane (merged),
+  tp2-l2warm (merged), tp2-headsplit (merged), tp2-hostloop (merged, mtp_preswap),
+  tp2-tpstep0 (ledger/ring, in flight), tp2-draftseed (drafter, in flight),
+  tp2-decode (decode instrumentation, merged). Production tree /home/gary/opt/basalt
+  untouched at 306f81e7 lineage; basalt-ctl exists but the tp2 server runs manually.
+- Subagent lessons: workers die at 262k context (work economically: notes + diffs, no
+  transcript re-reads); direct async children cannot resume after stop but COMPLETED
+  runs revive via `subagent({action:"resume", id})` (used 3x successfully); steering a
+  completed run's id revives it; the supervisor reply AND steer both (the reply alone
+  did not always route); "desktop" is a MODEL (worker agent + model desktop), kimi-k3
+  is `synthetic/hf:moonshotai/Kimi-K3` (bare `kimi-k3` resolves to the quota-dead
+  opencode-go route).
+- Bench kit: `/tmp/tp2_bench.sh PORT LABEL` + payloads /tmp/tp2_r1..r7.json
+  (r1 = 122k fresh + 300 gen; the nat prompt /tmp/tp2_prompt_nat.txt ~122k tokens;
+  random-word prompts starve the drafter — a confound). Kill pattern:
+  `pgrep -f "^/home/gary/opt/basalt/.venv/bin/python -m serve.server"` (plain pkill
+  hits unrelated processes).
