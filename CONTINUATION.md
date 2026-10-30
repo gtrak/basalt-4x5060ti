@@ -35,6 +35,12 @@
    NOT the supervisor's business**: briefs carry the task, the constraints, and the reporting
    bar; progress files are insurance, not the primary continuation.
 10. **FORK PUSHES AS CHECKPOINTS** after every accepted unit; the branch of record is tp2pp2.
+11. **RECOVERY LADDER when serving degrades** (degenerate output, crashes, wrong modes):
+    (a) drop the experimental flag (gate-off is byte-identical to the tested baseline — cheapest);
+    (b) revert the offending commits on the branch (git revert, keep the record);
+    (c) run the production binary `/home/gary/opt/basalt` (306f81e7, the split topology — a
+    different but fully proven mode: 3,750-3,868 prefill / 35.4-39.8 ms decode). The workers'
+    inference runs through whatever serves :8000, so restoration priority is absolute.
 
 
 State as of `293ca647` (2026-10-30 ~01:30 UTC). Written as compaction insurance: a future
