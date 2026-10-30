@@ -865,9 +865,12 @@ struct PeerPrefill {
         core::qsa_pair_free(qsa.lead_cols);
         core::qsa_pair_free(qsa.peer_cols);
         qsa.pair.close();
-        if (qsa.ev_in) cudaEventDestroy(qsa.ev_in);
+        // The two lead-side proofs belong to the LEAD's context, where they were created (`make_peer`), so they
+        // are destroyed while it is current; the arm's own stream and `ev_out` belong to this card.
+        { const core::OnDevice on_lead(prim);
+          if (qsa.ev_in) cudaEventDestroy(qsa.ev_in);
+          if (qsa.ev_red) cudaEventDestroy(qsa.ev_red); }
         if (qsa.ev_out) cudaEventDestroy(qsa.ev_out);
-        if (qsa.ev_red) cudaEventDestroy(qsa.ev_red);
         if (qsa.s) cudaStreamDestroy(qsa.s);
         for (cudaEvent_t e : copied) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : used) if (e) cudaEventDestroy(e);
@@ -2434,11 +2437,16 @@ bool peer_qsa_publish(PeerPrefill& P, const uint16_t* mixed_h, const float* q_id
     }
     const basalt::kernels::QsaShapes sh = core::qsa_shard_shapes(*sp.g, sp.heads);
     const uint64_t N = (uint64_t) sp.g->n_embd;
+    uint64_t queued = 0;   // what this publish put on the link, so a refusal says how far it got
     auto across = [&](void* dst, const void* src, uint64_t bytes, const char* what) -> bool {
-        if (cudaMemcpyPeerAsync(dst, P.dev, src, P.prim, (size_t) bytes, cs) != cudaSuccess) {
-            err = std::string("peer QSA: the ") + what + " would not cross to CUDA" + std::to_string(P.dev);
+        const cudaError_t e = cudaMemcpyPeerAsync(dst, P.dev, src, P.prim, (size_t) bytes, cs);
+        if (e != cudaSuccess) {
+            err = std::string("peer QSA: the ") + what + " would not cross to CUDA" + std::to_string(P.dev) +
+                  ": " + cudaGetErrorString(e) + " (" + std::to_string(bytes) + " B, " + std::to_string(queued) +
+                  " B queued before it)";
             return false;
         }
+        queued += bytes;
         return true;
     };
     if (!across(qs.mixed_h[wire], mixed_h, N * (uint64_t) T * 2u, "mixed rows")) return false;
@@ -2446,7 +2454,16 @@ bool peer_qsa_publish(PeerPrefill& P, const uint16_t* mixed_h, const float* q_id
     if (!across(qs.idx_raw[wire], idx_raw, (uint64_t) T * sh.idx_dim * 4u, "indexer k")) return false;
     if (steps != nullptr &&
         !across(qs.steps, steps, (uint64_t) T * basalt::kernels::kStepCount * 4u, "step counts")) return false;
-    if (cudaEventRecord(qs.ev_in, cs) != cudaSuccess) { err = "peer QSA: the publish would not be recorded"; return false; }
+    // `ev_in` lives on the LEAD's context because it is recorded on the lead's compute stream; only
+    // `cudaStreamWaitEvent` may reach across devices, `cudaEventRecord` may not (see `make_peer`).
+    cudaError_t erec = cudaErrorUnknown;
+    { const core::OnDevice on_lead(P.prim); erec = cudaEventRecord(qs.ev_in, cs); }
+    if (erec != cudaSuccess) {
+        err = std::string("peer QSA: the publish would not be recorded on CUDA") + std::to_string(P.prim) + ": " +
+              cudaGetErrorString(erec) + " (set " + std::to_string(wire) + ", " + std::to_string(T) +
+              " rows, " + std::to_string(queued) + " B queued)";
+        return false;
+    }
     return true;
 }
 
@@ -2643,9 +2660,14 @@ bool peer_qsa_finish(PeerPrefill& P, Gemm& lead_gemm, cudaStream_t lead_cs, cons
         err = "prefill: the lead's half of layer " + std::to_string(layer) + ": " + err;
         return false;
     }
-    // The two proofs the next layer's publish and push wait on, recorded after the two adds were enqueued.
-    if (cudaEventRecord(qs.ev_out, qs.s) != cudaSuccess || cudaEventRecord(qs.ev_red, lead_cs) != cudaSuccess) {
-        err = "peer QSA: the reduce would not be recorded";
+    // The two proofs the next layer's publish and push wait on, recorded after the two adds were enqueued - each
+    // on the card whose stream it records into, which is where each event was created (`make_peer`).
+    cudaError_t e_out = cudaErrorUnknown, e_red = cudaErrorUnknown;
+    { const core::OnDevice on_partner(P.dev); e_out = cudaEventRecord(qs.ev_out, qs.s); }
+    { const core::OnDevice on_lead(P.prim); e_red = cudaEventRecord(qs.ev_red, lead_cs); }
+    if (e_out != cudaSuccess || e_red != cudaSuccess) {
+        err = std::string("peer QSA: the reduce would not be recorded: ") +
+              cudaGetErrorString(e_out != cudaSuccess ? e_out : e_red);
         return false;
     }
     cudaSetDevice(P.prim);   // the driver runs on the lead's thread; `all_reduce` left the peer's card current
@@ -2790,6 +2812,17 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
     if (cudaEventCreateWithFlags(&pp->ev_in, cudaEventDisableTiming) != cudaSuccess) { err = "prefill peer: event"; return false; }
     if (cudaEventCreateWithFlags(&pp->ev_act, cudaEventDisableTiming) != cudaSuccess) { err = "prefill peer: event"; return false; }
     if (cudaEventCreateWithFlags(&pp->ev_planes, cudaEventDisableTiming) != cudaSuccess) { err = "prefill peer: event"; return false; }
+    // The arm's two LEAD-side proofs, created on the LEAD's context because both are recorded on the lead's
+    // compute stream: `ev_in` behind the publish's copies, `ev_red` behind the pair's adds.  `cudaEventRecord`
+    // requires the event and the stream to share a context; only `cudaStreamWaitEvent` is allowed to cross
+    // devices, which is how the partner's stream consumes both.  `ev_out` is the reverse case - recorded on the
+    // arm's own stream - so it is created with that stream below, on the partner's context.
+    if (pp->qsa.span.on &&
+        (cudaEventCreateWithFlags(&pp->qsa.ev_in, cudaEventDisableTiming) != cudaSuccess ||
+         cudaEventCreateWithFlags(&pp->qsa.ev_red, cudaEventDisableTiming) != cudaSuccess)) {
+        err = "prefill peer: the prompt-attention arm's lead-side event";
+        return false;
+    }
     bool ok = true;
     if (relay) {   // the primary's side of the host relay
         int lo = 0, hi = 0;   // the rows' upload at the greatest priority: the layer's end waits for it
@@ -2824,11 +2857,9 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
         // may not take, so neither `T_max` nor `T_fp4` alone is the bound.
         pp->qsa.rows_max = Tp;
         pp->qsa.card = pp->dev;
-        if (ok) {
+        if (ok) {   // `ev_in` and `ev_red` are the lead's, created above; only these two belong to this card
             ok = cudaStreamCreateWithFlags(&pp->qsa.s, cudaStreamNonBlocking) == cudaSuccess &&
-                 cudaEventCreateWithFlags(&pp->qsa.ev_in, cudaEventDisableTiming) == cudaSuccess &&
-                 cudaEventCreateWithFlags(&pp->qsa.ev_out, cudaEventDisableTiming) == cudaSuccess &&
-                 cudaEventCreateWithFlags(&pp->qsa.ev_red, cudaEventDisableTiming) == cudaSuccess;
+                 cudaEventCreateWithFlags(&pp->qsa.ev_out, cudaEventDisableTiming) == cudaSuccess;
         }
         if (ok)
             ok = pp->qsa.gemm.init_external(pp->qsa.s, pp->qsa.gscratch, GEMM_SCRATCH, pp->qsa.gws, GEMM_WS, err);
