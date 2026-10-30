@@ -21,9 +21,8 @@ lines **`no peer -1/0`**/**`no peer -1/2`**, lead-experts 125–162 ms, decode c
 the boot (`peer_share_refusal_is_fatal()`); a crippled pair cannot be served, and the missing `pipelined` marker is
 what pulled the thread.
 
-Gates, current: build green under `-j4`; `ctest -L cpu` **68/69** with the count verified at 69 — only the
-pre-existing `expert_multi_test` (no AVX512-VNNI/VBMI here); boundary and stderr checks ok. `:8000` never
-contacted; `=2` numbers stay **TODO-for-the-window**.
+Gates, current: build green under `-j4`; `ctest -L cpu` **69/70** with the count verified at 70 (only the pre-existing
+`expert_multi_test`, no AVX512-VNNI/VBMI here); boundary and stderr checks ok. `:8000` never contacted.
 
 **`=2` booted and the model went degenerate; the cause was the pair's collective, not the attention (`e0d94223`).**
 Three boots, one cached prompt: gate-off normal, `=1` normal, `=2` replied `!` 256 times at acc=100%, and the
@@ -125,20 +124,21 @@ the ~26 ms it should cost, 6 QSA layers a stage, two stages):
   the filed `+18/+15 ms` a layer-pair stands as the **no-extra-eviction upper bound**, its instrument (the two row
   rates and `blob_mb_ms`, read before and after the slice on one boot) and the STOP rule are ledger §3.
 
-**The boot lines that say the slice is on** (both modes print these; the first must say `pipelined` for `=2` — if
-it says `serialized` the flag never reached `set_peer`, and the boot is not the mode you asked for):
+**The boot lines that say the slice is on** (the first must say `pipelined` for `=2`; `serialized` = the flag never
+reached `set_peer`, so the boot is not the mode you asked for):
 
-    grep "peer prompt-attention pair CUDA"     # ... MODE and BOTH staging figures: `pipelined, 2 o_proj staging
-                                               #   sets, 2 collective staging sets` for =2, `1`/`1` for =1
-    grep "peer prompt-attention arm, lead card" # the lead's reserve, the split, and the chunk ceiling
+    grep "peer prompt-attention pair CUDA"     # ... MODE and BOTH staging figures: `pipelined, 2 o_proj staging sets,
+                                               #   2 collective staging sets` for =2, `1`/`1` for =1
+    grep "peer prompt-attention arm, lead card" # the lead's reserve, the split, the chunk ceiling
     grep "peer prompt-attention arm:"           # the shard projections copied resident on the partner card
+    grep 'qsa pair: a second chunk entered the same prefill'   # must print NOTHING: cross-chain aliasing, cosine file
     grep "peer chunk at token" | head -1        # must read `mmq/p2p peer D/P`, NEVER `no peer -1/0`
-    grep "qsa chain:" | head -2                 # per-layer component fingerprints, when `--exp qsa_dump_chain=1`
+    grep "qsa chain:" | head -2                 # within-boot fingerprints (verdict §8; cosines: cosine file)
 
-The last grep is the one the =2 window needed: `no peer -1/0` means `PeerPrefill` never went live, so every
+The `peer chunk` grep is the one the =2 window needed: `no peer -1/0` means `PeerPrefill` never went live, so every
 partner-held expert row fell to the lead's link and no per-layer term on that line means anything. (The pair audits
-itself - the agreement rings, and beside them the per-layer chain that says what the rings cannot: two cards agreeing
-on a WRONG sum agree perfectly. Both in the kernels file; the chain's three boots are verdict §8.)
+itself - the agreement rings, and beside them the chain that says what the rings cannot: two cards agreeing on a WRONG
+sum agree perfectly. Kernels file; verdict §8 within-boot only, §8a the CPU differential.)
 
 What boot 3 read off, the first measurement of any of it: staging **20 971 520 floats = 8192 x 2560**, so the
 wire's funded width and the publisher's `rows_max` are one number as its check assumes; **79 MiB** of shard
@@ -280,8 +280,8 @@ finds zero tests and "passes"), and that the count is read before the pass rate 
 The byte ledger and filed predictions are in **`progress-tp2slice-ledger.md`** (the span catch-up's per-turn pricing
 stays in §2b here); the kernel and arm pieces — container and sizing walk, resident projections
 (`peer_qsa_resident_up`), the partner's own `Gemm`, the shard-width kernels and cache writer, the packed
-`attn_output` column funding, `peer_qsa_layer()`, and every hardcoded head count found, fixed and parity-tested — are
-in **`progress-tp2slice-kernels.md`**. The headline figures, restated so this file stands alone:
+`attn_output` column funding, `peer_qsa_layer()`, and every hardcoded head count found, fixed and parity-tested — in
+**`progress-tp2slice-kernels.md`**. Headline figures, restated so this file stands alone:
 
     wire traffic   104.9 MB in a QSA layer    what the +10/+20 gates grade; the RETURN leg is FP32 today (83.9 MB)
     tier reserve   2.01 GiB int8 (=1)          span 0.96 + wire 0.20 + scratch 0.64 + weights 0.08 + cols 0.04 + gemm 0.09

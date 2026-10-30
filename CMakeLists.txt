@@ -1252,6 +1252,14 @@ if(BUILD_TESTING)
   basalt_cpu_test(NAME peer_qsa_span_test COMMAND peer_qsa_span_test)
   set_tests_properties(peer_qsa_span_test PROPERTIES TIMEOUT 120)
 
+  # the sliced QSA layer's whole data path on the CPU, run three ways (whole / serialized / pipelined) and compared
+  # per layer and per component: the deterministic answer to "does =2 change what is summed", which a GPU boot
+  # cannot give because its own kernels are not reproducible between runs
+  add_executable(qsa_layer_diff_test tests/cuda/qsa_layer_diff_test.cpp)
+  target_link_libraries(qsa_layer_diff_test PRIVATE prefill engine ${_gpu_runtime_target})
+  basalt_cpu_test(NAME qsa_layer_diff_test COMMAND qsa_layer_diff_test)
+  set_tests_properties(qsa_layer_diff_test PROPERTIES TIMEOUT 600)
+
   # the prompt path's buffer layout against its sizing (no device memory), once per expert layout
   add_executable(prefill_layout_test tests/cuda/prefill_layout_test.cpp)
   target_link_libraries(prefill_layout_test PRIVATE prefill ${_gpu_runtime_target})

@@ -10,17 +10,20 @@ A fresh `cmake` configure does **not** reproduce the working build: `BUILD_TESTI
     cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 \
           -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DBUILD_TESTING=ON
     cmake --build build -j4
-    ctest -L cpu --test-dir build -N       # MUST report 69 before a green suite means anything
-    ctest -L cpu --test-dir build          # 68/69; expert_multi_test is the known failure
+    ctest -L cpu --test-dir build -N       # MUST report 70 before a green suite means anything
+    ctest -L cpu --test-dir build          # 69/70; expert_multi_test is the known failure
 
 A suite of zero passes exactly as well as a suite of sixty-nine. Build with `-j4`, not more: this worktree builds
 on the host that runs the serving engine.
 
 The slice's own CPU tests are `peer_qsa_span_test` (the partner's span: wire bytes, the staging sets, the resident
 projections, and two protocol replays of the pair - `replay_collective()` for the collective's landing regions and
-`replay_steps()` for the shipped step counts, each falsified by running the depth it should fail at) and
+`replay_steps()` for the shipped step counts, each falsified by running the depth it should fail at),
+`qsa_layer_diff_test` (one sliced QSA layer's whole data path recomputed on the CPU and run three ways - the whole
+layer, the pair at `=1`, the pair at `=2` - and graded per layer per component on a cosine against the reference,
+with the coded orderings each run away and five injected faults the table must never let through) and
 `tp2_shard_weights_test` (a weight the pack serves only as a native image can still be
-cut); the attention window's parity case is `qsa_prompt_attn_parity` and needs a card.
+ cut); the attention window's parity case is `qsa_prompt_attn_parity` and needs a card.
 
 The pair's own device tests, both needing two cards and skipping (77) with fewer: `tp2_allreduce_parity` (the
 collective bitwise against `tp2_all_reduce_ref`, the refusals, the microbench line, and now the pair-agreement
