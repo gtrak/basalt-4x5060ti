@@ -2104,6 +2104,205 @@ wait 0.0):
 5. Build green `-j4`; `ctest -L cpu` 67/68 (`expert_multi_test` pre-existing);
    `tools/check_platform_boundary.sh` + `tools/check_stderr_logging.sh` ok.
 
+## RUN 22 — the share priced in TIME (share-v2), the head cut parameterized into spans, and the attention slice priced NET
+
+Scope, as approved: **mechanism and model only (option A)**. The peer-side prompt attention plus a second
+`attn_output` all-reduce (**option B**) is NOT in this run; it is the opening milestone of the TP=4 prototype work,
+and everything below that concerns it is labelled as a model prediction, not a capability. Nothing was measured on
+a pair here: the box has a live server on `:8000` and the engine was never started. Every figure below is analytic,
+per stage and per card, from the shipped functions transcribed into a scratch program (the run-16/21 method, not
+committed). Full build green `-j4`; `ctest -L cpu` 67/68 (`expert_multi_test` pre-existing); platform-boundary and
+stderr-logging checks pass; the four named CPU shard tests pass with their added cases, and the two GPU parity
+tests compile (the all-reduce one's pure parts were run with no card visible). No test files were added, so the cpu
+count stays 68.
+
+### 1. The head split is now a SPAN, not a half
+
+`QsaHeadShard` (`include/basalt/core/qsa_head_split.hpp`) gained `q_beg`/`nq_`: a card states which QUERY heads it
+runs and its KV run is DERIVED from that run (`kv0() = q0/rep`, `nkv()` = the groups the run touches), so the group
+rule still holds and a cut INSIDE a KV group leaves the boundary group's KV on BOTH cards. `parts`-only shards -
+what every caller builds today - carry `nq_ == 0` and take the symmetric run, byte-identically: `qsa_pair_shard(n,
+kv, n/2, rank)` compares `==` to `QsaHeadShard{n, kv, rank, 2}`, which is what keeps the default path and the
+sizing tests untouched. New: `qsa_pair_shard` (one card of a pair from the lead's head count), `qsa_lead_heads`
+(a ratio to heads, at least one per card), `qsa_pair_tiles` (the pair covers the axis exactly once) and
+`qsa_shard_whole_groups`.
+
+**The assumption that hard-coded equal halves, and what was done about it.** The three QSA attention kernels -
+`qsa_dec_attn.cu`, `qsa_decode_attn.cu`, `qsa_prompt_attn.cu` - each fix the query heads per KV head at COMPILE
+TIME (`constexpr int G = 12`) and refuse any shape where `n_head != G * n_head_kv`. A shard's run must therefore be
+WHOLE KV GROUPS: at this artifact's geometry (24 heads, 2 KV heads) a stage's heads move **12 at a time**, and
+`qsa_shard_runs` (`src/core/layer.cpp`) now refuses a straddling span by name instead of letting a kernel `exit(1)`
+mid-run. Generalizing `G` to a runtime head count and a head map is the same substrate as option B and is NOT done
+here. Consequences of the group rule, tested: an uneven-but-whole-group cut (24 heads over 8 KV heads, 3 groups to
+the lead and 5 to the partner) is runnable and splits the KV bytes 3/5; a straddling cut (16/8 at 24 over 2) holds
+3 KV heads of pool for a 2-head cache, and the carve prices it (`session_head_shard_test`).
+
+The ratio reaches the engine at one place, the decode side: `Verifier::qhs_init` builds the lead's shard from
+`--exp qsa_ratio_stage_a` (the stage that holds layer 0) or `--exp qsa_ratio_stage_b`, default 0.5 - the symmetric
+half RUN 17 armed. A ratio that cuts a group is refused at boot, naming the granularity. The prefill side does NOT
+read the ratio, because it runs no split (below).
+
+### 2. share-v2: the band's share is struck on the two cards' LAYER TIMES
+
+`peer_ram_share` (`src/prefill/prefill.cpp`) keeps its counts - `held`, `band`, the blob `B`, the rows `w` - and now
+gets an objective. `peer_layer_time` prices one stage's layer on each card at band share `r`:
+
+    lead = attn_lead + (chunk*K - rows_peer) * lead_row_us/1000 + (band - r) * B / blob_link
+    peer = attn_peer +  rows_peer * peer_row_us/1000 + rows_peer * row_bytes / pair_link + acts / pair_link
+    rows_peer = (held + r) * chunk * K / n_expert
+
+and `r` is the closed form where the two meet, since each moved expert moves a constant `d_lead` off one card and
+`d_peer` onto the other (then clamped as before: to the band, and to the half-the-chunk's-rows cap). The default
+objective is this TIME one; `--exp qsa_share_bytes=1` restores run 16's byte-lane balance verbatim, which is both
+the fallback and the A/B the time objective is graded against. The rates, in MB (1e6 B) a millisecond and
+microseconds a row-visit, and their `--exp` names:
+
+| constant | default | what it prices | re-price it |
+|---|---|---|---|
+| `lead_row_us` | 2.26 | one row-visit of one expert on the lead | `--exp qsa_lead_row_us` |
+| `peer_row_us` | 1.09 | ... and on the peer card | `--exp qsa_peer_row_us` |
+| `link_mb_ms` | 4.2 | the pair's link, both legs (the planes out, the rows back) | `--exp qsa_link_mb_ms` |
+| `blob_mb_ms` | 4.2 | the lead's own read of a RAM blob | `--exp qsa_blob_mb_ms` |
+| `attn_lead_ms` | 54.4 / 49.0 | the stage's whole attention, run by the lead alone | `--exp qsa_attn_ms_stage_a\|_b` |
+| `attn_peer_ms` | **0.0** | what the peer runs of it | `--exp qsa_attn_peer_ms_stage_a\|_b` |
+
+`attn_peer_ms` is 0.0 because **prompt attention has no peer caller**: prefill calls `qsa_prompt_attn_batch` once
+with the whole `n_head`, then one whole `attn_output` projection; the `QsaPair`/`qsa_pair_prepare`/`tp2_all_reduce`
+machinery has no prefill call site. So the ratio knob in prefill changes NO work - the new boot line prints the
+heads it priced and says so in words, and the peer's attention term is printed as 0.0 rather than left to be
+inferred. `blob_mb_ms` is priced at the pair's link rate: the lead's RAM read has not been measured on this pair.
+The four row/link terms are the reviewer's measured constants from the 400 W boots (run 18's `rows 114.6 -> 56.3`
+BF16 attribution and run 21's planes at 1 448 B a token over ~2.8 ms for 8 192 tokens = ~4.2 MB/ms, which the rows
+leg agrees with to a few percent); they are shipped as overridable constants, not as measurements of this build.
+
+The new line, printed with the band on (`grep "peer layer time"`), averages the terms over the stage's layers:
+
+    peer layer time layers 0-24 at 2/8 band: lead 132.2 ms a layer = attention 54.4 + rows 77.8 + blobs 0.0, peer
+    109.4 ms = attention 0.0 + rows 51.4 + back 55.2 + acts 2.8; the critical side is the lead by 22.8 ms (2.26/1.09
+    us a row-visit, 4.2 MB/ms of link); heads 12/12 priced (--exp qsa_ratio_stage_a), the peer runs no prompt
+    attention so its heads are priced at 0.0
+
+(`rows` is the card's own expert-row compute, `back` the peer's rows crossing the pair's link, `acts` the chunk's
+activations arriving.)
+
+### 3. What the model picks, at run 14's geometry (MODEL PREDICTIONS; nothing here was measured)
+
+24 layers a stage, 512 experts a layer of 2 548 736 B, chunk 8 192, BF16 rows, FP4 planes. `r` is the band experts
+moved a layer; `cap` is `n_expert/2 - held`, the half-the-chunk's-rows bound.
+
+| stage | held / band a layer | byte objective: num, r | time objective: num, r | lead ms = attn+rows+blobs | peer ms = rows+back+acts | critical side |
+|---|---|---|---|---|---|---|
+| A | 128 / 112 | 4/8, r=50 | **8/8, r=112** | 152.8 = 54.4+98.4+0.0 | 91.5 = 41.9+46.8+2.8 | lead by 61.3 |
+| A | 128 / 256 | 4/8, r=128 (cap) | 4/8, r=128 (cap) | 224.6 = 54.4+92.6+77.7 | 97.4 = 44.6+49.9+2.8 | lead by 127.2 |
+| A | 200 / 112 | 2/8, r=32 | **4/8, r=56** | 181.0 = 54.4+92.6+34.0 | 97.4 = 44.6+49.9+2.8 | lead by 83.5 |
+| A | 200 / 160 | 3/8, r=56 (cap) | 3/8, r=56 (cap) | 210.1 = 54.4+92.6+63.1 | 97.4 = 44.6+49.9+2.8 | lead by 112.7 |
+| A | 240 / 64 | **0/8** | **2/8, r=16** | 176.1 = 54.4+92.6+29.1 | 97.4 = 44.6+49.9+2.8 | lead by 78.7 |
+| A | 248 / 8 | **0/8** | **8/8, r=8** | 147.0 = 54.4+92.6+0.0 | 97.4 = 44.6+49.9+2.8 | lead by 49.6 |
+| B | 200 / 112 | 2/8, r=32 | **4/8, r=56** | 175.6 = 49.0+92.6+34.0 | 97.4 = 44.6+49.9+2.8 | lead by 78.1 |
+| B | 240 / 64 | **0/8** | **2/8, r=16** | 170.7 = 49.0+92.6+29.1 | 97.4 = 44.6+49.9+2.8 | lead by 73.3 |
+
+Read this as the model's OWN balance, not as a measurement: the row terms are per-row-visit rates held CONSTANT,
+but a row-visit's cost rises with the row count a card holds (a card's GEMMs amortize better when busy), so the
+model moves MORE band than a measurement will justify - every row where the two objectives differ is the model
+over-reaching, and the reviewer's `peer chunk` lines are the arbiter. Two structural facts survive that bias: the
+lead's blob term is what makes the time objective move band where the byte model moved none (0/8 -> 2/8, 8/8), and
+**the pair is never balanced by band alone** - the lead keeps the whole attention, so `critical side` reads `lead`
+at every placement and the residual is tens of ms a layer.
+
+### 4. The attention slice, priced NET (review #3 addendum, P1)
+
+**The slice's gain is unproven and could be negative.** Splitting the whole prompt attention moves compute off the
+lead, and it costs the transport of the `attn_output` partials, which is `T x n_embd` per layer per card - at
+chunk 8 192 and `n_embd` 2 560 that is **83.9 MB of FP32 one way a layer** (41.9 MB if the partial crossed as BF16
+bits the way the peer's rows do). The figures, per layer-pair at 8 192:
+
+| transport variant | assumed | ms a layer | net vs the 27.2 ms of compute |
+|---|---|---|---|
+| bulk 2-card all-reduce, FP32 partials, at the measured 4.2 MB/ms | both legs serialize | ~40 | **-12.8** |
+| bulk 2-card all-reduce, BF16 partials, at the measured 4.2 MB/ms | both legs serialize | ~20 | **+7.2** |
+| the addendum's own figures (100 MB at ~7 GB/s d2d) | bulk AR | 14 one way, 28 round | **+13.2 / -0.8** |
+| per-head-group streaming BEHIND the peer's expert window, BF16 | the bytes hide under the peer's 51.4 ms of comp | ~0 hidden | **+27.2** |
+
+So the slice's net range is **[-13, +27] ms a layer**, and which end it lands at is decided by ONE question: can
+the partial for a head group cross while the peer computes its experts, or does it serialize into an all-reduce
+barrier? The streaming variant is the only one that pays, and it is exactly the wiring that does not exist (option
+B). Until it is measured, the head-ratio figures in section 3 and the `heads N/M priced` clause of the boot line are
+**MODEL PREDICTIONS and the slice is not called a win**: the number that matters is the measured net critical-path
+ms WITH transport, per layer-pair, at 8 192.
+
+**Kill criterion for the slice, at the TP=4 milestone: measured net < +10 ms a layer-pair at chunk 8 192 -> STOP
+and re-plan.** Below that, EP+PP keeps the whole attention on the lead and the slice serves tensor parallelism
+only.
+
+### 5. What the reviewer should see, and what falsifies this run
+
+1. **`grep "peer layer time"`** on both stages with `--peer-ram-rows`: the terms must read against the chunk lines
+   (lead's `attention` against the `attn` field, its `rows` against `lead`; peer's `rows` against `comp`+`rows`, its
+   `acts` against `act`). A term more than ~20% off means its constant is wrong for this box: re-price it with the
+   matching `--exp` and re-boot before reading the share it chose.
+2. **`attn 0.0` on the peer** with no flag: the peer runs no prompt attention. If it ever reads non-zero without
+   option B's wiring being merged, that is a bug, not a feature.
+3. **share-v2 moves `num/8` only where the two objectives differ** (section 3's bold rows). With
+   `--exp qsa_share_bytes=1` on the same boot the line must read exactly run 21's figures - that is the
+   byte-identity control for the share's choice.
+4. **Row-rate falsifier:** after the balance, if the lead's row rate still runs **>= 1.4x** the peer's
+   (`lead` ms / lead rows against `comp` ms / peer rows, from the chunk lines), the lead's row kernel is
+   contending with the link and copy-stream load: record it and STOP balancing further. The shipped constants
+   already sit at 2.26/1.09 = 2.1x, so this is expected to fire - which is the honest statement that the model does
+   not yet understand why the lead's rows cost twice the peer's for the same arithmetic.
+5. **Kill criteria for the whole run** (after one iteration): stop if the critical-side pair wall exceeds ~135 ms a
+   layer, or if `8192`-chunk prefill falls below 2 200 t/s.
+6. **Decode floors** (untouched by this run - the split stays behind `--exp decode_headsplit`, which still refuses
+   while the peer's item is unbuilt): solo >= 78 t/s, accuracy within 3 points of the branch's, hit >= 89.
+
+### Quality gate (this run CHANGES which rows cross the wire, so the gate applies)
+
+share-v2 changes which band experts the peer computes, so a different set of result rows arrives as BF16 bits and
+the combine re-sums them in a different order: **the PPL/KLD gate against the Q8_0 reference, through the decode
+path (`basalt-bench --quality`), must pass** - byte identity with run 21 is NOT expected with the time objective
+on. The controls: `--exp qsa_share_bytes=1` reproduces run 21's choice exactly (same experts, so same bits), and
+`--peer-rows-fp32` removes the BF16 rounding entirely. The head-span work adds no numeric path: no caller builds an
+uneven shard unless a ratio flag is given, and a straddling ratio is refused at boot.
+
+### Not done, on purpose
+
+- Option B (the peer's prompt attention, its `attn_output` partial and the second all-reduce) - the TP=4 opening
+  milestone. The slice's net in section 4 cannot be measured without it.
+- `G` in the three attention kernels stays compile-time, so unequal cuts are expressible, priced, tested and
+  refused at run time on this geometry. Making it a runtime head map is part of the same milestone as option B.
+- `blob_mb_ms` is the pair's link rate until the lead's RAM read is measured; the boot line prints it, so the
+  reviewer can see what the model believed.
+
+### Reviewer checklist
+
+- [ ] Boot both stages with `--peer-ram-rows --prefill 8192 --tp-size 2`; `grep "peer layer time"` reads the two
+      cards' terms and names the critical side; the peer's attention term is `0.0`.
+- [ ] Same boot twice: `--exp qsa_share_bytes=1` (run 21's objective) against the default - the `num/8` difference
+      is section 3's table, and the byte-model boot must match run 21's line.
+- [ ] `--exp qsa_ratio_stage_a=0.75` (or any ratio that cuts a group): the decode flag `--exp decode_headsplit=1`
+      must refuse naming the KV-group granularity; the prefill line must print `heads 18/6 priced` and NOTHING ELSE
+      may change (compare two chunk lines with and without it).
+- [ ] `--exp qsa_ratio_stage_a=0.5`: the armed decode line reads `12 of 24 query heads (ratio 0.5 ...)`, as RUN 17
+      measured it.
+- [ ] Chunk lines: item 1's term-by-term read, and item 4's row-rate ratio.
+- [ ] Quality gate: PPL/KLD against the Q8_0 reference with the time objective ON (the required pass), plus the
+      `qsa_share_bytes=1` control.
+- [ ] `prefill_fp4_test` on the two devices: unchanged (the peer's row/act wires did not move).
+- [ ] Decode: the floors above, flag off.
+
+### Validated here (GPU untouched: the server is live, `:8000` never touched, no engine started)
+
+Full build green `-j4`, and the warning set is unchanged: the two `prefill.cpp` warnings it prints are the two HEAD
+prints (checked by building HEAD's `prefill.cpp` beside this one), and `session_head_shard_test`'s sign-compare
+warning is the pre-existing one, at its own untouched line. `ctest -L cpu` 67/68 - only the pre-existing
+`expert_multi_test` (this CPU lacks AVX512-VNNI/VBMI); the count is unchanged at 68 because the new cases went into
+the existing test files. `qsa_head_split_test`, `session_head_shard_test`, `tp2_shard_weights_test`,
+`qsa_decode_combine_test` pass with the added uneven-span cases; `tp2_head_split_parity` and `tp2_allreduce_parity`
+compile, and the latter's pure parts (including the new unequal-partials case) pass under
+`CUDA_VISIBLE_DEVICES=""`. `tools/check_platform_boundary.sh` and `tools/check_stderr_logging.sh` ok. The
+section-3 table is the shipped `peer_ram_share`/`peer_layer_time` transcribed into a scratch program (not
+committed), same method as runs 16 and 21.
+
 ## RUN 23 — the suffix drafter's long-generation decay: the index already had the tail; the gate was throwing it away (kimi review #2, P2-4)
 
 ### The measured problem
