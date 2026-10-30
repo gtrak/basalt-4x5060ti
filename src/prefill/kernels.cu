@@ -668,6 +668,68 @@ void kv_append_nkv(const float* K, const float* V, int64_t T, int64_t pos0, cons
         host ? *host : basalt::kernels::KvHostPools{}, stage ? *stage : basalt::kernels::KvHostPools{}, nkv);
     check("kv_append_nkv");
 }
+
+// One card's KV cells, imported from its pair's lead's pools.
+//
+// The partner cannot recompute these cheaply: running attn_k/attn_v over the lead's mixed rows would move
+// n_embd a cell across the link to produce nkv * head_dim of them, ten times the bytes for the same result.
+// So it reads the lead's finished pool rows over P2P instead.
+//
+// It is a GATHER, not a copy, and the two reasons are the same one that made `kv_append_nkv` necessary: the
+// row formula is `(page * nkv + kvh) * page_size + off`, and the lead's pools hold two KV heads per page while
+// the partner's hold one. A whole-range memcpy would therefore land every cell in the wrong row, and would do
+// so more convincingly at the start of the context than the end. So each side resolves its own row from its own
+// page table and its own `nkv`, and the head index is the only thing shared - the partner's local head `h` is
+// the lead's `kvh0 + h`, which is what the head shard says and nothing else decides it.
+//
+// Reads the lead's memory through the pair's peer access, on the CALLER's stream (the partner's), so it overlaps
+// the lead's own work rather than serializing against it.
+__global__ void kv_span_import_kernel(const QsaSpanImport im, int64_t c0) {
+    const int64_t pos = c0 + blockIdx.x;
+    const int h = blockIdx.y;                      // this card's LOCAL kv head
+    const bool is_v = (blockIdx.z & 1) != 0;
+    const int d = threadIdx.x;                      // one thread per dim, head_dim is 256
+    const int64_t page_size = im.page_size;
+    const int64_t page_s = im.s_table[pos / page_size];
+    if (page_s < 0) return;                         // never resident on the lead: nothing to import
+    const int64_t off = pos % page_size;
+    const int64_t row_s = (page_s * im.src_nkv + (im.kvh0 + h)) * page_size + off;
+    if (im.int8_mode) {
+        const int64_t page_d = im.d_table[pos / page_size];
+        if (page_d < 0) return;                     // unresident on this card: its own allocator's business
+        const int64_t row_d = (page_d * im.dst_nkv + h) * page_size + off;
+        const int8_t* sc = is_v ? im.s_v_q : im.s_k_q;
+        const uint16_t* ss = is_v ? im.s_v_scale : im.s_k_scale;
+        int8_t* dc = is_v ? im.d_v_q : im.d_k_q;
+        uint16_t* ds = is_v ? im.d_v_scale : im.d_k_scale;
+        dc[row_d * 256 + d] = sc[row_s * 256 + d];
+        // one amax per 64 dims: four scale entries a row, so the first four threads rather than all 256
+        if (d < 256 / 64) ds[row_d * (256 / 64) + d] = ss[row_s * (256 / 64) + d];
+        return;
+    }
+    const int64_t page_d = im.d_table[pos / page_size];
+    if (page_d < 0) return;
+    const int64_t row_d = (page_d * im.dst_nkv + h) * page_size + off;
+    const uint16_t* sp = is_v ? im.s_v_pool : im.s_k_pool;
+    uint16_t* dp = is_v ? im.d_v_pool : im.d_k_pool;
+    dp[row_d * 256 + d] = sp[row_s * 256 + d];
+}
+
+void kv_span_import(const QsaSpanImport& im, int64_t c0, int64_t c1, void* stream) {
+    if (c1 <= c0) return;
+    if (im.s_table == nullptr || im.d_table == nullptr || im.page_size <= 0 || im.src_nkv <= 0 || im.dst_nkv <= 0 ||
+        im.kvh0 < 0 || im.kvh0 + im.dst_nkv > im.src_nkv) {
+        basalt::log::error("basalt", "kv_span_import: bad span or head run");
+        return;
+    }
+    // one block per (cell, kv head, K-or-V); 256 threads, one per dim, so a row is a block's width and the
+    // scale entries fall to the first threads rather than to a second launch
+    kv_span_import_kernel<<<dim3((unsigned) (c1 - c0), (unsigned) im.dst_nkv, 2), 256, 0,
+            (cudaStream_t) stream>>>(
+        im, c0);
+    check("kv_span_import");
+}
+
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
     to_f16_kernel<<<(unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, (cudaStream_t) stream>>>(x, y, n);

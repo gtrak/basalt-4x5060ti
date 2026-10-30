@@ -1068,6 +1068,133 @@ int main(int argc, char** argv) {
         cudaFree(K_d); cudaFree(V_d); cudaFree(tab_d);
     }
 
+    // ---- 11. kv_span_import: the partner pulling its cells from the lead's pools
+    //
+    // The step-4 catch-up's only new kernel, and the one where a flat copy would be most convincing: the lead's
+    // pools hold two KV heads per page and the partner's hold one, so `memcpyPeerAsync` over the cell range would
+    // land every row one head off - exactly the corruption the cache writer was about to cause, one layer later.
+    // Three things are therefore pinned at once:
+    //   - the head mapping: the partner's local head h must receive the LEAD's kvh0 + h, which only rank 1 (kvh0
+    //     1, the odd head) can catch; a test of rank 0 alone would pass with the head index forgotten;
+    //   - the row formula against a page table that is NOT the lead's. The partner's pages here are deliberately
+    //     scrambled relative to the lead's, so a kernel that assumed both sides agree on physical layout fails;
+    //   - the range: cells outside [c0, c1) must be left exactly as they were, which is what lets the catch-up
+    //     import only the gap and not the whole context every turn.
+    // Both KV formats, because the INT8 path carries a second plane (one amax per 64 dims) with its own stride.
+    {
+        const int64_t PS = 4, cells = 20, pages = (cells + PS - 1) / PS;
+        std::vector<int32_t> lead_tab((size_t) pages), part_tab((size_t) pages);
+        for (int64_t i = 0; i < pages; ++i) {
+            lead_tab[(size_t) i] = (int32_t) i;             // the lead keeps its pages in order
+            part_tab[(size_t) i] = (int32_t) (pages - 1 - i);  // this card's allocator handed out the reverse
+        }
+        int32_t* lt_d = dalloc<int32_t>((size_t) pages);
+        int32_t* pt_d = dalloc<int32_t>((size_t) pages);
+        up(lt_d, lead_tab); up(pt_d, part_tab);
+        // the lead's cache, written by the real writer so the layout under test is the layout the engine makes
+        const int64_t T11 = cells;
+        std::vector<float> K11((size_t) T11 * 2 * D), V11((size_t) T11 * 2 * D);
+        for (auto& x : K11) x = nd(rng) * 3.0f;
+        for (auto& x : V11) x = nd(rng) * 3.0f;
+        float* K11_d = dalloc<float>(K11.size());
+        float* V11_d = dalloc<float>(V11.size());
+        up(K11_d, K11); up(V11_d, V11);
+
+        const int64_t c0 = 6, c1 = 15;   // neither page-aligned nor the whole range
+        for (int fmt = 0; fmt < 2; ++fmt) {
+            const bool int8_mode = fmt == 1;
+            uint16_t* lk_p = dalloc<uint16_t>((size_t) pages * 2 * PS * D);
+            uint16_t* lv_p = dalloc<uint16_t>((size_t) pages * 2 * PS * D);
+            int8_t* lk_q = dalloc<int8_t>((size_t) pages * 2 * PS * D);
+            int8_t* lv_q = dalloc<int8_t>((size_t) pages * 2 * PS * D);
+            uint16_t* lks = dalloc<uint16_t>((size_t) pages * 2 * PS * (D / 64));
+            uint16_t* lvs = dalloc<uint16_t>((size_t) pages * 2 * PS * (D / 64));
+            pr::kv_append_nkv(K11_d, V11_d, T11, 0, lt_d, PS, int8_mode ? nullptr : lk_p,
+                              int8_mode ? nullptr : lv_p, int8_mode ? lk_q : nullptr, int8_mode ? lv_q : nullptr,
+                              int8_mode ? lks : nullptr, int8_mode ? lvs : nullptr, nullptr, nullptr, nullptr, 2);
+
+            for (const QsaHeadShard* r : {&r0, &r1}) {
+                const int nkv = (int) r->nkv();
+                // this card's pools, filled with a sentinel OUTSIDE the range so an over-wide import shows
+                const size_t n_data = (size_t) pages * nkv * PS * D;
+                const size_t n_sc = (size_t) pages * nkv * PS * (D / 64);
+                auto dalloc_filled = [&](size_t n, int bytes) {
+                    void* d = nullptr;
+                    ck(cudaMalloc(&d, n * bytes), "import malloc");
+                    ck(cudaMemset(d, 0xAA, n * bytes), "import memset");
+                    return d;
+                };
+                uint16_t* pk_p = (uint16_t*) dalloc_filled(n_data, 2);
+                uint16_t* pv_p = (uint16_t*) dalloc_filled(n_data, 2);
+                int8_t* pk_q = (int8_t*) dalloc_filled(n_data, 1);
+                int8_t* pv_q = (int8_t*) dalloc_filled(n_data, 1);
+                uint16_t* pks = (uint16_t*) dalloc_filled(n_sc, 2);
+                uint16_t* pvs = (uint16_t*) dalloc_filled(n_sc, 2);
+
+                pr::QsaSpanImport im;
+                im.s_k_pool = int8_mode ? nullptr : lk_p; im.s_v_pool = int8_mode ? nullptr : lv_p;
+                im.s_k_q = int8_mode ? lk_q : nullptr;     im.s_v_q = int8_mode ? lv_q : nullptr;
+                im.s_k_scale = int8_mode ? lks : nullptr;  im.s_v_scale = int8_mode ? lvs : nullptr;
+                im.d_k_pool = int8_mode ? nullptr : pk_p;  im.d_v_pool = int8_mode ? nullptr : pv_p;
+                im.d_k_q = int8_mode ? pk_q : nullptr;     im.d_v_q = int8_mode ? pv_q : nullptr;
+                im.d_k_scale = int8_mode ? pks : nullptr;  im.d_v_scale = int8_mode ? pvs : nullptr;
+                im.s_table = lt_d; im.d_table = pt_d;
+                im.src_nkv = 2; im.dst_nkv = nkv; im.kvh0 = (int) r->kv0();
+                im.page_size = PS; im.int8_mode = int8_mode;
+                pr::kv_span_import(im, c0, c1, nullptr);
+
+                // compare the imported rows against the lead's, and the untouched rows against the sentinel
+                const size_t rows_l = (size_t) pages * 2 * PS, rows_p = (size_t) pages * nkv * PS;
+                bool ok = true;
+                int rep = 0;
+                // `elems` is the plane's width a row: head_dim for the data planes, head_dim/64 for the scale
+                // planes (one amax per block).  Passed, never inferred from the label - an earlier version of
+                // this sniffed the string and read the scale plane at the data stride, which "fails" on memory
+                // the kernel never touched and looks exactly like a kernel bug.
+                auto check_plane = [&](const void* a_, const void* b_, size_t nrows_a, size_t nrows_b,
+                                       size_t elems, const char* what, int bytes) {
+                    const size_t per_row = elems * (size_t) bytes;
+                    // `a` holds THIS card's rows (indexed by nrows_b), `b` the lead's (indexed by nrows_a):
+                    // each buffer sized by the download that goes INTO it, not by the row count it is indexed by
+                    std::vector<uint8_t> a(nrows_b * per_row), b(nrows_a * per_row);
+                    ck(cudaMemcpy(a.data(), b_, nrows_b * per_row, cudaMemcpyDeviceToHost), "down part");
+                    ck(cudaMemcpy(b.data(), a_, nrows_a * per_row, cudaMemcpyDeviceToHost), "down lead");
+                    for (int64_t pos = 0; pos < cells; ++pos)
+                        for (int64_t h = 0; h < nkv; ++h)
+                            for (size_t e = 0; e < per_row; ++e) {
+                                const int64_t pg_l = lead_tab[(size_t) (pos / PS)], pg_p = part_tab[(size_t) (pos / PS)];
+                                const size_t ri = ((size_t) pg_l * 2 + (r->kv0() + h)) * PS + pos % PS;
+                                const size_t di = ((size_t) pg_p * nkv + h) * PS + pos % PS;
+                                const uint8_t want = (pos >= c0 && pos < c1) ? b[ri * per_row + e] : 0xAA;
+                                if (a[di * per_row + e] == want) continue;
+                                if (rep < 3) {
+                                    std::printf("FAIL import %s rank %d pos %lld kv %lld e %zu: %02x vs %02x\n", what,
+                                            r->rank, (long long) pos, (long long) (r->kv0() + h), e,
+                                            (unsigned) a[di * per_row + e], (unsigned) want);
+                                    ++g_fail; ++rep;
+                                }
+                                ok = false;
+                            }
+                };
+                if (int8_mode) {
+                    check_plane(lk_q, pk_q, rows_l, rows_p, D, "int8 K", 1);
+                    check_plane(lv_q, pv_q, rows_l, rows_p, D, "int8 V", 1);
+                    check_plane(lks, pks, rows_l, rows_p, D / 64, "int8 sc K", 2);
+                    check_plane(lvs, pvs, rows_l, rows_p, D / 64, "int8 sc V", 2);
+                } else {
+                    check_plane(lk_p, pk_p, rows_l, rows_p, D, "fp16 K", 2);
+                    check_plane(lv_p, pv_p, rows_l, rows_p, D, "fp16 V", 2);
+                }
+                std::printf("[import %s] rank %d (kvh0 %d) cells [%lld,%lld) of %lld, pages scrambled: %s\n",
+                        int8_mode ? "int8" : "fp16", r->rank, (int) r->kv0(), (long long) c0, (long long) c1,
+                        (long long) cells, ok ? "lead's bytes inside, sentinel outside" : "WRONG");
+                cudaFree(pk_p); cudaFree(pv_p); cudaFree(pk_q); cudaFree(pv_q); cudaFree(pks); cudaFree(pvs);
+            }
+            cudaFree(lk_p); cudaFree(lv_p); cudaFree(lk_q); cudaFree(lv_q); cudaFree(lks); cudaFree(lvs);
+        }
+        cudaFree(K11_d); cudaFree(V11_d); cudaFree(lt_d); cudaFree(pt_d);
+    }
+
     std::printf("\ntp2 head split parity: %d failures\n", g_fail);
     return g_fail ? 1 : 0;
 }

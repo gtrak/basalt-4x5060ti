@@ -121,6 +121,40 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
 /// The same over ONE card's KV-head run: `nkv` KV heads, `K`/`V` laid out [T, nkv, head_dim], and pools holding
 /// `nkv` heads per page.  The pair's partner calls this with its own run (core/qsa_head_split.hpp); the whole
 /// layer's `kv_append` above is this at the model's `n_head_kv`, so lead and card share one kernel body.
+/// One card's KV import from its pair's lead: the two pool sets and the two page tables, plus the head run that
+/// maps one onto the other.  A POD so the kernel takes it by value.  The pointers are DEVICE; the lead's are read
+/// through the pair's peer access from the partner's stream.  Exactly one pool set of the pair is used, chosen by
+/// `int8_mode`, matching the state's own KV format - a mixed set is refused rather than half-copied.
+struct QsaSpanImport {
+    const uint16_t* s_k_pool = nullptr;   ///< the lead's FP16 pools (null in INT8 mode)
+    const uint16_t* s_v_pool = nullptr;
+    const int8_t* s_k_q = nullptr;        ///< the lead's INT8 codes + FP16 scale per 64 (null in FP16 mode)
+    const int8_t* s_v_q = nullptr;
+    const uint16_t* s_k_scale = nullptr;
+    const uint16_t* s_v_scale = nullptr;
+    const int32_t* s_table = nullptr;     ///< the lead's page table
+    uint16_t* d_k_pool = nullptr;         ///< this card's pools
+    uint16_t* d_v_pool = nullptr;
+    int8_t* d_k_q = nullptr;
+    int8_t* d_v_q = nullptr;
+    uint16_t* d_k_scale = nullptr;
+    uint16_t* d_v_scale = nullptr;
+    const int32_t* d_table = nullptr;     ///< this card's page table
+    int src_nkv = 0;                      ///< the lead's KV heads per page
+    int dst_nkv = 0;                      ///< this card's KV heads per page
+    int kvh0 = 0;                         ///< this card's first KV head, in the LEAD's numbering
+    int64_t page_size = 0;
+    bool int8_mode = false;
+};
+
+/// Cells [c0, c1) of this card's KV heads, gathered from `im`'s lead into its own pools: each side resolves its
+/// own row as `(page * nkv + kvh) * page_size + off`, so the two pools may hold different head counts and use
+/// different physical pages.  This is why it is a kernel and not a `cudaMemcpyPeerAsync` over the range: the
+/// partner holds one KV head to the lead's two, so a flat copy would put every cell in the wrong row.  A cell
+/// unresident on either side is skipped, not zeroed.  Nothing here is quantized or recomputed - the bytes are the
+/// lead's, which is the point: the partner's cache must hold the lead's bits, not an equivalent.
+void kv_span_import(const QsaSpanImport& im, int64_t c0, int64_t c1, void* stream);
+
 void kv_append_nkv(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table,
                    int64_t page_size, uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q,
                    uint16_t* k_scale, uint16_t* v_scale, void* stream, const basalt::kernels::KvHostPools* host,
