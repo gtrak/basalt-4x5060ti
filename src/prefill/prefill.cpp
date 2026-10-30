@@ -3234,20 +3234,19 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
     // Those bytes cross the same way when the pair has peer access, and through pinned host buffers when it does not.
     if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
     // `--exp tp_prompt_attn`: the partner's half of the prompt QSA attention (TP2PP2-NOTES RUN 22 Ruling B, RUN 25).
-    // The peer's half needs four things that do not exist yet - the peer's QSA leg beside prefill.cpp's own, the
-    // partner's KV span and indexer pooled table funded from its expert tier, the per-turn span catch-up for the
-    // cells the lead appended while the peer was out of the loop (decode, prefix reuse), and the o_proj partial's
-    // reduce-to-lead.  Half an attention with no error and plausible tokens is the failure this branch refuses
-    // everywhere else (RUN 17), so the flag refuses here until all four land.  The gate is the prompt path's only:
-    // it never arms the decode head split, whose own refusal lives in verify.cpp's `qhs_peer_item`.
+    // The arm needs the peer's QSA leg, its KV span and indexer pooled table funded from its expert tier, the
+    // per-turn span catch-up for the cells the lead appended while the peer was out of the loop, and the o_proj
+    // partial's reduce-to-lead; all four are here. The gate is the prompt path's only: it never arms the decode
+    // head split, whose own refusal lives in verify.cpp's `qsa_head_split` gate (`qhs_peer_item`).
     const double prompt_attn = core::exp_flag("tp_prompt_attn", 0.0);
-    if (prompt_attn != 0 && prompt_attn != 1) {
-        // Only the SERIALIZED gate is built: the lead's stream waits for the partner's whole layer before the
-        // next publish, which is what makes the two wire sets and the pair's single staging buffer safe.  The
-        // pipelined gate needs a free-ness protocol of its own and is a later commit; a value that is not 1 is
-        // refused rather than run as 1, because the operator would read the resulting number as the pipelined one.
+    if (prompt_attn != 0 && prompt_attn != 1 && prompt_attn != 2) {
+        // 1 = SERIALIZED: after the arm the lead's stream waits for the partner's whole layer before the next
+        // publish - the 67-80 ms peer-wait run 25 measured. 2 = PIPELINED: no such wait; the pair meets at the
+        // reduce, and free-ness is carried by the per-set `ev_in`/`ev_out`/`ev_red` and the second `o_proj`
+        // staging set (`PeerQsaSpan::staging_sets`).  Any other value is refused rather than silently run as one
+        // of them, because the operator would read the resulting number as the mode they did not ask for.
         err = "prefill peer: --exp tp_prompt_attn=" + std::to_string(prompt_attn) +
-              " is refused: only the serialized gate (1) is built";
+              " is refused: the gates are 1 (serialized) and 2 (pipelined)";
         return false;
     }
     if (prompt_attn != 0 && (m.g == nullptr || m.wt == nullptr)) {
@@ -3347,9 +3346,6 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
     // than that needs bytes the tier never left free, and discovering that during `make_peer` is an allocation
     // failure with no advice attached, while discovering it during an o_proj is worse - a partial reading memory
     // nobody held.  Here it becomes one line naming both splits and what to pin.
-    //
-    // Unreachable while the gate above refuses, which is the point of the gate: nothing here may run until the
-    // reduce-to-lead lands.  It is written now so unstickng the gate is removing a block, not writing a feature.
     PeerQsaSpan want_span;   // filled below when the flag is on; assigned to the arm after it is created
     if (prompt_attn != 0 && m.g != nullptr && m.wt != nullptr) {
         const int64_t mc = (m.ss != nullptr && m.ss->qsa_states != nullptr)
