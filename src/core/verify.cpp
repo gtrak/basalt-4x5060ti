@@ -1449,7 +1449,12 @@ void Verifier::gs_free() {
 bool Verifier::qhs_init(std::string& err) {
     const ModelGeometry& g = *g_;
     const int64_t N = g.n_embd, HD = g.head_dim;
-    const QsaHeadShard h{g.n_head, g.n_head_kv, 0, 2};
+    // The stage's head cut: the LEAD's fraction of the stage's query heads, --exp qsa_ratio_stage_a for the stage
+    // that holds layer 0 and qsa_ratio_stage_b for the other, 0.5 (the symmetric half) by default.  A ratio that
+    // cuts a KV group is refused below, naming the kernels' heads-per-KV-head: at this geometry the heads move 12
+    // at a time.  Both cards of the pair are given the same flag; the armed line prints what this one read.
+    const double ratio = exp_flag(lb_ == 0 ? "qsa_ratio_stage_a" : "qsa_ratio_stage_b", 0.5);
+    const QsaHeadShard h = qsa_pair_shard(g.n_head, g.n_head_kv, qsa_lead_heads(g.n_head, ratio), 0);
     if (!qsa_shard_runs(h, err)) {
         err = "verify: " + err;
         return false;
@@ -1544,10 +1549,10 @@ bool Verifier::qhs_init(std::string& err) {
     qhs_heads_ = h;
     qhs_live_ = true;
     basalt::log::info("basalt verify",
-                      "the QSA decode split is armed on the lead: %lld of %lld query heads, KV head %lld of %lld "
-                      "(%llu MiB packed)",
-                      (long long) h.nq(), (long long) g.n_head, (long long) h.kv0(), (long long) g.n_head_kv,
-                      (unsigned long long) (packed_bytes / 1048576));
+                      "the QSA decode split is armed on the lead: %lld of %lld query heads (ratio %g of this "
+                      "stage's heads), KV head %lld of %lld (%llu MiB packed)",
+                      (long long) h.nq(), (long long) g.n_head, ratio, (long long) h.kv0(),
+                      (long long) g.n_head_kv, (unsigned long long) (packed_bytes / 1048576));
     return true;
 }
 
