@@ -2624,3 +2624,27 @@ rule and needs the PPL/KLD gate, not just greedy identity.
    evidence against; share-v2's real grade is the two falsifier reads (peer layer time
    term-by-term vs peer chunk; the row-rate ratio >= 1.4x) + a blob_mb_ms measurement -
    1-boot exercises, top of the morning list.
+
+**RUN 23 engine-grade attempt (04:30 UTC) - INCONCLUSIVE, recorded honestly.** Formal A/B on
+the merged binary (reseed on) vs the drafter-tree binary (reseed off, byte-identical), same
+122k prompt + greedy 20k continuation: the reseed leg made 9,000 tok at 51.3 t/s (acc 75%),
+the baseline leg 20,000 tok at 63.4 t/s (acc 90%). The generations DIVERGED across legs
+(greedy is not content-stable across boots/slot states here), so the legs are different
+workloads and the comparison is void. The bigger finding: the baseline shows NO collapse on
+this prompt (63.4 t/s, acc 90%) - the nat-prompt continuation tail is verbatim-heavy, where
+the min-8 gate already fires and the reseed floor is inert by design. The collapse class
+(noisy parameterized repetition, the worker's sim streams) was never reproduced in the
+engine; the real-grade needs that workload class (the owner's observed 40 t/s 70k session,
+or a crafted noisy-repetition prompt) with --draft-log per the checklist. The sim evidence
+(1.09->2.03 noisy / 1.1->2.7 clean) stands as the design basis; --exp draft_reseed=1 stays
+on (inert on verbatim tails by construction, active where the sims say it pays).
+
+**Morning falsifier reads (04:25 UTC, the share-v2 grade kimi #5 asked for):**
+- Row-rate falsifier FIRED: lead 2.61 us/row-visit vs peer 0.98 (ratio 2.67x) - above the
+  >= 1.4x threshold and above the shipped constants (2.26/1.09). The time objective
+  UNDER-prices lead contention and over-assigns rows to the lead; the re-price is a
+  boot-flag exercise (qsa_lead_row_us=2.61 qsa_peer_row_us=0.98), no rebuild.
+- Term-by-term: the model's attn (54.4) and rows (89.5) track the chunk lines (attn
+  48.5-50.0, lead-experts 87.8) within ~5-10% - the accounting is honest.
+- blob_mb_ms still unmeasured (the one constant the model admits not knowing).
+- Prefill re-confirmed 2,004 t/s fresh concurrent on this boot.
