@@ -3045,7 +3045,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                             // the peer's rows in the order its groups run them: its groups need them contiguous
                             std::stable_sort(order_peer.begin(), order_peer.end(), [&](int32_t a, int32_t b) {
-                                return peer_reads_it_from_ram(b) && !peer_reads_it_from_ram(a);
+                                return peer_reads_it_from_ram(a) && !peer_reads_it_from_ram(b);
                             });
                             for (int32_t e : order_peer) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
                             for (int32_t e = 0; e < m.g->n_expert && !on_cpu.empty(); ++e)   // the CPU's block, last
