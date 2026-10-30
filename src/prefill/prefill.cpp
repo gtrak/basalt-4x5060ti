@@ -765,13 +765,17 @@ struct PeerPrefill {
         // This card's own per-chunk scratch, ONE set: every buffer here is written and read inside one layer's
         // arm on `s` and is dead once that layer's partial has been pushed.
         float *Qf = nullptr, *q = nullptr, *attn = nullptr, *Kc = nullptr, *Vc = nullptr;
+        uint16_t* attn_h = nullptr;   // the gated FP16 rows the o_proj product reads
         int32_t* sel_ids = nullptr;
         float* sel_scores = nullptr;
+        int32_t* steps = nullptr;     // the lead's per-query step counts, shipped: same bits, same selection
+        float* part_f32 = nullptr;    // the o_proj partial as the product leaves it, before the BF16 conversion
 
         // The projections this card owns: its shard's rows of attn_q, its KV head's rows of attn_k/attn_v, and
         // the two RMS norms those projections are normalized by.  Boot-time copies, no per-layer traffic.
         void *wq = nullptr, *wk = nullptr, *wv = nullptr;
         float *wqn = nullptr, *wkn = nullptr;
+        float *wiqn = nullptr, *wikn = nullptr;   // the indexer's q/k norms (the k norm the append normalizes by)
 
         Gemm gemm;                    // this card's own (see the header note)
         uint16_t* gscratch = nullptr;
@@ -1994,6 +1998,16 @@ void peer_qsa_layout(PeerPrefill::Qsa& qs, int64_t T, Take&& take, PeerQsaParts*
     qs.Vc = (float*) one_scratch((size_t) T * sp.heads.nkv() * sh.head_dim * 4);
     qs.sel_ids = (int32_t*) one_scratch((size_t) T * cap * 4);
     qs.sel_scores = (float*) one_scratch(256 * (size_t) max_blocks * 4);
+    qs.attn_h = (uint16_t*) one_scratch((size_t) T * sp.heads.nq() * sh.head_dim * 2);
+    // The o_proj product leaves its partial in FP32 (`Gemm` has no BF16-output entry point), so it needs a
+    // home before the wire's BF16 conversion.  One set: the partial is produced and pushed inside one layer's
+    // arm, so it is not held across the overlap boundary that forces the wire's second set.
+    qs.part_f32 = (float*) one_scratch((size_t) T * N * 4);
+    // The step counts the selection and the attention read per query.  They are pure position arithmetic that
+    // the lead computes on the host and uploads, so the LEAD's copy crosses rather than the partner's own
+    // recomputation: identical bits, so `width` and `active` cannot disagree between the two cards' selections.
+    // One set, not one per wire set: they are a property of the chunk's positions, not of a layer.
+    qs.steps = (int32_t*) one_scratch((size_t) T * basalt::kernels::kStepCount * 4);
     tmp.scratch = sc;
 
     // the projections, RESIDENT: this shard's rows of attn_q, its KV head's rows of attn_k and attn_v, and the
@@ -2008,11 +2022,19 @@ void peer_qsa_layout(PeerPrefill::Qsa& qs, int64_t T, Take&& take, PeerQsaParts*
         qs.wv = take((size_t) kr.len * sp.kv_row_bytes);
         qs.wqn = (float*) take((size_t) sh.head_dim * 4);
         qs.wkn = (float*) take((size_t) sh.head_dim * 4);
+        // The indexer's k norm is not the attention's: `native_qsa_indexer_append_batch` normalizes each cell's
+        // raw key by it before pooling, and the partner appends into a pooled table of its own, so it needs the
+        // tensor.  The q norm is NOT taken: the lead ships q_idx already normalized and rotated, the exact bits
+        // it fed its own block scores, which keeps the selection the lead's by construction rather than by
+        // two cards repeating a computation and hoping.  Priced anyway so the row that holds it is allocated
+        // either way and the figure does not move if that choice is revisited.
+        qs.wiqn = (float*) take((size_t) sh.idx_dim * 4);
+        qs.wikn = (float*) take((size_t) sh.idx_dim * 4);
         uint64_t w = 0;
         for (int64_t i = 0; i < nl; ++i)
             for (uint64_t x : {(uint64_t) qr.len * sp.q_row_bytes, (uint64_t) kr.len * sp.kv_row_bytes,
                                (uint64_t) kr.len * sp.kv_row_bytes, (uint64_t) sh.head_dim * 4,
-                               (uint64_t) sh.head_dim * 4})
+                               (uint64_t) sh.head_dim * 4, (uint64_t) sh.idx_dim * 4, (uint64_t) sh.idx_dim * 4})
                 w += (x + 255) & ~uint64_t(255);
         tmp.weights = w;
     }

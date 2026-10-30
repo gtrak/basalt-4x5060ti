@@ -108,15 +108,48 @@ The tier figure, one honest number, int8 shipped boot (`--kv int8`, 262144 cells
 
     span     0.96 GiB   KV span + indexer pooled, 6 QSA layers at the shard
     wire     0.20 GiB   2 sets (traffic stays 104.9 MB a layer)
-    scratch  0.52 GiB   shard-width q/k/v/attn + selection, one set
+    scratch  0.64 GiB   shard-width q/k/v/attn/attn_h + selection + the lead's steps + the FP32 partial, one set
     weights  0.05 GiB   resident projections at a Q2_0-class row (pack-dependent: 6 x 6144 x q_row_bytes + ...)
     gemm     0.09 GiB   the partner's own dequant scratch + cuBLAS workspace
-    TOTAL    1.82 GiB   ~11.5% of the 15.8 GiB half-depth carve
+    TOTAL    1.89 GiB   ~12.0% of the 15.8 GiB half-depth carve
 
 1.77 GiB is the figure with the projections unpriced (the test's default, pack not consulted); 1.82 GiB is with
 them priced at a Q2_0-class 1280 B row. **The boot reads the real row bytes from the pack, so the boot line must
 print this total** — the projection term is the only one that depends on the quantization type, and a heavier
 type moves the tier figure without moving anything else.
+
+## The two kernels the arm needs, found before writing the compute
+
+`split_q_kernel` and `gate_attn_kernel` (`src/prefill/kernels.cu:556-568`) **hardcode 24 query heads**:
+`if (i >= T * 24 * 256) return;` and `qf[t * 24 * 512 + h * 512 + d]`. Everything else the arm calls takes its
+counts as arguments — `rms_rows(x, w, rows, cols, ld, ...)`, `rope(x, T, heads, dim, ld, pos0, ...)`, and
+`qsa_prompt_attn_batch(..., s, ...)` which runs at shard shapes already (proven by case 6 of
+`tests/kernels/tp2_head_split_parity.cpp`, which calls it with `s0`/`s1`). So the head split reached the
+attention kernel and not the two elementwise ones around it.
+
+Two ways to give the partner a shard-width arm:
+
+- **(a) full-width scratch on the partner.** Allocate `Qf`/`q`/`attn`/`attn_h` for 24 heads and reuse the two
+  kernels unmodified. No new kernels, but the partner pays VRAM for heads it does not compute — `Qf` alone
+  doubles — taking scratch from 0.64 to roughly 1.0 GiB and the tier figure from 1.89 to ~2.3 GiB.
+- **(b) shard-width variants of the two kernels.** Two mechanical mirrors of the existing ones, taking the head
+  count and the `Qf` row stride as arguments. Keeps scratch at 0.64 GiB. AGENTS.md is explicit about what this
+  owes: every new kernel gets a parity test (random inputs + real geometry) and a microbench line.
+
+**Taking (b)**, because the head split's premise is that a card does not pay for heads it does not run, and
+`qsa_shard_shapes` exists to narrow exactly this; making the partner reserve 24 heads to save writing twelve lines
+of kernel would contradict the design to save effort. The parity test extends case 6's harness rather than
+inventing a new oracle, and the microbench line goes in the same run's table. If this is judged the wrong trade,
+(a) is the fallback and the tier figure above is the number that changes.
+
+Also settled while reading, and it changes what crosses the wire: **the lead ships its own `steps`** rather than
+the partner recomputing them. They are host-computed per token (`qsa_step_fill` at prefill.cpp:2703) and uploaded,
+they are a property of the chunk's positions rather than of a layer (so one set, not one per wire set), and
+shipping the lead's bits means `width` and `active` cannot disagree between the two cards' selections. Same
+reasoning took the indexer **q** norm off the partner's list: the lead ships `q_idx` already normalized and
+rotated — the exact bits it fed its own block scores — so the selection is the lead's by construction rather than
+by two cards repeating a computation and hoping. The indexer **k** norm stays resident, because the partner's
+append normalizes each cell's raw key by it into a pooled table of its own.
 
 ## 3. Predictions, filed before measuring
 

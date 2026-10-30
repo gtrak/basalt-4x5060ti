@@ -187,7 +187,10 @@ void test_resident_projections_are_priced() {
     s.kv_row_bytes = kvrow;
     // 6 layers x (12 heads x 2 x 256 rows of attn_q  +  1 KV head x 256 rows each of attn_k and attn_v)
     // the row runs are asserted as literals, not via qsa_q_rows, so a wrong run would show here
-    const uint64_t per_layer = (6144ull * qrow) + 2ull * (256ull * kvrow) + 2ull * 256ull * 4ull;
+    // attn_q rows, attn_k + attn_v rows, the two attention norms, and the two indexer norms (only k is read,
+    // but q is allocated so the figure does not move if the shipped-q choice is revisited)
+    const uint64_t per_layer = (6144ull * qrow) + 2ull * (256ull * kvrow)
+                             + 2ull * 256ull * 4ull + 2ull * 128ull * 4ull;
     CHECK(part(s, 3) == 6ull * per_layer);
     std::printf("resident projections: %.3f GiB over 6 QSA layers (attn_q rows 6144, attn_k/v rows 256)\n",
                 (double) part(s, 3) / GiB);
@@ -205,8 +208,16 @@ void test_resident_projections_are_priced() {
     // residency, not traffic: the projections do not grow with the chunk length or the context, only the span
     // does -- which is what makes them a boot-time cost rather than a per-layer one
     Prefill::PeerQsaSpan twice = s;
-    twice.max_cells = max_cells_for_test * 2;   // a longer context grows the SPAN, not the weights
-    CHECK(part(twice, 3) == part(s, 3));
+    twice.max_cells = max_cells_for_test * 2;   // a longer context grows the SPAN and the block scores...
+    CHECK(part(twice, 3) == part(s, 3));        // ...but not the resident projections
+    CHECK(part(twice, 0) > part(s, 0));
+    // the selection-width buffers scale with the CHUNK, not the context: a shorter chunk is less scratch
+    Prefill::PeerQsaSpan short_chunk = s;
+    const uint64_t long_scratch = part(short_chunk, 2);
+    uint64_t a2 = 0, b2 = 0, c2 = 0, w2 = 0, g2 = 0, t2 = 0;
+    short_chunk.bytes(T / 2, &a2, &b2, &c2, &w2, &g2, &t2);
+    CHECK(c2 < long_scratch);
+    CHECK(a2 == part(short_chunk, 0));   // the span is cells, not tokens: unchanged
 }
 
 void test_uneven_ratio_stays_funded() {
