@@ -242,6 +242,14 @@ public:
     /// The longest routed-only chunk whose rows of its experts the peer computes (0: no peer share).
     int64_t peer_routed_rows_max() const;
 
+    /// Did the last `run` end because the prompt-attention slice (`--exp tp_prompt_attn`) DECLINED - one of the
+    /// arm's own guards, before any kernel of the layer ran - rather than because the model, the session or the
+    /// CUDA context is broken?  The slice is an optional feature: a chunk it cannot price or an event it cannot
+    /// record leaves THIS request without an answer, and every other request and the gate-off path must keep
+    /// serving.  The request loop fails the request on true and keeps the process up; a poisoned context is
+    /// fatal whatever says so (`cudaPeekAtLastError` decides there, not here).  False unless the arm refused.
+    bool prompt_attention_refused() const;
+
     /// Hand the partner the LEAD's QSA states, one per QSA layer of this stage, and the card they live on, so a
     /// prompt can catch its span up from them.  Borrowed pointers, as `set_ring_remotes` borrows the experts
     /// another card's cache holds: this Prefill neither owns them nor frees them, and the lead's session must

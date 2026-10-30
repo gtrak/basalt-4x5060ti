@@ -146,6 +146,22 @@ int fatal_start_error(const std::string& text) {
     basalt::log::error("basalt", "%s", text.c_str());
     return 1;
 }
+// Is the CUDA context still usable?  The distinction the request loop needs: a call that REFUSED (a bad handle, a
+// size it would not take) is that call's error and the context serves on, while an illegal address or a faulted
+// kernel poisons the context for the whole process - and unwinding the destructors on a poisoned one can hang
+// until the watchdog, which is why those still leave by `std::_Exit`.  Peek, never Get: this must not clear what
+// the caller is about to report.
+bool cuda_context_poisoned() {
+    switch (cudaPeekAtLastError()) {
+        case cudaErrorIllegalAddress:      case cudaErrorIllegalInstruction:
+        case cudaErrorMisalignedAddress:   case cudaErrorInvalidAddressSpace:
+        case cudaErrorAssert:              case cudaErrorIllegalState:
+        case cudaErrorLaunchFailure:       case cudaErrorLaunchTimeout:
+            return true;
+        default:
+            return false;
+    }
+}
 // " (N MiB of M MiB VRAM free on this GPU)" for an allocation's failure message (clears the error first)
 std::string vram_free_note() {
     (void) cudaGetLastError();
@@ -9506,6 +9522,10 @@ int main(int argc, char** argv) {
             // run on the CPU), never a prompt buffer.
             constexpr double decode_share = 0.5;
             bool batch_fatal = false;
+            /// The prompt-attention slice (`--exp tp_prompt_attn`) refused THIS prompt from one of its own guards:
+            /// the client gets the ERR the branch below prints, the chunk's partial state unwinds as a cancelled
+            /// read, and the engine stays up - which is the whole point of the flag being optional.
+            bool slice_declined = false;
             int64_t il_parts = 0;   // the slots' windows run between this prompt's chunks
             double il_ms = 0;
             int64_t yielded_at = -1;   // BYIELD: the read stopped here and its slot holds it
@@ -10374,7 +10394,15 @@ int main(int argc, char** argv) {
                 pp_part_ckpt = -1;
                 if (sp_ok && win && !ov_window()) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 if (!sp_ok) {
-                    if (yielded_at < 0 && (batch_fatal || !(stop_req.load() || stdin_lost.load() || ram_stop.load()))) {
+                    // The prompt-attention slice declining is an optional feature saying no to THIS prompt: one of
+                    // the arm's own guards fired, the model is fine and the context is usable.  Failing the process
+                    // for it put the server in a crash-loop over a queued prompt, so the request ends with the
+                    // reason and the engine keeps serving - the next prompt runs unsliced, exactly as it would
+                    // with the flag off.  A poisoned context stays fatal whatever refused it, which is what the
+                    // hard path below still does.
+                    const bool declined = sp.prompt_attention_refused() && !cuda_context_poisoned();
+                    if (yielded_at < 0 && !declined &&
+                        (batch_fatal || !(stop_req.load() || stdin_lost.load() || ram_stop.load()))) {
                         basalt::log::error("basalt serve", "%s", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
                         // a CUDA fault (an illegal address) poisons the context for the whole process, and unwinding
@@ -10384,6 +10412,11 @@ int main(int argc, char** argv) {
                             std::_Exit(1);
                         }
                         return 1;
+                    }
+                    if (declined) {   // the client's reason, and no DONE: the request ended in error, not in a cancel
+                        basalt::log::error("basalt serve", "%s", err.c_str());
+                        std::printf("ERR %s\n", err.c_str());
+                        slice_declined = true;
                     }
                     cancelled = true;   // stopped while reading the prompt: refill the lent slots below, then DONE cancel
                     break;
@@ -11042,7 +11075,8 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", msg);
             }
             if (!ram_out && yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
-            if (!ram_out) std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld\n",
+            // A slice refusal already handed the client its ERR; a DONE after it would read as a served request.
+            if (!ram_out && !slice_declined) std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld\n",
                         (long long) produced_n,
                         (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
                         (long long) resume, (long long) req_hits, (long long) req_look,

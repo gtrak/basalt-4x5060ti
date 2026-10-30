@@ -968,6 +968,12 @@ struct Prefill::Impl {
     const int32_t* host_res = nullptr;
     int64_t T = 0, T_max = 0;
     bool borrowed = false;
+    /// The last `run_impl` ended because the prompt-attention slice DECLINED, not because the model or the CUDA
+    /// context is broken: a guard of the arm's own (a chunk wider than its wire, a wire set not allocated, an
+    /// event that would not be recorded, a pair that gave up waiting).  The flag is optional, so its refusal
+    /// costs the request that asked for it and nothing else.  The request loop reads it through
+    /// `Prefill::prompt_attention_refused`; cleared on every entry to `run_impl`.
+    bool qsa_refused = false;
     uint32_t* hist = nullptr;                // routed-entry counts per (layer, expert); see route_hist_reset
     int64_t hist_n = 0, hist_tokens = 0;
     bool hist_on = false;
@@ -1791,6 +1797,7 @@ void Prefill::set_ring_remotes(std::vector<std::tuple<const int32_t*, const core
 
 void Prefill::set_peer_share(bool on) { impl_->peer_share = on; }
 int64_t Prefill::peer_routed_rows_max() const { return impl_->pp ? impl_->pp->T_max : 0; }
+bool Prefill::prompt_attention_refused() const { return impl_->qsa_refused; }
 
 void Prefill::set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
     if (layer_end < 0 && impl_->g != nullptr) layer_end = impl_->g->n_layers;   // after init: resolved here
@@ -3496,6 +3503,7 @@ bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, 
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     err.clear();
     Impl& m = *impl_;
+    m.qsa_refused = false;   // a slice that refused an earlier chunk must not speak for this one
     const core::OnDevice on_device(m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
@@ -4126,8 +4134,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const int64_t wire = sap != nullptr ? qsa_ord % Prefill::PeerQsaSpan::kWireSets : 0;
                     if (sap != nullptr &&
                         !peer_qsa_publish(*sap, m.mixed_h, m.q_idx, m.idx_raw,
-                                          qsa_ord == 0 ? m.steps_dev : nullptr, wire, T, m.cs, err))
+                                          qsa_ord == 0 ? m.steps_dev : nullptr, wire, T, m.cs, err)) {
+                        m.qsa_refused = true;   // the arm declined this chunk; the request is what fails, not the engine
                         return false;
+                    }
                     // the indexer appends, token by token; then scores + selection for many queries at once:
                     // a query reads completed blocks (final once completed) and `dead` for its own tail block
                     const basalt::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
@@ -4181,13 +4191,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         { const core::OnDevice on_partner(sap->qsa.card); 
                           ok_arm = peer_qsa_layer(sap->qsa, qsa_ord, wire, T, p0, active, err) &&
                                    peer_qsa_finish(*sap, m.gemm, m.cs, m.attn_h, ZV, m.bo, qsa_ord, l, wire, T, err); }
-                        if (!ok_arm) return false;
+                        if (!ok_arm) { m.qsa_refused = true; return false; }
                         qsa_sliced = true;
                         // The next publish must not land in the wire set this layer's arm is still reading, nor
                         // overwrite the partner's staging before its add has run: the lead's stream waits for the
                         // partner's whole layer before anything of the next one is queued on it.
                         if (cudaStreamWaitEvent(m.cs, sap->qsa.ev_out, 0) != cudaSuccess) {
                             err = "prefill: the lead would not wait for the partner's layer";
+                            m.qsa_refused = true;
                             return false;
                         }
                     } else {
@@ -5295,6 +5306,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 err = "prefill: the prompt-attention pair gave up waiting for a partial this chunk; the layer whose "
                       "reduce went half would have reached the model as one card's attention, so the run stops here "
                       "and the pair is not used again";
+                m.qsa_refused = true;   // the pair is disarmed; the next prompt runs unsliced on a live engine
                 return false;
             }
             // The partner appended this chunk's cells into its OWN pools, for every QSA layer of the stage, so
