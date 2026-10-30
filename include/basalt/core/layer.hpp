@@ -401,6 +401,11 @@ void qsa_pair_free(QsaPair& p);
 /// The device bytes `qsa_pair_prepare` will allocate: what the caller's arena or budget must cover.
 uint64_t qsa_pair_bytes(const WeightTable& tables, const ModelGeometry& g, const QsaHeadShard& heads);
 
+/// The native image's whole bytes for a tensor, or 0 when it has no native projection.  One row's figure is
+/// `native_mmvq_weight_bytes(type, ne0, 1)`; this multiplies by the rows.  Shared with the partner's span sizer
+/// so the packed-column bytes are computed one way, here.
+uint64_t qsa_native_bytes(const WeightRef& w);
+
 /// Is this shard runnable HERE?  True when the shard is a well-formed half of a pair AND the buffers carry that
 /// pair: same rank, an open `Tp2Pair`, and a packed `attn_output` for `layer`.  Everything else refuses, loudly -
 /// a session that was never carved for a pair cannot end up running half a layer by accident.  The head split

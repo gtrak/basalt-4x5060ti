@@ -2561,6 +2561,91 @@ static bool peer_fp4_possible(bool streamed_share) {
 /// The partner's prompt-attention span (`--exp tp_prompt_attn`).  ONE walk prices it: `bytes` counts through the
 /// same `Alloc` the arm will carve from later, so the reserve the tier leaves free cannot drift from what
 /// `set_peer` allocates - the failure mode where a boot survives sizing and dies in the allocation.
+/// The span the partner's expert tier must leave free, with every pack-derived figure read from the table rather
+/// than assumed.  Lives here, beside the walk that spends these bytes, for the same reason the walk exists: the
+/// figures that size the tier and the figures that allocate the buffers must come from ONE place, or a boot can
+/// be sized for one amount and fail to allocate another.
+///
+/// `lead_heads` is how many query heads the LEAD keeps; the partner takes the rest.  At the pinned 50/50 the
+/// two are equal, which is the configuration the tier reserve is ruled to price - a wider partner run is caught
+/// at `set_peer` rather than silently under-reserved.
+///
+/// Returns `on == false` when the pack cannot answer: no table, no QSA layer in the range, or a projection or
+/// `attn_output` missing its native blocks.  An off span reserves nothing, which is the safe direction; a
+/// half-priced span (bytes for the pools, none for the weights) is the direction that fails at allocation.
+Prefill::PeerQsaSpan Prefill::make_peer_qsa_span(const core::ModelGeometry& g, const core::WeightTable& wt,
+                                                 int64_t max_cells, int64_t lb, int64_t le, int64_t lead_heads,
+                                                 bool on) {
+    PeerQsaSpan sp;
+    sp.g = &g;
+    sp.max_cells = max_cells;
+    sp.lb = lb;
+    sp.le = le;
+    sp.heads = core::qsa_pair_shard(g.n_head, g.n_head_kv, lead_heads, /*rank*/ 1);
+    sp.on = on && sp.heads.ok();
+    if (!sp.on) return sp;
+    // The first QSA layer of the stage supplies the pack figures: the sizer prices one row and multiplies by the
+    // stage's QSA layer count, so a pack that varied its quantization between layers would be priced wrong here
+    // rather than refused.  Checked, not assumed - the same reasoning that made the walk count inside `take`.
+    const int64_t nl = sp.n_qsa_layers();
+    if (nl <= 0) { sp.on = false; return sp; }
+    int64_t qi = -1;
+    for (int64_t l = lb; l < le; ++l) if (core::is_qsa_layer(g, l)) { qi = l; break; }
+    const core::LayerView v(wt, qi);
+    const core::WeightRef* wq = v.get("attn_q.weight");
+    const core::WeightRef* wk = v.get("attn_k.weight");
+    const core::WeightRef* wo = v.get("attn_output.weight");
+    if (wq == nullptr || wk == nullptr || wo == nullptr || wq->ne1 <= 0 || wk->ne1 <= 0 || wq->bytes == 0 ||
+        wk->bytes == 0 || wq->native_type < 0 || wk->native_type < 0 || wo->native_type < 0) {
+        sp.on = false;   // the pack was never consulted, or cannot answer: price nothing rather than guess a layout
+        return sp;
+    }
+    sp.q_row_bytes = (int64_t) (wq->bytes / (uint64_t) wq->ne1);
+    sp.kv_row_bytes = (int64_t) (wk->bytes / (uint64_t) wk->ne1);
+    sp.q_type = wq->native_type;
+    sp.kv_type = wk->native_type;
+    sp.o_type = wo->native_type;
+    // One QSA layer's packed attn_output columns, by the same expression `qsa_pair_bytes` sums over the model -
+    // read here per layer because the sizer needs the per-layer figure to scale to the stage's range.
+    const basalt::kernels::QsaShapes sh = core::qsa_shard_shapes(g, sp.heads);
+    const core::QsaHeadRun cols = core::qsa_out_cols(sp.heads, sh.head_dim);
+    const uint64_t ob = core::qsa_weight_cols_bytes(*wo, cols.start, cols.len, core::qsa_native_bytes(*wo));
+    sp.o_col_bytes = (int64_t) ((ob + 15) & ~uint64_t(15));
+    if (sp.q_row_bytes <= 0 || sp.kv_row_bytes <= 0 || sp.o_col_bytes <= 0) sp.on = false;
+    return sp;
+}
+
+/// Is this span covered by what the tier was sized to leave free?  Pure, so the sizer test can exercise the
+/// refusal without a device: the figures are arithmetic, and a rule this important should not be reachable only
+/// from a boot that has already committed to the split.
+///
+/// The rule (RUN 25 ruling, option (c)): the tier is sized against the pinned symmetric cut.  A declared split
+/// that hands the partner MORE than that needs bytes nobody reserved, so it is refused here with both figures
+/// named - what the split wants and what the reserve priced - rather than becoming an allocation failure at the
+/// first gated prompt or, worse, an o_proj reading a buffer that was never held.  Naming the split, not just the
+/// bytes, is what lets the operator pin the ratio instead of debugging a mystery refusal.
+bool Prefill::PeerQsaSpan::fits_within(const PeerQsaSpan& reserved, int64_t T, std::string& why) const {
+    if (!on) return true;                       // nothing declared, nothing to cover
+    if (!reserved.on) {                         // the tier was never sized for a span at all
+        why = "the partner's prompt-attention span was declared but the peer tier was never sized for one";
+        return false;
+    }
+    // Compare the spans, not just the heads: two different shard shapes can want the same bytes, and a
+    // geometry change between sizing and set_peer (a different max_cells, a different stage range) must be
+    // caught even when the head count happens to match.
+    uint64_t want = 0, have = 0;
+    bytes(T, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &want);
+    reserved.bytes(T, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &have);
+    if (want <= have) return true;
+    why = "the partner took " + std::to_string(heads.nq()) + "/" + std::to_string(g->n_head) +
+          " query heads (" + std::to_string(heads.nkv()) + " KV); the reserve priced " +
+          std::to_string(reserved.heads.nq()) + " (" + std::to_string(reserved.heads.nkv()) +
+          " KV): needs " + std::to_string(want / 1048576) + " MiB, the tier left " +
+          std::to_string(have / 1048576) + " MiB. Pin the split with --exp qsa_ratio_stage_a|b to the "
+          "reserved ratio, or size the tier for the wider one";
+    return false;
+}
+
 int64_t Prefill::PeerQsaSpan::n_qsa_layers() const {
     if (!g || le <= lb) return 0;
     int64_t n = 0;
@@ -2747,7 +2832,42 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
                           price.lead_row_us, price.peer_row_us, price.link_mb_ms, (long long) lead_heads,
                           (long long) (heads - lead_heads), lb == 0 ? 'a' : 'b');
     }
+    // The partner's prompt-attention span, from the split THIS stage chose (`lead_heads` above, from the ratio
+    // flags or the cost model), checked against the reserve the tier was sized against before a single byte is
+    // allocated.  The check is the whole point of pricing the reserve at the pinned symmetric cut: a split wider
+    // than that needs bytes the tier never left free, and discovering that during `make_peer` is an allocation
+    // failure with no advice attached, while discovering it during an o_proj is worse - a partial reading memory
+    // nobody held.  Here it becomes one line naming both splits and what to pin.
+    //
+    // Unreachable while the gate above refuses, which is the point of the gate: nothing here may run until the
+    // reduce-to-lead lands.  It is written now so unstickng the gate is removing a block, not writing a feature.
+    PeerQsaSpan want_span;   // filled below when the flag is on; assigned to the arm after it is created
+    if (prompt_attn != 0 && m.g != nullptr && m.wt != nullptr) {
+        const int64_t mc = (m.ss != nullptr && m.ss->qsa_states != nullptr)
+                               ? m.ss->qsa_states[m.ss->qsa_primary()].max_cells
+                               : 0;
+        if (mc <= 0) { err = "prefill peer: --exp tp_prompt_attn needs a session with QSA states to size the span"; return false; }
+        // The split this boot chose, from the same ratio the layer-time line above reports: the heads a wired
+        // peer WOULD run, which is exactly what the reserve has to cover.
+        const int64_t lead_heads = core::qsa_lead_heads(heads, ratio);
+        PeerQsaSpan want = make_peer_qsa_span(*m.g, *m.wt, mc, lb, le, lead_heads, true);
+        if (!want.on) {
+            err = "prefill peer: --exp tp_prompt_attn: the pack gave no figure for the partner's projections or "
+                  "attn_output columns, so its span cannot be reserved";
+            return false;
+        }
+        // The reserve rule, in one place: half the query heads to the lead, the same geometry, the same range.
+        const PeerQsaSpan reserved = make_peer_qsa_span(*m.g, *m.wt, mc, lb, le, m.g->n_head / 2, true);
+        std::string why;
+        if (!want.fits_within(reserved, std::max<int64_t>(t_routed, tf), why)) {
+            err = "prefill peer: --exp tp_prompt_attn: " + why;
+            return false;
+        }
+        want_span = want;   // `make_peer` allocates through the same walk that priced these bytes
+    }
+
     std::unique_ptr<PeerPrefill> pp;
+    if (prompt_attn != 0) pp->qsa.span = want_span;
     // `cap_rows` bounds the routed share only: with the FP4 share on, the primary leaves EVERY expert the peer holds
     // and every band expert the share moves out of its stream (before the routing is known), so the peer has to be
     // able to take all of those experts' rows - which `peer_layout` guarantees by sizing its row tables for the

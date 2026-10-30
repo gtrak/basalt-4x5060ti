@@ -484,7 +484,11 @@ basalt::kernels::QsaShapes qsa_shard_shapes(const ModelGeometry& g, const QsaHea
 
 /// The native image's whole bytes, or 0 when the tensor has no native projection.  `native_mmvq_weight_bytes`
 /// gives one row's figure, which is what `tp2_shard_weights.hpp` multiplies up.
-static uint64_t qsa_native_bytes(const WeightRef& w) {
+///
+/// Not file-local any more: the partner's span sizer needs the same figure `qsa_pair_bytes` sums, and a second
+/// copy of this in `prefill.cpp` would be two places computing one layout - the failure this project has already
+/// recorded once as a silent wrong answer.  One definition, two callers.
+uint64_t qsa_native_bytes(const WeightRef& w) {
     if (!w.native_data || w.native_type < 0 || w.ne0 <= 0 || w.ne1 <= 0) return 0;
     try {
         return basalt::kernels::native_mmvq_weight_bytes(w.native_type, (int) w.ne0, 1) * (uint64_t) w.ne1;

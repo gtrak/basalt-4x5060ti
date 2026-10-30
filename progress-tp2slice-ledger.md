@@ -257,3 +257,27 @@ no engine started, no GPU test run while the server holds the cards.
   `Prefill::set_peer`, and `qhs_peer_item()` (`src/core/verify.cpp`) still returns false as
   decode's unbuilt window item.
 - The software-pipelined variant (`=2`) is untouched.
+
+## 2j. The (c) tier reserve, priced at the pinned symmetric cut
+
+`peer_prompt_bytes` / `pair_prompt_bytes` now pass a `PeerQsaSpan`, so `stage_room` leaves the partner's span
+free instead of discovering at the first gated prompt that nothing was reserved. Figures read from the pack by
+`Prefill::make_peer_qsa_span` — row bytes, the three GGUF types, the packed `attn_output` columns — living beside
+the walk that spends them, so the tier's reserve and the arm's allocation cannot come from two different
+arithmetic. `qsa_native_bytes` was exported from `layer.cpp` for the same reason: a second copy of that formula
+in `prefill.cpp` would be two places computing one layout, which this project has already recorded as a silent
+wrong answer once.
+
+Reserve rule, in one place: **half the query heads to the lead**, the stage's real layer range, the session's
+real `max_cells`. `set_peer` then prices the span for the split the boot actually chose (`qsa_lead_heads`, the
+same figure the layer-time line reports) and refuses if it needs more, via `PeerQsaSpan::fits_within` — which is
+**pure and CPU-tested**, because a rule reachable only from a boot that has already committed to the split is a
+rule nobody checks. The refusal is the ruling's wording, and it is printed by the test:
+
+    the partner took 16/24 query heads (2 KV); the reserve priced 12 (1 KV): needs 4445 MiB,
+    the tier left 2730 MiB. Pin the split with --exp qsa_ratio_stage_a|b to the reserved ratio,
+    or size the tier for the wider one
+
+The comparison is on **bytes, not heads**: the same head count over a longer context needs more, and the test
+pins that too. Flag off (default) adds zero bytes and reads no table, so boots that do not ask for the slice are
+untouched.

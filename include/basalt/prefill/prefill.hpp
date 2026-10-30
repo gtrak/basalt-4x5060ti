@@ -197,7 +197,21 @@ public:
         /// One set of the wire: the bytes a QSA layer actually moves across the pair's link, which is what the
         /// ledger prices and what the +10/+20 gates are graded against.
         uint64_t wire_one_set(int64_t T) const;
+
+        /// Is this span covered by what the peer tier was sized to leave free (`reserved`, the pinned symmetric
+        /// cut)?  False fills `why` with BOTH the split the caller declared and the split the reserve priced, so
+        /// a refusal tells the operator what to pin rather than only that something did not fit.  Pure: the
+        /// figures are the same arithmetic `bytes` reports, so the rule is testable without a device.
+        bool fits_within(const PeerQsaSpan& reserved, int64_t T, std::string& why) const;
     };
+
+    /// The span the partner must be given, with the pack-derived figures (row bytes, GGUF types, the packed
+    /// `attn_output` columns) read from `wt` rather than assumed - so the tier's reserve and the arm's allocation
+    /// come from one place.  `lead_heads` is what the LEAD keeps; the partner takes the rest, and the ruled
+    /// reserve prices the pinned symmetric cut.  `on` comes back false when the pack cannot answer, which reserves
+    /// nothing rather than pricing a span half of whose bytes were guessed.
+    static PeerQsaSpan make_peer_qsa_span(const core::ModelGeometry& g, const core::WeightTable& wt,
+                                          int64_t max_cells, int64_t lb, int64_t le, int64_t lead_heads, bool on);
 
     /// The bytes `set_peer` takes on the peer card for chunks of up to `chunk` tokens (0: no peer share); the peer tier
     /// leaves them free when it sizes itself.  `qsa` adds the prompt-attention span above.

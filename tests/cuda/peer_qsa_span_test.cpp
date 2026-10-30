@@ -229,6 +229,50 @@ void test_resident_projections_are_priced() {
     CHECK(a2 == part(short_chunk, 0));   // the span is cells, not tokens: unchanged
 }
 
+void test_the_reserve_refuses_a_wider_split_by_name() {
+    // The ruling is that the tier is reserved at the pinned symmetric cut and a WIDER partner is refused, with
+    // both splits named so the operator knows what to pin.  Tested here, on the CPU, because a rule that can
+    // only be reached from a boot that has already committed to the split is a rule nobody can check: the
+    // refusal path is the one that has to be right, and it is the one least likely to be exercised.
+    const int64_t qrow = 1280, kvrow = 1280, ocol = 3200;
+    auto funded = [&](Prefill::PeerQsaSpan sp) {
+        sp.q_row_bytes = qrow; sp.kv_row_bytes = kvrow; sp.o_col_bytes = ocol;
+        sp.q_type = sp.kv_type = sp.o_type = 0;   // set, so nothing is refused for want of a format
+        return sp;
+    };
+    const Prefill::PeerQsaSpan reserve = funded(span_for(0, 24, 12, 1));   // the symmetric cut: lead 12, partner 12
+
+    // the symmetric split fits its own reserve, exactly
+    std::string why;
+    CHECK(funded(span_for(0, 24, 12, 1)).fits_within(reserve, T, why));
+    CHECK(why.empty());
+    // a partner with FEWER heads than the reserve priced also fits: less to hold is never a problem
+    CHECK(funded(span_for(0, 24, 16, 1)).fits_within(reserve, T, why));
+    // a partner with MORE does not, and the message has to name both splits and both figures - an operator
+    // reading it must know what to pin without reading the source
+    const Prefill::PeerQsaSpan wide = funded(span_for(0, 24, 8, 1));       // partner takes 16 of 24
+    why.clear();
+    CHECK(!wide.fits_within(reserve, T, why));
+    CHECK(why.find("16/24") != std::string::npos);
+    CHECK(why.find("priced 12") != std::string::npos);
+    CHECK(why.find("qsa_ratio_stage") != std::string::npos);   // says what to pin, not just that it failed
+    std::printf("the refusal reads: %s\n", why.c_str());
+    // a declared span with no reserve behind it is a configuration error, not a zero-need case
+    const Prefill::PeerQsaSpan none = funded(span_for(0, 24, 12, 1));
+    why.clear();
+    CHECK(!wide.fits_within(span_for(0, 24, 12, 1, /*on=*/false), T, why));
+    CHECK(!why.empty());
+    CHECK(none.on);
+    // nothing declared is always covered, whatever the reserve says
+    why.clear();
+    CHECK(span_for(0, 24, 12, 1, /*on=*/false).fits_within(reserve, T, why));
+    // the check is on bytes, not only heads: the same head count over a longer context needs more and must refuse
+    Prefill::PeerQsaSpan longer = funded(span_for(0, 24, 12, 1));
+    longer.max_cells = CELLS * 2;
+    why.clear();
+    CHECK(!longer.fits_within(reserve, T, why));   // the span grows with cells; the reserve did not
+}
+
 void test_o_cols_and_types_are_funded() {
     // The o_proj half of the partner's arm: its columns of attn_output, PACKED, because a column slice of a
     // blocked weight is not a pointer.  qsa_pair_prepare allocates them on the partner's card, so nothing in the
@@ -287,6 +331,7 @@ void test_uneven_ratio_stays_funded() {
 }  // namespace
 
 int main() {
+    test_the_reserve_refuses_a_wider_split_by_name();
     test_o_cols_and_types_are_funded();
     test_gate_closed();
     test_layer_count();

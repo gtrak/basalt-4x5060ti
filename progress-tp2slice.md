@@ -69,9 +69,10 @@ packed `attn_output` column funding and the pack's GGUF types, and **`peer_qsa_l
 partner's QSA block, through the gate. It has no caller yet.
 
 **Landed since**: `span_valid` with its once-a-turn catch-up, its invalidation sites and the cross-card gather
-`kv_span_import` (case 11). **Still not built**: the o_proj reduce-to-lead (`qsa_pair_prepare` + `Tp2Pair`
-push); the `generate.cpp` tier call sites that would make `stage_room` leave the room, and the call that hands
-the partner the lead's QSA states; the gate unstick; and the pipelined `=2` variant.
+`kv_span_import` (case 11); and the **(c) tier reserve** — `generate.cpp` now holds back the partner's span from
+its expert tier at the pinned symmetric cut, and `set_peer` refuses a wider split by naming both figures.
+**Still not built**: the o_proj reduce-to-lead (`qsa_pair_prepare` + `Tp2Pair` push, designed two-sided from the
+first line); the call that hands the partner the lead's QSA states; the gate unstick; and the pipelined `=2`.
 
 ## 0. Rulings taken mid-run (the supervisor's, applied to this file)
 **Branch doctrine (supervisor):** *cases unrun are cases that have not passed.* A GPU-labelled test that

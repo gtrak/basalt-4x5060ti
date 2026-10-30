@@ -3098,19 +3098,38 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+    // The partner's half of the prompt attention (`--exp tp_prompt_attn`, RUN 25): the span its pools and indexer
+    // planes occupy on its own card, held back from its expert tier exactly as the peer prompt buffers are, since
+    // both are allocated after the tier is filled.  Read from the SAME flag `set_peer` refuses on, or the reserve
+    // and the arm would disagree about whether the span exists at all.
+    //
+    // Priced at the PINNED SYMMETRIC cut (the lead keeps half the query heads) over the whole model's layers -
+    // both the conservative direction, and the ruled one: an under-reserved tier is an allocation failure at the
+    // first gated prompt, while an over-reserved one only costs the partner some tier slots.  `set_peer` refuses
+    // a wider split by name if the cost model ever chooses one ("partner took 14/24 heads; the reserve priced
+    // 12"), so the failure mode is a message that says what to pin, not an OOM.  Flag off (the default) leaves
+    // `on` false and adds nothing: the boots that do not ask for the slice are byte-identical.
+    auto peer_qsa_span = [&]() -> basalt::prefill::Prefill::PeerQsaSpan {
+        if (!o.serve || o.peer_prefill_rows == 0) return {};
+        return basalt::prefill::Prefill::make_peer_qsa_span(g, wt, o.max_context, 0, g.n_layers,
+                                                            g.n_head / 2,
+                                                            basalt::core::exp_flag("tp_prompt_attn", 0.0) != 0);
+    };
     // what the peer's prompt buffers take on its card: they are allocated after its tier is filled, so the tier leaves them free
     auto peer_prompt_bytes = [&]() -> uint64_t {
-        return o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0
-                   ? basalt::prefill::Prefill::peer_bytes(o.prefill_chunk, peer_streamed_share, o.peer_ram_rows,
-                                                           o.peer_rows_fp32, o.peer_acts_fp32) : 0;
+        if (!(o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0)) return 0;
+        const auto qsa = peer_qsa_span();
+        return basalt::prefill::Prefill::peer_bytes(o.prefill_chunk, peer_streamed_share, o.peer_ram_rows,
+                                                    o.peer_rows_fp32, o.peer_acts_fp32, qsa.on ? &qsa : nullptr);
     };
     // tp2: the same bytes on a stage's partner card - its prompt peer buffers are allocated after its expert tier is
     // filled, so the room the partner's tier is sized from leaves them out too (see `open_partner`)
     auto pair_prompt_bytes = [&](int lead_dev, int partner_dev) -> uint64_t {
-        return o.serve && o.tp_size == 2 && o.peer_prefill_rows != 0
-                   ? basalt::prefill::Prefill::peer_bytes(o.prefill_chunk, pair_streamed_share(lead_dev, partner_dev),
-                                                           o.peer_ram_rows, o.peer_rows_fp32, o.peer_acts_fp32)
-                   : 0;
+        if (!(o.serve && o.tp_size == 2 && o.peer_prefill_rows != 0)) return 0;
+        const auto qsa = peer_qsa_span();
+        return basalt::prefill::Prefill::peer_bytes(o.prefill_chunk, pair_streamed_share(lead_dev, partner_dev),
+                                                    o.peer_ram_rows, o.peer_rows_fp32, o.peer_acts_fp32,
+                                                    qsa.on ? &qsa : nullptr);
     };
     // the GDN mixer split is priced once, before either card sizes its experts: its peer reserve displaces experts
     // only when the cards cannot hold them all
