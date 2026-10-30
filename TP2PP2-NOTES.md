@@ -2625,6 +2625,43 @@ rule and needs the PPL/KLD gate, not just greedy identity.
    term-by-term vs peer chunk; the row-rate ratio >= 1.4x) + a blob_mb_ms measurement -
    1-boot exercises, top of the morning list.
 
+**KIMI REVIEW #6 (the night's capstone, on the full measured set):**
+1. The structural finding CONFIRMED airtight at its measured granularity (the one escape -
+   sub-layer tile scheduling - priced and rejected: it contradicts RUN 24's coarser-rendezvous
+   lesson and multiplies events ~8x on a gap-bound host path). Lockstep arithmetic sound within
+   a band: **quote 2,430-2,520, not 2,540**.
+2. The =2 corruption: the shared-indexer hypothesis falsified (buffers are per-card, per-layer);
+   the staging class exonerated ON DEVICE (tp2_staging_depth: the ungated race shape fires 8/24
+   layers wrong when deliberately built, the gated design clean). KIMI'S NEW TOP SUSPECT:
+   **cross-chain staging-set aliasing** - kWireSets=2 keyed on qsa_ord was sized for ONE chain's
+   back-to-back QSA layers; the engine runs TWO pipelined chains (two slots), whose QSA layers
+   alias the same sets - tripwire-silent (both cards read the same set coherently), depth-
+   dependent, needs long prompts. P2: an off-by-one among the eight pipeline>=2 index sites
+   (one audited, seven not). P3: the KV span import - mode-independent, so the DISCRIMINATOR
+   is one boot: the FIXED =1 on a 15-chunk prompt (clean => =2-only readers; both corrupt =>
+   import). P4: tier squeeze, lowest. And: hash INPUTS at publish time (mixed_h fence bytes,
+   step counts, span-import checksum) - an output-only chain shows divergence without naming
+   the stale wire set.
+3. THE DECISION, AMENDED: the -8.7% does NOT kill attention-splitting (its mechanism is
+   STAGE-COUPLING, which full sharding removes by construction). But the split's measured
+   3,750-3,868 caps sharding's prefill claim: even undiscounted, ~2,540 sits 33% below - full
+   sharding justified on prefill throughput LOSES at its own best projection. The defensible
+   case is DECODE: tp2's measured 19.4 ms windows vs the split's 35.4 at comparable t/s. THE
+   PRODUCT QUESTION FOR THE OWNER: halved decode-window latency + ~2,430-2,520 prefill vs
+   doubled decode latency + 3,750 prefill - a workload-value decision, not a performance tie.
+4. VERDICT CHANGES: the slice's ship rule is MOOTED (never ship in PP=2 form at any staging
+   depth - its machinery folds into full sharding only; slice-alone is a component, not a
+   milestone). Decode collective-free STRENGTHENED; RESIDENCY is the binding budget for every
+   topology's additions (enforce the >=78 decode floor at boot-config review). The kill
+   criterion worked as designed. MORNING CARRIES: (a) power-limit labels on all windows
+   (AGENTS.md) before tonight's numbers circulate; (b) re-measure the FIXED =1 once (it is the
+   corruption discriminator x P3); (c) the 2ea9a1ff class (gate claims 1-and-2, accepts 1;
+   refusal swallowed) is a boot-line TRUTHFULNESS bug - add "refusals fatal + gate strings
+   audited against the accept set" to the checklist; (d) quote 2,430-2,520 with the contention
+   band. RETROACTIVE UPGRADE: share-v2 + continuation placement = REQUIRED balancing machinery
+   for any lockstep design (the 2.1x row-rate asymmetry is a wall-time asymmetry only
+   placement fixes).
+
 **RUN 25 MEASURED (13:49 UTC, the slice's first graded boot — all four bring-up lines printed,
 both pairs open, columns packed on both cards, 79 MiB resident projections copied at boot):**
 - Serialized prefill: **1,833 t/s** (fresh 122k concurrent) vs the 2,004 baseline = **-8.5%**.
