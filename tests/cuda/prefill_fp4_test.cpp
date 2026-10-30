@@ -643,7 +643,8 @@ std::vector<float> primary_rows(const std::vector<int32_t>& order, const std::ve
 std::vector<float> peer_rows(const std::vector<int32_t>& order, const std::vector<int32_t>& bh, int64_t rows,
                              const float* x_dev, int64_t T, const std::vector<int32_t>& src,
                              const std::vector<const uint8_t*>& blob, int64_t cap, cudaStream_t s, float& ms,
-                             int& npieces, int& ngroups, std::vector<uint16_t>* rows16 = nullptr) {
+                             int& npieces, int& ngroups, std::vector<uint16_t>* rows16 = nullptr,
+                             const std::vector<uint8_t>* shipped = nullptr) {
     fp4::Pieces pc;
     fp4::cut_pieces(bh.data(), (int) order.size(), cap, pc);
     ngroups = (int) pc.group.size() - 1;
@@ -663,7 +664,17 @@ std::vector<float> peer_rows(const std::vector<int32_t>& order, const std::vecto
     std::vector<float> out((size_t) rows * N);
     const size_t row_bytes = rows16 != nullptr ? 2 : 4;
     if (rows16) rows16->assign((size_t) rows * N, 0);
-    fp4::quantize_tokens(x_dev, T, N, N, a4x.p, gsx.as<float>(), s);
+    // `shipped` (set): the planes as they crossed the pair's link - the codes and UE4M3 scales, then the token scales -
+    // uploaded and used as they are, which is the lead's FP4 leg's wire.  Without it the peer rounds its own copy of
+    // the activations, the `--peer-acts-fp32` wire.
+    const size_t abytes = fp4::token_bytes(T, N);
+    if (shipped != nullptr) {
+        if (shipped->size() != abytes + (size_t) T * 4) throw std::runtime_error("shipped planes are the wrong size");
+        ck(cudaMemcpyAsync(a4x.p, shipped->data(), abytes, cudaMemcpyHostToDevice, s), "shipped a4x");
+        ck(cudaMemcpyAsync(gsx.p, shipped->data() + abytes, (size_t) T * 4, cudaMemcpyHostToDevice, s), "shipped gsx");
+    } else {
+        fp4::quantize_tokens(x_dev, T, N, N, a4x.p, gsx.as<float>(), s);
+    }
     auto group = [&](int g) {
         const int p0 = pc.group[(size_t) g], ns = pc.group[(size_t) g + 1] - p0;
         const int64_t r0 = pc.bounds[(size_t) p0], nr = pc.bounds[(size_t) p0 + ns] - r0;
@@ -746,26 +757,38 @@ bool peer_share(int d0, int d1, const PeerShape& sh, const std::vector<const uin
     for (int32_t e : L.order) bh_all.push_back(L.off[(size_t) e]);
     bh_all.push_back((int32_t) rows);
     const int64_t row_cap = std::min<int64_t>(rows, std::max<int64_t>(T, (int64_t) 1023 * K));   // group_rows_cap
-    // the primary: the whole layer, then its own experts alone
+    // the primary: the whole layer, then its own experts alone, and the token planes it rounds for them - the bytes
+    // its FP4 leg ships to a peer card (`fp4::token_bytes` of codes and UE4M3 scales, then the token scales)
     ck(cudaSetDevice(d0), "device 0");
     cudaStream_t s0;
     ck(cudaStreamCreateWithFlags(&s0, cudaStreamNonBlocking), "stream");
     std::vector<float> ref, loc;
+    std::vector<uint8_t> planes;
     {
         Dev x0(x.size() * 4);
         ck(cudaMemcpy(x0.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
         ref = primary_rows(L.order, bh_all, rows, x0.as<float>(), sh.T, L.src, blob0, row_cap, s0);
         const std::vector<int32_t> src_l(src2.begin(), src2.begin() + rows_local);
         loc = primary_rows(order_l, bh_l, rows_local, x0.as<float>(), sh.T, src_l, blob0, row_cap, s0);
+        {
+            Dev a4x(fp4::token_bytes(sh.T, N)), gsx((size_t) sh.T * 4);
+            fp4::quantize_tokens(x0.as<float>(), sh.T, N, N, a4x.p, gsx.as<float>(), s0);
+            ck(cudaStreamSynchronize(s0), "sync planes");
+            planes.resize(fp4::token_bytes(sh.T, N) + (size_t) sh.T * 4);
+            ck(cudaMemcpy(planes.data(), a4x.p, fp4::token_bytes(sh.T, N), cudaMemcpyDeviceToHost), "a4x");
+            ck(cudaMemcpy(planes.data() + fp4::token_bytes(sh.T, N), gsx.p, (size_t) sh.T * 4,
+                          cudaMemcpyDeviceToHost), "gsx");
+        }
     }
     cudaStreamDestroy(s0);
     // the peer: its own copy of the activations (the same bytes, through the host)
     ck(cudaSetDevice(d1), "device 1");
     cudaStream_t s1;
     ck(cudaStreamCreateWithFlags(&s1, cudaStreamNonBlocking), "stream");
-    std::vector<float> per;
+    std::vector<float> per, per_ship;
     std::vector<uint16_t> per16;
-    float ms = 0, ms16 = 0;
+    std::vector<uint8_t> own_planes;
+    float ms = 0, ms16 = 0, ms_ship = 0;
     int npieces = 0, ngroups = 0;
     {
         Dev x1(x.size() * 4);
@@ -775,6 +798,18 @@ bool peer_share(int d0, int d1, const PeerShape& sh, const std::vector<const uin
         // the same rows through the BF16 return leg: the down product's epilogue's rounding, and nothing else
         peer_rows(order_p, bh_p, rows - rows_local, x1.as<float>(), sh.T, src_p, blob1, sh.cap, s1, ms16, npieces,
                   ngroups, &per16);
+        // the same rows from the planes the PRIMARY rounded for its own experts: the peer quantizes nothing, so this
+        // is the shipped-planes wire, and its rows must be the rows above bit for bit
+        per_ship = peer_rows(order_p, bh_p, rows - rows_local, x1.as<float>(), sh.T, src_p, blob1, sh.cap, s1, ms_ship,
+                             npieces, ngroups, nullptr, &planes);
+        // and the planes the peer's own quantize of those activations makes: the bytes the shipped ones must equal
+        Dev a4x(fp4::token_bytes(sh.T, N)), gsx((size_t) sh.T * 4);
+        fp4::quantize_tokens(x1.as<float>(), sh.T, N, N, a4x.p, gsx.as<float>(), s1);
+        ck(cudaStreamSynchronize(s1), "sync peer planes");
+        own_planes.resize(fp4::token_bytes(sh.T, N) + (size_t) sh.T * 4);
+        ck(cudaMemcpy(own_planes.data(), a4x.p, fp4::token_bytes(sh.T, N), cudaMemcpyDeviceToHost), "a4x");
+        ck(cudaMemcpy(own_planes.data() + fp4::token_bytes(sh.T, N), gsx.p, (size_t) sh.T * 4, cudaMemcpyDeviceToHost),
+           "gsx");
     }
     cudaStreamDestroy(s1);
     ck(cudaSetDevice(d0), "device 0");
@@ -790,6 +825,13 @@ bool peer_share(int d0, int d1, const PeerShape& sh, const std::vector<const uin
     const int64_t rows_p = rows - rows_local;
     int64_t bad16 = 0;
     for (size_t i = 0; i < per16.size(); ++i) bad16 += per16[i] != basalt::kernels::bf16_from_f32(per[i]);
+    // the two cards' quantize of the same activations: the same bytes, or the shipped planes are not the peer's own
+    int64_t badp = planes.size() != own_planes.size() ? 1 : 0;
+    for (size_t i = 0; !badp && i < planes.size(); ++i) badp += planes[i] != own_planes[i];
+    // and the rows they produced, against the rows the peer computed from its own planes
+    int64_t bads = 0;
+    for (int64_t r = 0; r < rows_p; ++r)
+        bads += std::memcmp(per.data() + (size_t) r * N, per_ship.data() + (size_t) r * N, (size_t) N * 4) != 0;
     const double flop = 2.0 * (double) rows_p * (1280.0 * N + (double) N * FF);
     std::printf("  peer share, %d tokens (%s routing), cap %lld: the peer's %zu experts hold %lld of %lld rows (%.1f%%, "
                 "largest %lld) in %d pieces / %d groups; bitwise equal to the primary's whole layer: %s (%lld rows differ); "
@@ -797,9 +839,14 @@ bool peer_share(int d0, int d1, const PeerShape& sh, const std::vector<const uin
                 T, sh.hot ? "hot" : "even", (long long) sh.cap, order_p.size(), (long long) rows_p, (long long) rows,
                 100.0 * (double) rows_p / (double) rows, (long long) maxcnt_p, npieces, ngroups, bad == 0 ? "yes" : "NO",
                 (long long) bad, bad16 == 0 ? "yes" : "NO", (long long) bad16);
+    std::printf("  the lead's FP4 planes are the peer's own quantize's bytes: %s (%lld of %zu bytes differ, %zu B a "
+                "token); the peer's rows from the shipped planes are its own: %s (%lld rows differ)\n",
+                badp == 0 ? "yes" : "NO", (long long) badp, planes.size(), planes.size() / (size_t) sh.T,
+                bads == 0 ? "yes" : "NO", (long long) bads);
     std::printf("  bench: peer share on device %d: %lld rows in %.2f ms (%.1f TFLOP/s); the same rows as BF16 bits in "
-                "%.2f ms\n", d1, (long long) rows_p, ms, flop / (ms * 1e-3) * 1e-12, ms16);
-    return bad == 0 && bad16 == 0;
+                "%.2f ms; from the shipped planes in %.2f ms\n", d1, (long long) rows_p, ms,
+                flop / (ms * 1e-3) * 1e-12, ms16, ms_ship);
+    return bad == 0 && bad16 == 0 && badp == 0 && bads == 0;
 }
 
 int peer_parity(int d0, int d1) {

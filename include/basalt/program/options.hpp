@@ -119,6 +119,10 @@ struct Options {
     /// --peer-rows-fp32: the prompt peer's streamed result rows cross the pair's link as FP32 instead of BF16 (the
     /// A/B of the return leg; BF16 is the default and halves those bytes).
     bool peer_rows_fp32 = false;
+    /// --peer-acts-fp32: a streamed chunk's activations cross the pair's link as FP32, which the prompt peer rounds
+    /// to FP4 itself, instead of as the FP4 planes the lead rounded for its own experts (the A/B of the outgoing leg;
+    /// the planes are the default and take a seventh of those bytes - and the peer's rows are the same bits either way).
+    bool peer_acts_fp32 = false;
     /// Names the model's expert profile when it carries one (the file and `#profile`); empty means none.  A profile
     /// decides residency by routing frequency instead of by first use.
     std::string expert_profile;
