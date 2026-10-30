@@ -4,16 +4,20 @@
 
 1. **SLOTS**: 1 desktop worker (a different box, fully isolated) + 2 local workers. The LOCAL
    box hosts the RUNNING basalt instance whose code the workers are changing.
-2. **LOCAL WORKERS ARE CPU-ONLY BY DEFAULT**: builds, CPU tests, code, docs — freely, in
-   parallel. Anything that could conflict with the running basalt — GPU tests, timing
-   measurements, boots, memory pressure — YIELDS TO THE SUPERVISOR, who sequences it in a
-   window against the server's known traffic state. A worker may never assume the server is
-   idle; only the supervisor knows (the ring-probe alongside-run was luck, not precedent).
+2. **THE RUNNING BASALT INSTANCE IS THE LOCAL WORKERS' INFERENCE ENDPOINT.** Their LLM
+   serving IS :8000 — bouncing basalt bounces their minds mid-generation; benching while they
+   generate competes with them for the GPUs and contaminates both directions. The local
+   workers' "Retry the previous request" log spam is inference retrying against a bounced
+   endpoint; the power-outage connection error was this. (It also means worker code-generation
+   traffic IS the drafter's target workload class — valid for its validation, but never call
+   it uncontaminated while benches run.)
 3. **SERVER-DOWN PROTOCOL**: merge everything pending on the feature branch FIRST, then take
    the server down, run the full battery (build, CPU, GPU, boot, bench), then BRING THE SERVER
    BACK UP before any next dispatch. Batch tests; no piecemeal boots per merge.
-4. **ALL WORKERS DONE BEFORE THE SERVER GOES DOWN.** No window while any worker is in flight,
-   regardless of what has merged. (Violated once; the worker's ctest aborted mid-suite.)
+4. **ALL WORKERS DONE BEFORE THE SERVER GOES DOWN** — because down means their inference is
+   gone. No window while any worker is in flight, regardless of what has merged. Benches
+   while workers run are also contaminated both ways: grade from quiet-machine runs, or
+   compare only like-for-like (both legs with comparable worker load).
 5. **LONG WORKER TIMEOUTS**: pass explicit timeoutMs (3h) on dispatches and resumes. The 30-min
    default fragmented a whole night into ~12 resume cycles.
 6. **DELEGATION LOSES LONG BRIEFS**: dispatches routinely arrive with an empty Task field.
