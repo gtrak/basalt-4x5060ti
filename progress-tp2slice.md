@@ -21,18 +21,13 @@
   compaction**, **context shift** (prefix removal / trimming / re-anchoring), and **sliding-window or
   attention-sink eviction**. Recorded as a documented invariant, not a tolerated gap.
 
-- **Tier-reserve sizing when the split is not yet decided: option (c).** `peer_prompt_bytes` /
-  `pair_prompt_bytes` must price the partner's span before `set_peer` chooses the head split, so the
-  reserve is priced against an unknown. Ruling: reserve the **symmetric 50/50** figure, and have
-  `set_peer` **refuse, naming both numbers** (e.g. "partner took 14/24 heads; the reserve priced 12")
-  when the chosen split needs more — never OOM, never silently under-reserve. The graded measurement
-  pins the ratio explicitly with `qsa_ratio_stage_a|b` at 50/50, which the reserve covers by
-  construction, and grades the +10/+20 gates against this ledger. Widest-case reserving is the
-  fallback, and returns only as a boot-flag change decided **from measurement** if the time model's
-  unpinned choice at the re-priced rates (lead 2.61 vs peer 0.98 us/visit — it may want wider than
-  50/50) turns out to matter. Hoisting the cost model above tier sizing is the right end-state but a
-  reordering of *when the split can change its mind*: not this milestone, not while the flag is
-  default-off.
+- **Tier-reserve sizing when the split is not yet decided: option (c) — landed.** `peer_prompt_bytes` /
+  `pair_prompt_bytes` price the partner's span before `set_peer` chooses the head split, so the reserve is struck
+  against an unknown. Ruling: reserve the **symmetric 50/50** figure and have `set_peer` **refuse, naming both
+  numbers**, when the chosen split needs more — never OOM, never silently under-reserve. The graded measurement
+  pins the ratio with `qsa_ratio_stage_a|b` at 50/50, which the reserve covers by construction. Widest-case
+  reserving is the fallback, decided **from measurement** only. Full wording and the implementation's figures:
+  ledger §2j.
 - **Ship bar calibration (kimi #5 wording):** the bar is `>= ~20 ms/layer OR a replicated positive
   at matched power`. A measured pipelined net of +15-18 ms that replicates across rule-of-3 boots
   with decode floors intact is a **ship, not a failure**. The +10 ms abort gate is unchanged.
@@ -68,11 +63,30 @@ kernels (`split_q_span`, `gate_attn_span`) and the shard-aware cache writer (`kv
 packed `attn_output` column funding and the pack's GGUF types, and **`peer_qsa_layer()`** — the
 partner's QSA block, through the gate. It has no caller yet.
 
-**Landed since**: `span_valid` with its once-a-turn catch-up, its invalidation sites and the cross-card gather
-`kv_span_import` (case 11); and the **(c) tier reserve** — `generate.cpp` now holds back the partner's span from
-its expert tier at the pinned symmetric cut, and `set_peer` refuses a wider split by naming both figures.
-**Still not built**: the o_proj reduce-to-lead (`qsa_pair_prepare` + `Tp2Pair` push, designed two-sided from the
-first line); the call that hands the partner the lead's QSA states; the gate unstick; and the pipelined `=2`.
+**Landed since**: `span_valid` with its catch-up, invalidation sites and the `kv_span_import` gather (case 11);
+the **(c) tier reserve** (pinned symmetric cut, `set_peer` refuses a wider split by naming both figures); the
+**all-reduce timeout fix** (`b34904ba`); and **pair bring-up** — `peer_qsa_pair_up()` opens one `Tp2Pair` across
+the stage's two cards sized for a PROMPT partial (`chunk x n_embd`, not the decode shard's `1 x n_embd`) and packs
+`attn_output` columns on BOTH cards, refusing if either card's set is missing on any QSA layer of the stage.
+
+**The three pieces left to a runnable serialized mode** — the reduce is NOT one of them, it is the fourth:
+- **(a) the lead-side per-layer publisher.** Nothing writes `qs.mixed_h[wire]`, `qs.q_idx[wire]` or
+  `qs.idx_raw[wire]`; they appear only in the walk that allocates them and in the arm that reads them. `qs.ev_in`
+  is never recorded and never waited on. The 104.9 MB/QSA-layer of activations the arm consumes has no code
+  shipping it. Until this exists the arm reads uninitialised scratch — plausible tokens, no error.
+- **(b) the driver.** `peer_qsa_layer()` has no caller. It must be called per QSA layer of the stage, from the
+  lead's thread, in the lead's layer order, with the wire set index alternating.
+- **(d) the reduce itself**, two-sided in one commit: the partner's o_proj product over `qs.peer_cols` into
+  `part_f32`, BF16 into `part_out`; the lead's own product over `qs.lead_cols`; and ONE `tp2_all_reduce()` per
+  rank per QSA layer on both `m.cs` and `qs.s`. `qsa_pair_prepare` is now run by the engine, `qsa_shard_ready`
+  still is not.
+Also outstanding: the call handing the partner the lead's `QsaState*` (`set_peer_qsa_lead` is never called, so
+catch-up refuses rather than degrading), the gate unstick, and the pipelined `=2`.
+
+**Why the reduce waits for (a)+(b)**: `tp2_add_wait` spins, gives up, and returns leaving the buffer a HALF sum
+while the collective still reported success. With no publisher and no driver, a lead-side reduce would add the
+lead's heads alone and call it the model's output. That is RUN 17's class, and it is now caught at the wrapper
+(`b34904ba`) — but caught late, so it must not be built ahead of the pieces that make the peer's push exist.
 
 ## 0. Rulings taken mid-run (the supervisor's, applied to this file)
 **Branch doctrine (supervisor):** *cases unrun are cases that have not passed.* A GPU-labelled test that
@@ -245,14 +259,11 @@ Still missing, and the gate still refuses at `Prefill::set_peer` with the messag
 - the `o_proj` reduce-to-lead via `qsa_pair_prepare` + `Tp2Pair` SM push (item 4),
 - the tier's call sites (`generate.cpp:3104/3111`) still pass no span, so `stage_room` leaves no room yet.
 
-## The arm's status (this window)
+## The arm's status
 
-`peer_qsa_layer()` exists and compiles: the partner's QSA block, on its own stream, refusing rather than
-approximating. It has **no caller yet** - it is wired once `span_valid` and the reduce-to-lead land, and the
-o_proj product goes with the reduce because both need `qsa_pair_prepare`'s packed columns. Case 9 now asserts the
-selection-equality claim in `tests/kernels/tp2_head_split_parity.cpp`. The head-split audit is closed:
-`split_q`, `gate_attn`, `kv_append` fixed; the three selection kernels cleared as not applicable. Details in
-**`progress-tp2slice-kernels.md`**.
+`peer_qsa_layer()` exists, compiles, and refuses rather than approximating; it has **no caller** (piece (b)).
+Its o_proj product waits for the reduce, since both need the packed columns the pair bring-up now builds. The
+head-split audit is closed: `split_q`, `gate_attn`, `kv_append` fixed; the three selection kernels cleared.
 
 ## Building this tree after a reboot
 
@@ -263,34 +274,26 @@ A fresh `cmake` configure does **not** reproduce the working build: `BUILD_TESTI
     cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 \
           -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DBUILD_TESTING=ON
     cmake --build build -j4
+    ctest -L cpu --test-dir build -N       # MUST report 69 before a green suite means anything
     ctest -L cpu --test-dir build          # 68/69; expert_multi_test is the known failure
 
-**Before trusting a green `ctest`, check the count:** `ctest -L cpu --test-dir build -N` must report
-**69**. A suite of zero passes exactly as well as a suite of sixty-nine.
+A suite of zero passes exactly as well as a suite of sixty-nine.
 
 ## Where the arithmetic lives
 
-The byte ledger, the funding figure, the span catch-up pricing and the filed predictions are in
-**`progress-tp2slice-ledger.md`** (§1 corrections, §2 the mix, §2b the catch-up, §2c/§2d the sizing rulings, §2f
-the funding bug, §2i the o_proj funding, §3 the predictions and their re-basing). The kernel side of the work —
-every hardcoded head count found, fixed and parity-tested — is in **`progress-tp2slice-kernels.md`**. Split to
-keep each file under the project's 300-line cap.
-The headline figures, restated so this file is usable on its own:
+The byte ledger, funding, catch-up pricing and filed predictions are in **`progress-tp2slice-ledger.md`**; the
+kernel side — every hardcoded head count found, fixed and parity-tested — in **`progress-tp2slice-kernels.md`**.
+Split to stay under the 300-line cap. Headline figures, restated so this file stands alone:
 
     wire traffic   104.9 MB a QSA layer        both modes; what the +10/+20 gates grade
     tier reserve   1.89 GiB int8               span 0.96 + wire 0.20 + scratch 0.64 + weights 0.05 + gemm 0.09
     span copy      <= 0.96 GiB per TURN        zero on a fresh prompt; ~254 ms worst case
     predictions    serialized -2/-4 ms         pipelined +18/+15 ms as an UPPER BOUND (no-extra-eviction)
 
-## 4. What is NOT built yet
+## 4. What stays closed
 
-- The peer's QSA arm, the partner's KV span allocation, `span_valid` and its catch-up copy, and the
-  o_proj reduce-to-lead (task items 1 and 2). `--exp tp_prompt_attn` therefore **refuses at init**
-  at `Prefill::set_peer`, naming those four, rather than running the lead's heads alone.
-- `qhs_peer_item()` (`src/core/verify.cpp`) still returns false. That is decode's window item and
-  is *supposed* to stay false for this milestone; `--exp decode_headsplit=1` still refuses.
-- No parity extension to `tp2_head_split_parity` beyond case 6, no AR call site in
-  `src/prefill/prefill.cpp`.
-- Closed, no longer open: the FP4-planes-as-attention-input question. **No** — see §0 and §2a. The
-  mix is the lead's FP16 mixed rows for q/k/v and the lead's indexer projections, priced at
-  104.8 MB a QSA layer.
+`--exp tp_prompt_attn` **refuses at init** at `Prefill::set_peer` until (a), (b) and (d) above land — refusing
+is what keeps a half-built slice from running the lead's heads alone and reporting them as the pair's.
+`qhs_peer_item()` (`src/core/verify.cpp`) still returns false: that is decode's window item, supposed to stay
+false for this milestone, and `--exp decode_headsplit=1` still refuses. Nothing here is measurable until the
+full chain runs; every timing figure in these files is `TODO-for-the-window`.

@@ -780,6 +780,18 @@ struct PeerPrefill {
         std::vector<void*> wq, wk, wv;
         std::vector<float*> wqn, wkn, wiqn, wikn;
 
+        // The pair's collective and EACH card's packed `attn_output` columns.  The pair belongs to the arm
+        // because the arm is the only thing that reduces across these two cards, and it is opened once here, at
+        // the width the widest prompt partial needs - NOT the decode shard's 1 x n_embd, which is what the
+        // collective was sized for when it was only ever exercised by tests.
+        //
+        // Both cards need columns: under the head split each sums its OWN heads' columns of `attn_output` and the
+        // pair adds the two partials, so a card without its columns cannot take part in the reduce at all.  A
+        // column slice of a blocked weight is not a pointer, which is why they are packed copies (`tp2_shard_weights.hpp`)
+        // and why both the span and the tier reserve carry their bytes.
+        basalt::kernels::Tp2Pair pair;
+        core::QsaPair lead_cols, peer_cols;
+
         Gemm gemm;                    // this card's own (see the header note)
         uint16_t* gscratch = nullptr;
         void* gws = nullptr;
@@ -839,6 +851,11 @@ struct PeerPrefill {
         // the prompt-attention arm's stream and events.  Its buffers are all `take` allocations and go with
         // `owned` above; its Gemm was init_external'd, so it frees nothing of its own.
         if (qsa.s) cudaStreamSynchronize(qsa.s);
+        // The pair's staging is its own allocation and the columns are `qsa_pair_prepare`'s; both go here rather
+        // than with `owned`, which is the walk's bookkeeping and must stay exactly 68 allocations.
+        core::qsa_pair_free(qsa.lead_cols);
+        core::qsa_pair_free(qsa.peer_cols);
+        qsa.pair.close();
         if (qsa.ev_in) cudaEventDestroy(qsa.ev_in);
         if (qsa.ev_out) cudaEventDestroy(qsa.ev_out);
         if (qsa.s) cudaStreamDestroy(qsa.s);
@@ -2160,6 +2177,89 @@ static constexpr int64_t kPeerSelBatch = 256;
 ///
 /// `active` is the chunk's widest n_bid + 1, from whoever shipped the steps: it is a property of the chunk's
 /// positions, not of a layer, so the arm takes it rather than reading a host copy per layer.
+/// Put the pair on the two cards and give each card the `attn_output` columns it will reduce with.
+///
+/// This is the substrate every later piece stands on - the publisher, the per-layer driver and the reduce all
+/// assume an open pair and two sets of columns - and it is deliberately landable on its own, because the two
+/// things it establishes have never been exercised outside a test: whether a P2P pair opens at PROMPT width
+/// (a chunk of n_embd rows, orders of magnitude more than the decode shard ever reduced), and whether the
+/// packed columns build at shard width against the real pack.  Neither can hang: nothing here spins, waits on a
+/// peer, or issues a collective, so landing it ahead of the reduce cannot leave a half-reduce behind.
+///
+/// Refuses rather than half-builds, in every direction: a pair that will not open, a pack that will not pack,
+/// and - the one a silent wrong answer would hide behind - a column set that came back `ok` on fewer QSA layers
+/// of the stage than the arm would run.  A missing column does not fail loudly; it leaves a card summing
+/// nothing into that layer's partial.
+bool peer_qsa_pair_up(PeerPrefill& P, const core::ModelGeometry& g, const core::WeightTable& wt, int lead_dev,
+                      int64_t lb, int64_t le, int64_t lead_heads, int64_t T, std::string& err) {
+    PeerPrefill::Qsa& qs = P.qsa;
+    if (!qs.span.on) { err = "prefill peer: the prompt-attention span is off, so the pair has nothing to reduce"; return false; }
+    if (P.dev < 0 || lead_dev < 0 || P.dev == lead_dev) {
+        err = "prefill peer: the pair needs two different cards, got CUDA" + std::to_string(lead_dev) + " and CUDA" +
+              std::to_string(P.dev);
+        return false;
+    }
+    if (T <= 0 || g.n_embd <= 0) { err = "prefill peer: a prompt partial of no rows cannot be staged"; return false; }
+
+    // THE STAGING WIDTH.  One collective moves `rows x stride` floats through each card's staging, and the pair
+    // is sized once at open.  The decode shard reduced 1 x n_embd; the prompt reduce moves a whole chunk, so a
+    // pair sized for the decode path would refuse every prompt-layer reduce with a capacity error - the failure
+    // would surface as an allocation-shaped complaint long after the number that caused it was chosen.  Priced
+    // from the same T the span is priced at, so the tier and the pair cannot disagree about the chunk.
+    const int64_t elems = T * g.n_embd;
+    if (!qs.pair.open(lead_dev, P.dev, elems, err)) {
+        err = "prefill peer: the pair would not open across CUDA" + std::to_string(lead_dev) + " and CUDA" +
+              std::to_string(P.dev) + " for a " + std::to_string(T) + " x " + std::to_string(g.n_embd) +
+              " partial: " + err;
+        return false;
+    }
+
+    // Each card's columns, packed by the code the decode shard path already uses, at the rank each card holds in
+    // THIS pair.  `qsa_pair_prepare` derives rank from the device it is given and refuses a mismatch, so a
+    // swapped pair fails here instead of silently reducing two copies of one card's half.
+    const core::QsaHeadShard lead_sh = core::qsa_pair_shard(g.n_head, g.n_head_kv, lead_heads, /*rank*/ 0);
+    const core::QsaHeadShard peer_sh = core::qsa_pair_shard(g.n_head, g.n_head_kv, lead_heads, /*rank*/ 1);
+    if (!core::qsa_pair_prepare(qs.lead_cols, wt, g, lead_sh, qs.pair, lead_dev, P.dev, err)) {
+        err = "prefill peer: the lead's attn_output columns did not build: " + err;
+        qs.pair.close();
+        return false;
+    }
+    if (!core::qsa_pair_prepare(qs.peer_cols, wt, g, peer_sh, qs.pair, P.dev, lead_dev, err)) {
+        err = "prefill peer: the partner's attn_output columns did not build: " + err;
+        core::qsa_pair_free(qs.lead_cols);
+        qs.pair.close();
+        return false;
+    }
+
+    // Both sets exist, on the same layers, for the whole stage.  Checked rather than trusted because the two
+    // prepares can disagree: the pack decides per tensor, and `attn_q` already taught this project that "it is
+    // uniform across the QSA layers" is the assumption that was wrong.
+    int64_t built = 0;
+    for (int64_t l = lb; l < le; ++l) {
+        if (!core::is_qsa_layer(g, l)) continue;
+        if (!qs.lead_cols.o_cols[(size_t) l].ok || !qs.peer_cols.o_cols[(size_t) l].ok) {
+            err = "prefill peer: layer " + std::to_string(l) + " is missing its packed attn_output columns on one "
+                  "of the pair's cards";
+            core::qsa_pair_free(qs.lead_cols);
+            core::qsa_pair_free(qs.peer_cols);
+            qs.pair.close();
+            return false;
+        }
+        ++built;
+    }
+    if (built == 0) { err = "prefill peer: the stage holds no QSA layer, so there is nothing to reduce"; return false; }
+    if (qs.lead_cols.o_cols.size() != (size_t) g.n_layers || qs.peer_cols.o_cols.size() != (size_t) g.n_layers) {
+        err = "prefill peer: the packed columns were not built over the whole model";
+        return false;
+    }
+    basalt::log::info("basalt prefill",
+                      "peer prompt-attention pair CUDA%d+CUDA%d open, staging %lld floats; attn_output columns "
+                      "packed on both cards over %lld QSA layers (lead %d/%d, partner %d/%d heads)",
+                      lead_dev, P.dev, (long long) elems, (long long) built,
+                      (int) lead_sh.nq(), (int) g.n_head, (int) peer_sh.nq(), (int) g.n_head);
+    return true;
+}
+
 bool peer_qsa_layer(PeerPrefill::Qsa& qs, int64_t li, int64_t wire, int64_t T, int64_t p0, int64_t active,
                     std::string& err) {
     const Prefill::PeerQsaSpan& sp = qs.span;
@@ -2713,6 +2813,13 @@ uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_r
         uint64_t tot = 0;
         qsa->bytes(Tp, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &tot);
         sum += tot;
+        // The pair's staging, which lives on this card: one `max_elems`-float buffer the peer pushes its o_proj
+        // partial into.  It is `Tp2Pair::open`'s allocation rather than the walk's, so it is priced here instead
+        // of counted by `last_takes()` - the 68 allocations are the arm's, and adding to them would pin a number
+        // that does not describe them.  Sized from the same chunk the span is, so the tier and the pair cannot
+        // disagree about the widest partial in flight.  The lead's own staging is the lead card's budget to make.
+        if (qsa->on && qsa->g)
+            sum += (uint64_t) ((Tp * qsa->g->n_embd * 4 + 255) & ~size_t(255));
     }
     return sum;
 }
@@ -2879,6 +2986,20 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
         ok = make_peer(peer, t_routed, cap_rows, 0, peer_rows_fp32, peer_acts_fp32, nullptr, pp, err);
     }
     if (!ok) return false;
+
+    // The pair and both cards' packed columns, once, here.  Asked for and not built is a refusal, never a quiet
+    // fall back to the replicated path: an operator who set --exp tp_prompt_attn and got the old behaviour would
+    // otherwise read the resulting tokens as the slice working.  The chunk width is the one the span is priced
+    // at, so the tier reserve and the pair's staging cannot disagree about how big a partial the pair carries.
+    if (prompt_attn != 0) {
+        std::string perr;
+        if (!peer_qsa_pair_up(*pp, *m.g, *m.wt, m.device, lb, le, core::qsa_lead_heads(heads, ratio),
+                              std::max<int64_t>(t_routed, tf), perr)) {
+            err = perr;
+            return false;
+        }
+    }
+
     m.pp = std::move(pp);
     return true;
 }
