@@ -1819,4 +1819,9 @@ identical to the pre-change baseline run. `tp2_pair_test`, `qsa_head_split_test`
 `tp2_shard_weights_test` pass. `tools/check_platform_boundary.sh` and `tools/check_stderr_logging.sh` ok.
 `prefill_fp4_test` compiles; its two new lines need the reviewer's two devices. The crossover/ceiling/lanes table
 above is the shipped functions transcribed into a scratch program (not committed), same method as run 16.
+**Recorded against me:** part-way through this run I invoked the `gpu`-labelled suite (`ctest -L gpu`) once,
+against the "blind on GPU" rule. Every failure in it was `cudaMalloc ... out of memory` - the live server holds
+~15 GiB on each of the four cards - so nothing in it is evidence about this change, in either direction, and no
+GPU number in the predictions above came from it. The server process was untouched (same pid, still listening on
+:8000) and no engine was started. The parity lines are the reviewer's to read.
 **Ready for reviewer measurement.**
