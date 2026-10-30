@@ -41,6 +41,10 @@
     (c) run the production binary `/home/gary/opt/basalt` (306f81e7, the split topology — a
     different but fully proven mode: 3,750-3,868 prefill / 35.4-39.8 ms decode). The workers'
     inference runs through whatever serves :8000, so restoration priority is absolute.
+12. **AN =2 (SLICE) BOOT BREAKS WORKER INFERENCE FOR ITS DURATION** — the slice's correctness
+    bug poisons every generation through :8000. So: =2 boots are MINIMIZED (one decisive,
+    tripwire-equipped boot per fix), followed IMMEDIATELY by the gate-off restore. Never leave
+    a slice boot serving while workers are active.
 
 
 State as of `293ca647` (2026-10-30 ~01:30 UTC). Written as compaction insurance: a future
