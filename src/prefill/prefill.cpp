@@ -2086,17 +2086,31 @@ void Prefill::PeerQsaSpan::bytes(int64_t T, uint64_t* span, uint64_t* wire, uint
     // 2. the wire: what lands on the partner's card per chunk, plus its partial on the way back.  The mix RUN 25
     // settled on: the lead's FP16 mixed rows (the SAME bits its own attn_q read, so the partner's q is its own
     // half of the lead's q), and the lead's indexer projections, which keep the selection the lead's.
+    //
+    // TWO sets.  The pipelined gate (`=2`) exists to put layer l+1's inbound on the link under layer l's compute,
+    // and a single staging set would serialize exactly that: the lead could not write the next layer's rows until
+    // the partner had finished reading the previous layer's.  The returning partial is doubled for the same
+    // reason - the partner starts layer l+1's arm while layer l's partial is still in flight to the lead.  The
+    // per-layer TRAFFIC is unchanged (the ledger prices one set); this is resident bytes, not bytes moved.
     const int64_t N = g->n_embd;
     const basalt::kernels::QsaShapes s = core::qsa_shard_shapes(*g, heads);
-    uint64_t w = 0;
-    w += (uint64_t) T * N * 2;                                  // in: the lead's FP16 m.mixed_h
-    w += (uint64_t) T * s.idx_n_head * s.idx_dim * 4;           // in: q_idx (the lead's indexer q projection)
-    w += (uint64_t) T * s.idx_dim * 4;                          // in: idx_raw (the lead's indexer k projection)
-    w += (uint64_t) T * N * 2;                                  // out: the o_proj partial, BF16
+    uint64_t one = 0;
+    one += (uint64_t) T * N * 2;                                // in: the lead's FP16 m.mixed_h
+    one += (uint64_t) T * s.idx_n_head * s.idx_dim * 4;         // in: q_idx (the lead's indexer q projection)
+    one += (uint64_t) T * s.idx_dim * 4;                        // in: idx_raw (the lead's indexer k projection)
+    one += (uint64_t) T * N * 2;                                // out: the o_proj partial, BF16
+    const uint64_t w = one * kWireSets;
 
     // 3. the scratch: the partner's own per-chunk buffers for the arm it runs - its q/k/v projections, its
     // attention, and the selection its re-run indexer produces.  At the SHARD's widths, which is where the
     // head split pays in VRAM as well as in time.
+    //
+    // ONE set, on purpose (unlike the wire above): every buffer here is written and read inside the partner's
+    // own compute for one layer, on its own stream, and is dead once that layer's partial has been pushed.  The
+    // pair of layers the pipeline overlaps share nothing here - the overlap is on the link, not on the
+    // partner's compute - so a second set would be 0.5 GiB of tier bought for nothing.  If the arm's structure
+    // ever does hold one of these across the overlap boundary, it gets its own second set and this comment
+    // says which; do not double the whole block on spec.
     Alloc a;
     a.count_only = true;
     bool ok = true;
@@ -2115,6 +2129,14 @@ void Prefill::PeerQsaSpan::bytes(int64_t T, uint64_t* span, uint64_t* wire, uint
     if (wire) *wire = w;
     if (scratch) *scratch = a.used;
     if (total) *total = sp + w + a.used;
+}
+
+uint64_t Prefill::PeerQsaSpan::wire_one_set(int64_t T) const {
+    if (!on || !g || T <= 0 || max_cells <= 0 || !heads.ok()) return 0;
+    const int64_t N = g->n_embd;
+    const basalt::kernels::QsaShapes s = core::qsa_shard_shapes(*g, heads);
+    return (uint64_t) T * N * 2 + (uint64_t) T * s.idx_n_head * s.idx_dim * 4 +
+           (uint64_t) T * s.idx_dim * 4 + (uint64_t) T * N * 2;
 }
 
 uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_rows, bool peer_rows_fp32,

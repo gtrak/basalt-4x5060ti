@@ -158,9 +158,17 @@ public:
         bool on = false;
         /// QSA layers of this stage: `qsa_interval` over [lb, le).
         int64_t n_qsa_layers() const;
+        /// How many resident sets of the wire's staging.  Two: the pipelined gate puts layer l+1's inbound on the
+        /// link under layer l's compute, which one set cannot do (the lead would wait on the partner's read of
+        /// the previous layer).  The per-layer traffic the ledger prices is ONE set; this is resident bytes.
+        static constexpr int kWireSets = 2;
         /// The bytes this spans, split so the boot line can name each part.  Zero with `on` false or a geometry it
         /// cannot price.  `T`: the widest chunk the partner can be given, which sizes the wire and the scratch.
+        /// `wire` reports the RESIDENT bytes (`kWireSets` sets); one set is the per-layer traffic figure.
         void bytes(int64_t T, uint64_t* span, uint64_t* wire, uint64_t* scratch, uint64_t* total) const;
+        /// One set of the wire: the bytes a QSA layer actually moves across the pair's link, which is what the
+        /// ledger prices and what the +10/+20 gates are graded against.
+        uint64_t wire_one_set(int64_t T) const;
     };
 
     /// The bytes `set_peer` takes on the peer card for chunks of up to `chunk` tokens (0: no peer share); the peer tier

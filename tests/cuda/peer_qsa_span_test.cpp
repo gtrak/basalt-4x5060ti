@@ -108,19 +108,27 @@ void test_shard_narrows_kv_only() {
 
 void test_wire_is_the_filed_mix() {
     const Prefill::PeerQsaSpan s = span_for(0, 24, 12, 1);
-    const uint64_t want = (uint64_t) T * g.n_embd * 2          // the lead's FP16 mixed rows (the q source)
-                        + (uint64_t) T * 4 * 128 * 4           // q_idx
-                        + (uint64_t) T * 128 * 4               // idx_raw
-                        + (uint64_t) T * g.n_embd * 2;         // the o_proj partial, BF16
-    CHECK(part(s, 1) == want);
-    // RUN 25's published figure: 104.8 MB a layer both ways.  Checked to 1%, which catches a dropped term
-    // (a 41.9 MB class error) and tolerates the byte rounding the allocator's 256 B pad cannot avoid.
-    const double wire_mb = (double) want / MB;
+    const uint64_t one = (uint64_t) T * g.n_embd * 2          // the lead's FP16 mixed rows (the q source)
+                       + (uint64_t) T * 4 * 128 * 4           // q_idx
+                       + (uint64_t) T * 128 * 4               // idx_raw
+                       + (uint64_t) T * g.n_embd * 2;         // the o_proj partial, BF16
+    // The TRAFFIC figure is what the ledger prices and the +10/+20 gates grade against: RUN 25 filed 104.8 MB
+    // a QSA layer.  Checked to 1%, which catches a dropped term (a 41.9 MB class error).
+    CHECK(s.wire_one_set(T) == one);
+    const double wire_mb = (double) one / MB;
     CHECK(wire_mb > 104.0 && wire_mb < 105.6);
-    std::printf("wire %8.1f MB a QSA layer (RUN 25 filed 104.8)\n", wire_mb);
-    // ...and at the lead's own 8192-token chunk, not a narrowed one: the wire does not shrink with the head
-    // split, which is the whole reason the slice's economics are tight
-    CHECK((uint64_t) T * g.n_embd * 2 * 2 == 2u * 41943040ull);
+    // The RESIDENT wire is `kWireSets` sets: the pipelined gate overlaps layer l+1's inbound with layer l's
+    // compute, which one set cannot do.  Pinned here so the tier figure and the traffic figure can never be
+    // mistaken for one another - the mistake would either hide 105 MB from the tier or double the ledger.
+    CHECK(Prefill::PeerQsaSpan::kWireSets == 2);
+    CHECK(part(s, 1) == one * Prefill::PeerQsaSpan::kWireSets);
+    std::printf("wire: traffic %6.1f MB a QSA layer (filed 104.8)   resident %6.1f MB (%d sets)\n", wire_mb,
+                (double) part(s, 1) / MB, Prefill::PeerQsaSpan::kWireSets);
+    // the wire does not shrink with the head split: the split buys compute, not bytes.  A narrower partner
+    // pays the same for the mixed rows it needs to project its own q/k/v.
+    const Prefill::PeerQsaSpan narrow = span_for(0, 24, 20, 1);   // the partner takes only 4 heads
+    CHECK(narrow.wire_one_set(T) == one);
+    CHECK(part(narrow, 2) < part(s, 2));                          // ...and its scratch does shrink
 }
 
 void test_total_is_the_sum_of_parts() {
@@ -132,6 +140,12 @@ void test_total_is_the_sum_of_parts() {
     CHECK(a > b && a > c);
     std::printf("fp16: span %.2f GiB  wire %.1f MB  scratch %.1f MB  total %.2f GiB\n", (double) a / GiB,
                 (double) b / MB, (double) c / MB, (double) t / GiB);
+    // the reservation delta the second wire set buys: honest about what the overlap costs the partner's tier
+    const uint64_t single = a + s.wire_one_set(T) + c;
+    std::printf("        second wire set costs %+.0f MB of tier (%.2f -> %.2f GiB total)\n",
+                (double) (t - single) / MB, (double) single / GiB, (double) t / GiB);
+    CHECK(t > single);
+    CHECK(t - single == s.wire_one_set(T));   // exactly one extra set, no more
     // the FP16 span, from geometry: 6 x (262144 cells x 256 dim x 2 x 2 B) of KV, plus the pooled table
     CHECK((double) a / GiB > 1.6 && (double) a / GiB < 1.85);
     // the shipped boot: --kv int8, which is what RUN 25's adopted ~1.0 GiB figure prices
