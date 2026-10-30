@@ -123,8 +123,30 @@ private:
 };
 
 /// The same collective as a free function, for a caller that already holds the pair.
+///
+/// THE TIMEOUT IS PART OF THE RESULT.  `tp2_add_wait` spins to its budget, sets the rank's mapped flag and
+/// RETURNS WITHOUT ADDING, leaving `buf` holding this rank's partial alone - and `all_reduce` still returns true
+/// with an empty `err`.  A caller that checks only the return value therefore cannot tell a completed reduce
+/// from a half one, and a half reduce is not an error the tokens recover from: it is attention summed over one
+/// card's heads, presented as the model's own output.  Failing loudly here is the only place that catches it,
+/// because no engine caller checks `timed_out()` itself.
+///
+/// The check is at ENTRY, not after the launch: the spin budget is around a second of device time, so a flag
+/// read immediately after `all_reduce` returns describes a kernel that has not run yet and would be a check that
+/// always passes.  At entry, a spin that gave up has long since been written.  What entry cannot see is the
+/// collective it is itself starting - so the property this buys is "a half reduce fails the run no later than
+/// the next collective of the pair", which for a per-layer reduce means the very next layer.  A caller that must
+/// know within one layer reads `timed_out(rank)` after its own stream sync.
 inline bool tp2_all_reduce(Tp2Pair& pair, float* buf, int64_t rows, int64_t stride, void* stream, int peer_dev,
                            int rank, std::string& err) {
+    // Both ranks are checked, not just this one: the stage drives both cards from one thread, so a peer whose
+    // last collective gave up has already left THIS one's sum short, whatever this rank's own flag says.
+    if (const int r = pair.timed_out(0) ? 0 : (pair.timed_out(1) ? 1 : -1); r >= 0) {
+        err = "tp2 all-reduce: CUDA" + std::to_string(pair.device(r)) + " gave up waiting for its peer's o_proj "
+              "partial; the last reduce on this pair left that card holding only its own sum, so the pair is not "
+              "in a state to reduce again";
+        return false;
+    }
     return pair.all_reduce(buf, rows, stride, stream, peer_dev, rank, err);
 }
 
