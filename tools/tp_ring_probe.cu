@@ -1,30 +1,37 @@
-// tools/tp_ring_probe.cu - the pair's and the ring's effective link bytes, measured, for the TP decision.
+// tools/tp_ring_probe.cu - the pair's and the ring's effective link bytes, and the collective's round-trip
+// latency, measured, for the TP decision.
 //
 // WHAT THIS IS. A standalone CUDA program, not wired into the engine and not built by CMake: it exists to answer
-// one question - how many bytes a second per link do these four cards actually move, (a) one ordered pair at a
-// time, (b) the four links of a ring at once (the TP=4 all-reduce's pattern), (c) the two pair links at once (the
-// TP=2/PP=2 pattern) - before any re-shard work is priced against them. The engine's own collective
-// (`Tp2Pair::all_reduce`, src/kernels/cuda/tp2_collective.cu) pushes with `cudaMemcpyPeerAsync`, so that is the
-// primitive this probes; an SM-driven copy is offered beside it because a pull-style collective would read peer
-// memory instead of writing it, and the two do not always cost the same.
+// two questions - how many bytes a second per link do these four cards actually move when several links are busy
+// at once, and how long one collective's round trip takes at the payload sizes a split linear actually has -
+// before any re-shard work is priced against them. The patterns are the ones the topologies really make: the 12
+// ordered pairs alone, one pair both directions, both pair links at once (PP=2's two AR pairs), the 4-deep ring,
+// and all-to-all. The engine's own collective (`Tp2Pair::all_reduce`, src/kernels/cuda/tp2_collective.cu) pushes
+// with `cudaMemcpyPeerAsync`, so that is the primitive the AR mode copies - push, flag, wait/add, the same three
+// issues per rank; an SM-driven push is offered beside it because a pull-style collective would read peer memory
+// instead of writing it, and because the copy engine is a queue the tier fill also uses.
 //
 // WHY IT IS NOT THE ENGINE'S TEST. `tp2_allreduce_parity_test` proves the collective is CORRECT; it says nothing
-// about which pairs of this box are direct and which are bridged, or whether four concurrent links each keep their
-// share. The roadmap (TP=2/PP=2, then maybe TP=4) turns on those two numbers, so they are measured here, once,
-// and written into the notes - not re-derived per change.
+// about how much of the fabric one link gets when its neighbours are hot, or what an AR costs while blobs are
+// streaming. The roadmap turns on those two numbers, so they are measured here, once, and written into the notes
+// - not re-derived per change.
 //
 // BUILD (deliberately not a CMake target: this is a probe, not a shipped artifact)
 //   /usr/local/cuda/bin/nvcc -O3 -std=c++17 -arch=sm_120 -o /tmp/tp_ring_probe tools/tp_ring_probe.cu
 // RUN
-//   /tmp/tp_ring_probe                       # every mode, the default size sweep
-//   /tmp/tp_ring_probe --mode ring           # one mode
-//   /tmp/tp_ring_probe --size 32MiB --iters 50
+//   /tmp/tp_ring_probe                                  # every bandwidth pattern, the default size sweep
+//   /tmp/tp_ring_probe --mode ring                      # one pattern (pairs pairbidir threelink pair2 ring all2all)
+//   /tmp/tp_ring_probe --mode ar        --reps 101      # the collective's round trip, idle, copy engine
+//   /tmp/tp_ring_probe --mode ar        --reps 101 --ar-sm          # ... pushed by SMs
+//   /tmp/tp_ring_probe --mode artier    --reps 31 --bg-blobs 4      # ... with expert blobs in flight behind it
+//   /tmp/tp_ring_probe --size 4MiB --iters 20           # one size, one repeat count
 //
 // BUFFER DISCIPLINE (the production server is LIVE on these four cards). The probe checks `cudaMemGetInfo` on
-// every card it is about to touch and REFUSES to run if any has less than 256 MiB free. It never allocates more
-// than 64 MiB on a card at any moment (one source and one destination of at most 32 MiB), frees both between
-// measurement points, and touches no stream but its own. If the server's allocations have grown, the probe exits
-// with a non-zero status and says which card is too full; that is the correct outcome, not a failure to fix.
+// every card it is about to touch and REFUSES to run if any has less than 256 MiB free. Its heaviest point holds
+// at most 60 MiB on a card - two bandwidth buffers of at most 31 MiB, or the AR's two small buffers beside the
+// tier load's two blob buffers - it frees everything between measurement points, and touches no stream but its
+// own. If the server's allocations have grown, the probe exits with a non-zero status and says which card is too
+// full; that is the correct outcome, not a failure to fix.
 #include <cuda_runtime.h>
 
 #include <algorithm>

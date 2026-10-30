@@ -2103,3 +2103,175 @@ wait 0.0):
 4. `--exp l2warm_force=1` boot: expect no change vs the default (no extra line).
 5. Build green `-j4`; `ctest -L cpu` 67/68 (`expert_multi_test` pre-existing);
    `tools/check_platform_boundary.sh` + `tools/check_stderr_logging.sh` ok.
+
+## RUN 24 — the link's real shape: one ~7.8 GiB/s pool for four cards, and the AR's floor (step 0, no engine change)
+
+Scope (reviewer, mid-run): **TP=4 is dropped**. The target is PP=2 + true TP=2 — 2 stages × 24 layers, every
+expert sharded 2-way, attention head-split. Quarter-width / 640-sliceability analysis and the 4-deep
+overlap cadence are out. What step 0 had to settle before any substrate work: the small-payload AR latency
+floor, whether a 1280-wide N-slice of gate/up is a pure-offset view, and the per-path byte ledger with each
+path's currency kept separate.
+
+### The one fact that governs everything: the four cards share a single ~7.8 GiB/s pool
+
+Measured with `tools/tp_ring_probe.cu` (standalone, `nvcc` directly, no CMake, not linked into the engine;
+buffers freed between every measurement point; refuses to run if any card is under 256 MiB free — the live
+server owns these cards and was never touched). `cudaMemcpyPeerAsync`, the same call `Tp2Pair::all_reduce`
+makes. 4 MiB per copy, 20 rounds, RTX 5060 Ti ×4 at a **180 W power limit** (SM clocks 2692–2947 MHz as
+read), all-GPU `PHB` topology (nvidia-smi `topo -m`), no NVLink. Every number in this RUN is at that limit.
+
+| pattern | links busy | per link | fabric total |
+|---|---|---|---|
+| one pair alone (any of the 12 ordered pairs) | 1 | 6.16–6.64 GiB/s | 6.16–6.64 |
+| one pair, both directions | 2 | 3.96 GiB/s | **7.92** |
+| two pair links, both directions (PP=2's two AR pairs) | 4 | 2.00 GiB/s | **8.00** |
+| 4-deep ring `0>1>2>3>0` (and reversed) | 4 | 1.93 GiB/s | 7.72 |
+| all-to-all, 12 directed pushes | 12 | 0.64 GiB/s | 7.68 |
+
+Every pattern lands on the same ~7.7–8.0 GiB/s total. The links are not independent: one pair at full
+duplex already saturates the fabric, and a second pair gets a quarter of the solo rate, not half. **Per-pair
+bandwidth is not a per-card allowance; it is a share of one host-bridge pool.** The 12 ordered pairs are
+uniform to within 8%, so no pair is privileged — the `PIX`/`PHB` distinction that mattered on the older
+boards does not buy anything here.
+
+### The AR's floor: 25 µs idle, 2.4 ms with the tier running — and the copy engine is why
+
+`--mode ar` / `--mode artier`: the engine's own three issues per rank (push, flag, wait/add), single-shot
+rounds with min/median/max, plus a queued back-to-back figure. Payloads are what a split o_proj / down_proj
+partial actually is. **Idle fabric:**
+
+| payload | one pair, copy engine | one pair, SM push | two pairs, copy engine |
+|---|---|---|---|
+| 4 KiB | 22.7 / **24.8** / 62.8 µs | 9.1 / **19.4** / 372.8 µs | 38.9 / 320 / 6562 µs |
+| 16 KiB | 22.9 / **24.8** / 2250 µs | 8.9 / **21.7** / 1257 µs | 42.8 / 1744 / 6564 µs |
+| 64 KiB | 28.6 / **33.1** / 2245 µs | 28.3 / **29.8** / 75.6 µs | 46.0 / 368 / 6581 µs |
+| 256 KiB | 72.5 / **76.4** / 109 µs | 65.4 / **68.7** / 298 µs | 135 / 1862 / 6626 µs |
+
+(median is the decision column; the max column is the live server taking the card back, not the fabric).
+
+**Under a concurrent tier fill** — 4 expert blobs (2.63 MiB each, the pack's real `NativeFmt` size) pushed
+across the same link per round on a second stream, the depth the ring runs at:
+
+| payload | copy-engine push | SM push |
+|---|---|---|
+| 4 KiB | 1888 / **2446** µs | 159 / **290** µs |
+| 16 KiB | 1717 / **2407** µs | 131 / **325** µs |
+| 64 KiB | 852 / **2376** µs | 140 / **375** µs |
+| 256 KiB | 2172 / **2444** µs | 245 / **347** µs |
+
+That is the run's result. A `cudaMemcpyPeerAsync` push **waits its turn behind the tier's copies on the
+copy engine**: a 25 µs round trip becomes 2.4 ms, 100×, and the AR payload size stops mattering at all —
+which is the signature of queueing, not of bandwidth. An SM-driven push (the IPC-read shape) does not queue
+there and costs 8× less under the same load, and is also cheaper on an idle fabric.
+
+### What that prices: decode misses the budget on the copy engine and just makes it on SMs
+
+The budget the reviewer set: 96 AR rounds/window (2 per layer × 48 layers) under ~2 ms.
+
+- copy engine, idle, 4 KiB median: 96 × 24.8 µs = **2.4 ms — over budget** before a single byte of work.
+- SM push, idle, 4 KiB median: 96 × 19.4 µs = **1.9 ms — inside, with no margin.**
+- copy engine with the tier live: 96 × 2446 µs = **235 ms.** Dead.
+- SM push with the tier live: 96 × 290 µs = **28 ms.** Still dead at decode rates.
+
+So the honest reading: the AR's *latency floor* passes decode only in the idealized case — SM-driven
+pushes, an idle fabric, and perfect pipelining so the wait hides behind compute. The tier and the ARs are
+**not** overlappable on the copy engine as the primitive stands today. Any TP=2 that streams expert blobs
+and ARs concurrently must put the AR on SMs *and* keep the blob stream off the same direction on the same
+link, or it pays the queue, which is two orders of magnitude, not a tuning constant.
+
+### The volume ledger, per path and per currency (H pinned from geometry, not guessed)
+
+`H = n_embd = 2560` from `ModelGeometry` (`include/basalt/core/layout.hpp`), 48 layers, 512 experts,
+`n_ff = 640`, 24 heads × 256. The AR's per-rank bytes are `tp2_all_reduce_bytes(rows, stride) =
+rows * stride * 4` (`include/basalt/kernels/tp2_collective.hpp`) — FP32 residual, so 10 KiB per token per
+AR. The QSA width 6144 is the *attention input*, not the AR payload; using it as `H` overstates the AR 2.4×.
+
+Current topology, from the boot lines (`503 MiB / 217 MiB` stage A, `419 / 213` stage B, per layer), booked
+as two currencies because the paths are different hardware:
+
+| path | bytes/layer | rate | ms/layer |
+|---|---|---|---|
+| lead's host link, tier fill (`h2d`) | 503 MiB (A) / 419 (B) | 6.71 GiB/s = the 7.2 GB/s the PCIe probe prints | 75.0 / 62.5 |
+| pair link, planes + rows (`d2d`) | 217 MiB (A) / 213 (B) | 6.4 solo, **2.00 when both pairs run** | 33.9 / 108.5 |
+
+The `d2d` column is why the current design's pair leg is only survivable: at the *solo* 6.4 GiB/s the pair's
+217 MiB is 34 ms. It only reaches 108 ms when both stages push at once, which the ledger above shows is what
+TP=2 makes permanent.
+
+TP=2/PP=2's added leg — 2 ARs per layer per rank at `2 × rows × 2560 × 4`:
+
+| chunk | AR bytes/layer | @2.00 (both AR pairs live) | @3.96 (staggered) | planes leg |
+|---|---|---|---|---|
+| 2048 | 40.0 MiB | 20.0 ms (13.0% of A's 153.8 ms) | 10.1 ms (6.6%) | 2.8 MiB, 1.4 ms |
+| 4096 | 80.0 MiB | 40.0 ms (26.0%) | 20.2 ms (13.1%) | 5.6 MiB, 2.8 ms |
+| 8192 | 160.0 MiB | 80.0 ms (52.0%) | 40.4 ms (26.3%) | 11.3 MiB, 5.6 ms |
+
+Against what TP=2 saves at chunk 8192: half the expert work and half the attention
+(`72.4/2 + 13.9 peer-wait + 57.2/2 = 78.7 ms`).
+
+- Both stages doing their ARs on the fabric at once (the 2.00 GiB/s column): **−6.9 ms per layer. A loss.**
+- Staggered so only one pair is ever pushing (the 3.96 column): **+35.4 ms per layer. A win, worth ~23%.**
+
+The entire verdict is the scheduling of the two stages' ARs against each other, not the collective's
+implementation. At 26–52% of the layer time the ARs are also no longer background: RUN 20's requirement to
+hide ≥90% of the pair traffic stops being satisfiable by putting the copy on a second stream, because the
+second stream now competes with the tier fill for the same pool.
+
+### 1280-wide N-slice of gate/up: a pure-offset view, not a repack
+
+`NativeFmt` (`src/kernels/cpu/native_expert.cpp::native_fmt`) lays an expert out as
+`[gate rows | up rows | down rows]` + a 16 B NVFP4 scale tail: `gu_row = 1440` B (`n_embd=2560` at
+`(2560/64)*36`), `up_off = 921600`, `down_off = 1843200`, blob `2764816` B — the boot line's "largest blob
+2.76 MB". A 1280-column N-slice is `640` rows × `720` B of each gate row plus the same offset into the up
+region: **two contiguous 460800 B runs at fixed offsets**, one in gate, one in up. Contiguous, aligned, and
+self-contained: it needs no dequant-slice and no load-time repack. Two constraints, both already satisfied:
+NVFP4 blocks are 64 values / 36 B so the slice boundary must be a multiple of 64 (1280 = 20 × 64 ✓), and
+the per-16-value UE4M3 sub-block scales live inside the same 36 B block, so slicing at 64 never separates a
+value from its scale. `moe_fp4.cu` already takes `w_off` + `w_cols` + `half` per product, so the kernel
+signature is shaped for it. The residual cost is not layout but reduction order: a sharded down_proj sums
+two half-width K-runs instead of one full run, which is a precision-path change under the `docs/precision/`
+rule and needs the PPL/KLD gate, not just greedy identity.
+
+### Verdict
+
+- **TP=2/PP=2 prefill: real, but conditional.** Worth ~+35 ms/layer (~23%) *only* if the two stages' ARs are
+  staggered so one pair-link direction is ever hot. Unstaggered it is a small loss. This is a scheduler
+  requirement on the substrate, and it is checkable before any of it is built.
+- **TP=2 decode: not yet a win.** The floor (96 × ~19–25 µs = 1.9–2.4 ms) sits exactly on the ~2 ms budget,
+  so it needs SM-driven pushes and has no margin. With any tier traffic on the same link the copy-engine
+  path dies (28–235 ms). Decode stays on the current topology until that is solved.
+- **TP=4: correctly dropped.** Under the measured pool it cannot be made to work: four cards is ~1.9 GiB/s
+  each, and it pays two more AR partners for bytes the pair split already moves at 3.4× the rate.
+- **Roadmap:** the next gate is not the substrate's abstraction. It is (1) an AR that does not queue behind
+  the tier's copies on the copy engine, and (2) stage-scheduling that keeps only one pair direction hot.
+  Both are measurable here before code, and both were the assumptions the ceiling rested on.
+
+### Reproduce
+
+```
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 -arch=sm_120 -o /tmp/tp_ring_probe tools/tp_ring_probe.cu
+/tmp/tp_ring_probe --mode all --size 4MiB --iters 20      # the pool table
+/tmp/tp_ring_probe --mode ar     --iters 40 --reps 101              # idle AR, copy engine
+/tmp/tp_ring_probe --mode ar     --iters 40 --reps 101 --ar-sm      # idle AR, SM push
+/tmp/tp_ring_probe --mode artier --iters 30 --reps 31 --bg-blobs 4  # AR under a tier fill
+/tmp/tp_ring_probe --mode artier --iters 30 --reps 31 --bg-blobs 4 --ar-sm
+```
+
+### Caveats to carry
+
+- All figures are development A/Bs on this box at its current power limit; headline numbers stay the
+  maintainer's own runs.
+- **The medians are not stable across server load; only the minimum is a fabric floor.** A repeat of the idle
+  AR run an hour later, with the live server busier, moved the one-pair copy-engine median at 256 KiB from
+  76 µs to 2274 µs while the minimum held at 74 µs. The AR tables above are from the quieter window. Read the
+  min column as what the fabric can do and the median/max as what the shared box does to it — which means the
+  decode budget in this run is an *optimistic* check, and the SM-push 1.9 ms has less margin than it looks.
+  A maintainer run on a quiet box is the number to quote.
+- The live server held ~366–388 MiB free per card throughout. The AR max columns (up to 6.5 ms) are the
+  server reclaiming a card, and the two-pair medians are inflated by the same interference plus single
+  host-thread issue serialization — read the one-pair medians as the fabric, the two-pair ones as
+  "contention is bad", not as a rate.
+- `--bg-blobs` is an approximation of a tier fill, not the engine's real ring: the ring's copies are
+  O_DIRECT-fed and interleaved with compute. The queue-behind-the-copy-engine result is robust to that; the
+  exact 2.4 ms is not a production measurement.
+- `--mode ring`/`all2all` measure simultaneous pushes, which is how a ring AR actually behaves.
