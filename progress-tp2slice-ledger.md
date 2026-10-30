@@ -231,30 +231,22 @@ I will report the number as measured; it will not be tuned to pass.
 
 ## 5. Landed earlier in the milestone
 
-Commit `b1f9850d`, `tests: the head-split parity gains the prompt attention kernel`:
-
-- Task item **4** (parity): case 6 in `tests/kernels/tp2_head_split_parity.cpp` runs 8 queries
-  through `qsa_prompt_attn_batch` whole (24 heads / 2 KV) and once per card (12 / 1) over each
-  card's KV-head slice, sharing one selection, step and permuted page table. Tolerance stated in
-  the source: relative 2e-3 of the row's largest magnitude, which is the prompt kernel's own bound
-  (`qsa_prompt_attn.hpp` says it is FP32-level, not bitwise). A bitwise run prints `bitwise` and
-  its worst deviation, so drift toward the bound stays visible.
-  GPU-labelled (`basalt_gpu_test`, skip 77 without a card), so the cpu count is unchanged at 68.
-  **Not executed** — the live server holds the cards. It compiles clean under `-j4`; the two
-  `-Wpointer-arith` warnings at lines 430-431 are pre-existing, on untouched lines.
+Commit `b1f9850d`, `tests: the head-split parity gains the prompt attention kernel`: case 6 of
+`tests/kernels/tp2_head_split_parity.cpp` runs the prompt attention whole (24 heads / 2 KV) and once per card
+(12 / 1) over each card's KV-head slice on one shared selection, at the kernel's own 2e-3 bound — the harness and
+its tolerance are documented in `progress-tp2slice-kernels.md`. GPU-labelled (`basalt_gpu_test`, skip 77 without
+a card), so the cpu count is unchanged; **not executed** — the window owns the cards.
 - Task item **5** (predictions): this file, filed before any measurement.
 
-Gates: `tools/check_platform_boundary.sh` ok, `tools/check_stderr_logging.sh` ok,
-`ctest -L cpu` **67/68** — only the pre-existing `expert_multi_test` (this CPU lacks
-AVX512-VNNI/VBMI). Build used `-j4` per the shared-CPU constraint. `:8000` was never contacted,
-no engine started, no GPU test run while the server holds the cards.
+Gates: `tools/check_platform_boundary.sh` ok, `tools/check_stderr_logging.sh` ok, `ctest -L cpu` **68/69** — only
+the pre-existing `expert_multi_test` (this CPU lacks AVX512-VNNI/VBMI), with the total count verified at 69. Build
+used `-j4` per the shared-CPU constraint. `:8000` was never contacted and no GPU test run while the server holds
+the cards.
 
-**Not built** — the pipelined variant and the executor behind the gate remain open:
-
-- No peer-side prompt-attention executor exists; `--exp tp_prompt_attn` refuses at
-  `Prefill::set_peer`, and `qhs_peer_item()` (`src/core/verify.cpp`) still returns false as
-  decode's unbuilt window item.
-- The software-pipelined variant (`=2`) is untouched.
+**Not built** — the pipelined variant remains open: the serialized path is landed and gated at 1, and the
+software-pipelined `=2` is untouched (it needs the free-ness protocol the reduce supplies by being in the lead's
+stream). Decode's window item `qhs_peer_item()` (`src/core/verify.cpp`) still returns false, as this milestone
+requires.
 
 ## 2j. The (c) tier reserve, priced at the pinned symmetric cut
 
@@ -298,3 +290,10 @@ Next to it, the reason the refusal was the good outcome: the arm's `qs.wq/wk/wv/
 priced into the tier and read by `peer_qsa_layer` - and nothing had ever written them. `peer_qsa_resident_up`
 copies them off the lead's card at boot and checks each layer's own type and row width against the figures the span
 was priced from, since the sizer reads one QSA layer and multiplies. Pinned by `tp2_shard_weights_test`.
+
+And the range, because the tier figure above depends on it: a stage's table holds its OWN layers' projections only
+(`NativeDense` loads inside `set_layer_range(st.lo, st.hi)`), so `qsa_pair_prepare` and its sizer twin
+`qsa_pair_bytes` take `[lb, le)`. Asked for the whole model, the other stage's layers price 0 and the prepare
+refuses - the second boot's `blk.27 ... native 0 B` on CUDA1 and `blk.3` on CUDA2, each card naming the other's
+first QSA layer. `peer_qsa_span_test` pins that a stage table prices 6 x 6 451 200 B over its range, 0 over the
+other's, and the same figure over the whole model - which is what lets `lead_qsa_bytes` reserve conservatively.

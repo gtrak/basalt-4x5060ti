@@ -34,24 +34,28 @@
 
 ## Status of this milestone
 
-**The gate is open at 1.** `--exp tp_prompt_attn=1` arms the prompt-attention slice at `Prefill::set_peer`; 0
-(the default) leaves the path byte-identical — the flag is read once, on the peer arm's setup, and no other code
-observes it. It is the prompt path's only flag: decode's seam (`qhs_peer_item()`, §4) stays shut, so the two gates
-cannot be mistaken for one another.
+**The gate is open at 1.** `--exp tp_prompt_attn=1` arms the prompt-attention slice at `Prefill::set_peer`; 0 (the
+default) leaves the path byte-identical — the flag is read once, on the peer arm's setup, and no other code
+observes it. It is the prompt path's only flag: decode's seam (`qhs_peer_item()`, §4) stays shut.
 
 Gates, current: build green under `-j4`; `ctest -L cpu` **68/69** with the count verified at 69 — only the
-pre-existing `expert_multi_test` (no AVX512-VNNI/VBMI here); boundary and stderr checks ok. `:8000` never contacted,
-no engine started, decode untouched; GPU numbers stay **TODO-for-the-window**.
+pre-existing `expert_multi_test` (no AVX512-VNNI/VBMI here); boundary and stderr checks ok. `:8000` never contacted;
+GPU numbers stay **TODO-for-the-window**.
 
-**The first gated boot refused for a pack reason, not a plumbing one:** the projections carry no canonical bytes
-here (native Q6_K/Q8_0 images only), so every figure built from the planes was 0, and the arm's resident
-projections had never been written. Both are fixed and priced from the pack; ledger §2k has the corrected tier.
+**Two gated boots refused, both for pack reasons, and the second read as the first.** The projections carry no
+canonical bytes here (native Q6_K/Q8_0 images only), so every figure built from the planes was 0, and the arm's
+resident projections had never been written; both fixed and priced from the pack (ledger §2k). The next boot then
+refused `blk.27.attn_output.weight ... cannot be cut at column 0 of 6144 (group 32, native 0 B)` on CUDA1 and the
+same on `blk.3` on CUDA2 — each card dying on the OTHER stage's first QSA layer. `qsa_pair_prepare` packed
+`[0, n_layers)` while a stage's table holds only its own layers' projections (`NativeDense` loads inside
+`set_layer_range(st.lo, st.hi)`): out-of-stage layers have neither form, 0 bytes, refusal. The pair now packs and
+prices `[lb, le)`, and an unprepared layer stays `!ok` and refuses rather than reading another stage's columns.
+The window's boots printed the arm line on both stage leads: 116 MiB held back, 12/24 heads, staging 8192x2560.
 
 **Landed since**: `span_valid` with its catch-up, invalidation sites and the `kv_span_import` gather (case 11); the
 **(c) tier reserve** (pinned symmetric cut, refusal naming both figures); the **all-reduce timeout fix**
 (`b34904ba`); and **pair bring-up** — `peer_qsa_pair_up()` opens one `Tp2Pair` across the stage's two cards sized
-for a PROMPT partial (`chunk x n_embd`, not the decode shard's `1 x n_embd`) and packs `attn_output` columns on
-BOTH cards, refusing if either card's set is missing on any QSA layer of the stage.
+for a PROMPT partial (`chunk x n_embd`) and packs the stage range's `attn_output` columns on BOTH cards.
 
 **LANDED (`b4cc1f70`, `e786401c`): the serialized slice runs.** (a) `peer_qsa_publish()` ships the lead's
 `mixed_h` / `q_idx` / `idx_raw` — and the chunk's step counts once — into the wire set on the LEAD's compute
@@ -281,10 +285,8 @@ kernel and arm pieces — container and sizing walk, resident projections (`peer
 every hardcoded head count found, fixed and parity-tested — are in **`progress-tp2slice-kernels.md`**. The
 headline figures, restated so this file stands alone:
 
-    wire traffic   104.9 MB in a QSA layer    what the +10/+20 gates grade; the RETURN leg is FP32 today
-                                              (83.9 MB, not the filed 41.9 BF16) -- see the findings above
-    tier reserve   2.01 GiB int8               span 0.96 + wire 0.20 + scratch 0.64 + weights 0.08 + cols 0.04
-                                              + gemm 0.09
+    wire traffic   104.9 MB in a QSA layer    what the +10/+20 gates grade; the RETURN leg is FP32 today (83.9 MB)
+    tier reserve   2.01 GiB int8               span 0.96 + wire 0.20 + scratch 0.64 + weights 0.08 + cols 0.04 + gemm 0.09
     span copy      <= 0.96 GiB per TURN        zero on a fresh prompt; ~254 ms worst case
     predictions    serialized -2/-4 ms         pipelined +18/+15 ms as an UPPER BOUND (no-extra-eviction)
 
@@ -295,5 +297,4 @@ than run as 1, because the operator would read the resulting number as the pipel
 the next commit and needs the free-ness protocol the reduce currently supplies by being in the lead's stream.
 `qhs_peer_item()` (`src/core/verify.cpp`) still returns false: that is decode's window item, supposed to stay
 false for this milestone, and `--exp decode_headsplit=1` still refuses. Decode's paths — `qhs_peer_item`, the
-peer window, `dm_peer_kernel` — are untouched by this slice. Every timing figure in these files is
-**TODO-for-the-window**; none of the slice has been executed on a card.
+peer window, `dm_peer_kernel` — are untouched by this slice. None of the slice has been executed on a card.
