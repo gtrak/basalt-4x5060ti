@@ -1673,6 +1673,80 @@ static bool in_ram_band(const RamView& v, const core::PeerExperts& peer, int64_t
     return v.src != nullptr && v.src->pinned(l, e);   // bytes only in the file's pages: the lead's stager reads them
 }
 
+/// What one stage's layer costs each card of the pair, in milliseconds, at a given band share: the pair's wall is
+/// the longer of `lead_ms()` and `peer_ms()`, so that is the balance the share is struck on.  The lead pays for the
+/// attention it runs, the expert rows it computes and the RAM blobs it reads over its own link; the peer pays for
+/// the attention it runs, the rows it computes and the bytes it carries - the chunk's activations in and its own
+/// rows back - over the pair's link.  `d_lead`/`d_peer` are what moving ONE more band expert does to each side: the
+/// lead loses that expert's rows and gains back its blob, the peer gains the rows and the bytes they carry.  Both
+/// are constant in the share, which is why the balance has a closed form.
+struct PeerLayerTime {
+    double lead_attn = 0, lead_rows = 0, lead_blobs = 0;
+    double peer_attn = 0, peer_comp = 0, peer_rows = 0, peer_acts = 0;
+    double d_lead = 0, d_peer = 0;
+    double lead_ms() const { return lead_attn + lead_rows + lead_blobs; }
+    double peer_ms() const { return peer_attn + peer_comp + peer_rows + peer_acts; }
+};
+
+/// The rates the time objective is struck in, in milliseconds and MB (1e6 B) a millisecond.  Each default is the
+/// measured figure of the named quantity at the priced chunk - TP2PP2-NOTES.md's pair-share section records which
+/// boot each came from - and `--exp NAME=V` re-prices one without a rebuild, so a sweep can move the balance.
+/// The attention terms are what each card runs of the layer's attention: the lead's is the whole of it, because
+/// `qsa_prompt_attn` has no peer caller, and the peer's is 0 until that wiring exists (the boot line prints the
+/// two of them, so a reader never takes the peer's 0 for an attention split that happened).
+struct PeerTimePrice {
+    double lead_row_us = 2.26;    ///< one row-visit of one expert, computed on the lead
+    double peer_row_us = 1.09;    ///< ... and on the peer card, whose rows come from its own memory
+    double link_mb_ms = 4.2;      ///< the pair's link: the activations out and the result rows back
+    double blob_mb_ms = 4.2;      ///< the lead's own read of a RAM blob, priced at the pair's link
+    double attn_lead_ms = 0;      ///< the stage's attention the lead card runs
+    double attn_peer_ms = 0;      ///< ... and the peer's: 0 while the prompt attention has no peer caller
+};
+
+/// The stage's prices, with each one open to `--exp`.  `attn_lead_ms` defaults to the stage's measured whole
+/// attention at the priced chunk (the two stages are profiled apart, so they are priced apart); the peer's term
+/// defaults to 0 and is the figure a future peer-side prompt attention is set to.
+static PeerTimePrice peer_time_price(bool stage_a) {
+    PeerTimePrice p;
+    p.lead_row_us = core::exp_flag("qsa_lead_row_us", p.lead_row_us);
+    p.peer_row_us = core::exp_flag("qsa_peer_row_us", p.peer_row_us);
+    p.link_mb_ms = core::exp_flag("qsa_link_mb_ms", p.link_mb_ms);
+    p.blob_mb_ms = core::exp_flag("qsa_blob_mb_ms", p.blob_mb_ms);
+    p.attn_lead_ms = core::exp_flag(stage_a ? "qsa_attn_ms_stage_a" : "qsa_attn_ms_stage_b",
+                                    stage_a ? 54.4 : 49.0);
+    p.attn_peer_ms = core::exp_flag(stage_a ? "qsa_attn_peer_ms_stage_a" : "qsa_attn_peer_ms_stage_b", 0.0);
+    if (!(p.lead_row_us > 0)) p.lead_row_us = 1e-9;
+    if (!(p.peer_row_us > 0)) p.peer_row_us = 1e-9;
+    if (!(p.link_mb_ms > 0)) p.link_mb_ms = 1e-9;
+    if (!(p.blob_mb_ms > 0)) p.blob_mb_ms = 1e-9;
+    if (!(p.attn_lead_ms >= 0)) p.attn_lead_ms = 0;
+    if (!(p.attn_peer_ms >= 0)) p.attn_peer_ms = 0;
+    return p;
+}
+
+/// The two cards' layer times at band share `r` of `band`.  A partner-held or moved expert's rows are the peer's
+/// and the rest the lead's, and the chunk's `K` rows a token go to one card or the other, so the two row terms
+/// always add up to the whole chunk's walk.
+static PeerLayerTime peer_layer_time(const PeerTimePrice& p, int64_t chunk, int64_t n_expert, int64_t held,
+                                    int64_t band, int64_t r, uint64_t rb, uint64_t acts, uint64_t slot) {
+    const double wr = (double) chunk * (double) K / (double) n_expert;   // the row-visits of one expert
+    const double rows_peer = (double) (held + r) * wr;
+    const double rows_lead = (double) chunk * (double) K - rows_peer;
+    const double link = p.link_mb_ms * 1e6;    // the pair's link, in bytes a millisecond
+    const double blob = p.blob_mb_ms * 1e6;    // ... and the lead's own read of a blob
+    PeerLayerTime t;
+    t.lead_attn = p.attn_lead_ms;
+    t.lead_rows = rows_lead * p.lead_row_us / 1000.0;
+    t.lead_blobs = (double) (band - r) * (double) slot / blob;
+    t.peer_attn = p.attn_peer_ms;
+    t.peer_comp = rows_peer * p.peer_row_us / 1000.0;
+    t.peer_rows = rows_peer * (double) rb / link;
+    t.peer_acts = (double) acts / link;
+    t.d_lead = wr * p.lead_row_us / 1000.0 + (double) slot / blob;
+    t.d_peer = wr * p.peer_row_us / 1000.0 + wr * (double) rb / link;
+    return t;
+}
+
 /// What the RAM band is worth to the pair.  Moving one of a layer's `band` experts to the partner takes its blob
 /// (`B`) off the LEAD's inbound link and puts its result rows (`w`) on the PAIR's link, which the chunk's outgoing
 /// activations already fill: it is that link's return leg a long chunk stops on, so a row is billed there, beside the
@@ -1683,6 +1757,12 @@ static bool in_ram_band(const RamView& v, const core::PeerExperts& peer, int64_t
 /// one.  A partner never takes more than half the chunk's rows, the routed share's own bound.  Priced at `chunk`, the
 /// longest chunk the share is ever given, and over one stage's layers only: `acts`, `held` and the band are the
 /// stage's own, so a pair's two stages are priced apart.
+///
+/// Two objectives pick `r` from the same counts.  The default prices TIME (`peer_layer_time`): the two CARDS
+/// balance, which is what the wall follows, and it moves more of the band than the bytes do because a row costs the
+/// two cards differently.  `--exp qsa_share_bytes=1` keeps the two LANES' byte balance - the earlier objective, and
+/// the A/B the time objective is graded against; its `r` is the point where the lead's blob lane meets the pair's
+/// link lane.
 struct PeerRamShare {
     static constexpr int kDen = 8;            // the share's denominator, fixed so every card counts the band alike
     int64_t layers = 0, band = 0, take = 0;   // the layers with a band, its experts, and those the partner reads
@@ -1690,13 +1770,15 @@ struct PeerRamShare {
     int num = 0;                              // `take` of `band`, rounded to eighths
     int64_t top = 0;                          // the longest chunk whose expert's rows still weigh less than its blob
     uint64_t lead = 0, pair = 0;              // the two lanes' bytes over those layers at the priced share
+    PeerLayerTime sum;                        // the two cards' predicted layer times at the priced share, summed
     /// The band experts the partner reads: `num` of every `kDen` of them, counted in id order, so the choice never
     /// depends on the routing and the price, the lead's stream and the row split all pick out the same ones.
     static bool taken(int64_t k, int num) { return k % kDen < num; }
 };
 
 static PeerRamShare peer_ram_share(const RamView& v, const core::PeerExperts& peer, int64_t lb, int64_t le,
-                                   int64_t n_expert, int64_t chunk, bool rows_bf16, bool acts_planes) {
+                                   int64_t n_expert, int64_t chunk, bool rows_bf16, bool acts_planes,
+                                   const PeerTimePrice& price, bool time_objective) {
     PeerRamShare pr;
     if (n_expert <= 0 || chunk <= 0) return pr;
     const uint64_t rb = peer_row_bytes(rows_bf16);
@@ -1710,19 +1792,36 @@ static PeerRamShare peer_ram_share(const RamView& v, const core::PeerExperts& pe
         if (band == 0) continue;
         const uint64_t B = core::PeerExperts::slot_bytes(l);
         const uint64_t w = (uint64_t) chunk * (uint64_t) K / (uint64_t) n_expert * rb;
-        if (w >= B) { ++pr.heavy; continue; }   // its rows already outweigh its blob: leave the whole band on the lead
+        const PeerLayerTime t0 = peer_layer_time(price, chunk, n_expert, held, band, 0, rb, acts, B);
+        // a band whose move costs more than it saves, in whichever currency the balance is struck in, stays whole
+        if (w >= B || (time_objective && t0.d_peer >= t0.d_lead)) { ++pr.heavy; continue; }
         ++pr.layers;
         pr.band += band;
         const int64_t top = (int64_t) (B * (uint64_t) n_expert / ((uint64_t) K * rb));
         pr.top = pr.top == 0 ? top : std::min(pr.top, top);
-        // one more expert moves `B` off the lead's link and puts `w` on the pair's: they meet at `r`
-        const uint64_t lead = (uint64_t) band * B, pair = acts + (uint64_t) held * w;
-        int64_t r = (int64_t) ((lead > pair ? lead - pair : 0) / (B + w));
+        int64_t r;
+        if (time_objective) {
+            // the cards meet where the lead's time comes down to the peer's; both move `d_lead`/`d_peer` per expert
+            const double gap = t0.lead_ms() - t0.peer_ms();
+            r = gap > 0 ? (int64_t) (gap / (t0.d_lead + t0.d_peer) + 0.5) : 0;
+        } else {
+            // one more expert moves `B` off the lead's link and puts `w` on the pair's: they meet at `r`
+            const uint64_t lead = (uint64_t) band * B, pair = acts + (uint64_t) held * w;
+            r = (int64_t) ((lead > pair ? lead - pair : 0) / (B + w));
+        }
         r = std::min(r, (int64_t) (n_expert / 2 - held));   // never more than half the chunk's rows
         r = std::max<int64_t>(0, std::min(r, band));
         pr.take += r;
         pr.lead += (uint64_t) (band - r) * B;
         pr.pair += acts + (uint64_t) (held + r) * w;
+        const PeerLayerTime t = peer_layer_time(price, chunk, n_expert, held, band, r, rb, acts, B);
+        pr.sum.lead_attn += t.lead_attn;
+        pr.sum.lead_rows += t.lead_rows;
+        pr.sum.lead_blobs += t.lead_blobs;
+        pr.sum.peer_attn += t.peer_attn;
+        pr.sum.peer_comp += t.peer_comp;
+        pr.sum.peer_rows += t.peer_rows;
+        pr.sum.peer_acts += t.peer_acts;
     }
     if (pr.take > 0 && pr.band > 0)
         pr.num = (int) std::min<int64_t>(PeerRamShare::kDen,
@@ -1997,9 +2096,18 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
     const RamView rv{m.host_res, m.cache, m.ring_peer, m.src};
     const bool rows_bf16 = !peer_rows_fp32;   // the width of the peer's rows on the pair's link (`PeerPrefill::rows_bf16`)
     const bool acts_planes = !peer_acts_fp32; // ... and of its activations (`PeerPrefill::acts_planes`)
+    // The share's objective: the two cards' layer TIMES by default, the two links' bytes with
+    // `--exp qsa_share_bytes=1` (the earlier objective, kept as the A/B and the fallback).
+    const PeerTimePrice price = peer_time_price(lb == 0);
+    const bool time_objective = core::exp_flag("qsa_share_bytes", 0.0) == 0;
     const PeerRamShare prs = peer_ram_rows && !peer_fp4_gate(streamed_share)
-                                 ? peer_ram_share(rv, *peer, lb, le, ne, m.T_max, rows_bf16, acts_planes)
+                                 ? peer_ram_share(rv, *peer, lb, le, ne, m.T_max, rows_bf16, acts_planes, price,
+                                                  time_objective)
                                  : PeerRamShare{};
+    // The head cut the ratio names for this stage.  It changes no work here - the prompt attention runs whole on
+    // the lead - so it is carried for the line below, which prices the pair's two cards at it.
+    const double ratio = core::exp_flag(lb == 0 ? "qsa_ratio_stage_a" : "qsa_ratio_stage_b", 0.5);
+    const int64_t heads = m.g ? m.g->n_head : 0;
     const PeerLink pl = peer_link(*peer, prs.num > 0 ? &rv : nullptr, lb, le, ne, prs.num, rows_bf16, acts_planes);
     // capped by the ceiling `peer_bytes` sized its buffers for, so the allocation always fits the reserve
     const int64_t t_fp4 = peer_fp4_possible(streamed_share)
@@ -2045,6 +2153,29 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
                       (long long) pl.ram, share.c_str(), rows_bf16 ? "BF16" : "FP32 (--peer-rows-fp32)",
                       acts_planes ? "the lead's FP4 planes" : "FP32 (--peer-acts-fp32)",
                       band.c_str());
+    // The model's own balance, in milliseconds a layer, next to the byte lanes it was struck against: what each
+    // card of the pair spends a layer on at the share this boot chose, and which side of the pair is therefore
+    // the critical one.  The peer's attention term is 0.0 and stays 0.0 - prompt attention has no peer caller - so
+    // the heads the ratio names are what a WIRED peer would run, and the pair's head-ratio figures are model
+    // predictions until that leg's transport is measured (RUN 22).
+    if (ram_on) {
+        const double per = 1.0 / (double) (prs.layers > 0 ? prs.layers : 1);
+        const int64_t lead_heads = core::qsa_lead_heads(heads, ratio);
+        const double lead_ms = prs.sum.lead_ms() * per, peer_ms = prs.sum.peer_ms() * per;
+        basalt::log::info("basalt prefill",
+                          "peer layer time layers %lld-%lld at %d/%d band: lead %.1f ms a layer = attention %.1f + "
+                          "rows %.1f + blobs %.1f, peer %.1f ms = attention %.1f + rows %.1f + back %.1f + acts "
+                          "%.1f; the critical side is the %s by %.1f ms (%.2f/%.2f us a row-visit, %.1f MB/ms of "
+                          "link); heads %lld/%lld priced (--exp qsa_ratio_stage_%c), the peer runs no prompt "
+                          "attention so its heads are priced at 0.0",
+                          (long long) lb, (long long) le, prs.num, (int) PeerRamShare::kDen, lead_ms,
+                          prs.sum.lead_attn * per, prs.sum.lead_rows * per, prs.sum.lead_blobs * per, peer_ms,
+                          prs.sum.peer_attn * per, prs.sum.peer_comp * per, prs.sum.peer_rows * per,
+                          prs.sum.peer_acts * per,
+                          lead_ms >= peer_ms ? "lead" : "peer", lead_ms >= peer_ms ? lead_ms - peer_ms : peer_ms - lead_ms,
+                          price.lead_row_us, price.peer_row_us, price.link_mb_ms, (long long) lead_heads,
+                          (long long) (heads - lead_heads), lb == 0 ? 'a' : 'b');
+    }
     std::unique_ptr<PeerPrefill> pp;
     // `cap_rows` bounds the routed share only: with the FP4 share on, the primary leaves EVERY expert the peer holds
     // and every band expert the share moves out of its stream (before the routing is known), so the peer has to be
