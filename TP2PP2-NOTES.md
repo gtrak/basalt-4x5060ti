@@ -2412,7 +2412,8 @@ start); prompt-sourced short matches still need `min_match`.
 5. Kill criterion check: if reseeded acc < 55% of fresh-session acc, close P2-4 as "tail distribution
    resists re-seeding" — do not iterate.
 
-## RUN 24 — the link's real shape: one ~7.8 GiB/s pool for four cards, and the AR's floor
+## RUN 24 — the link's real shape: one ~7.8 GiB/s pool for four cards, and the AR's floor (step 0, no engine change)
+
 **Topology correction (owner, post-run):** the four cards share ONE x16 uplink, bifurcated
 x4 per card. The ~7.8 GiB/s pool is the d2d (peer round-trip through the root) face of that
 link; the h2d face (RAM->card tier streaming) can use the whole x16 concurrently
@@ -2420,7 +2421,6 @@ link; the h2d face (RAM->card tier streaming) can use the whole x16 concurrently
 CONTEND: tier fill and the AR compete for the same silicon, which is Finding 2's queueing
 seen from the other side. Utilization arithmetic must use the right face per flow: streaming
 wall = bytes / (h2d face x util), AR wall = bytes / (~8.6 GiB/s d2d face), not one pool.
- (step 0, no engine change)
 
 Scope (reviewer, mid-run): **TP=4 is dropped**. The target is PP=2 + true TP=2 — 2 stages × 24 layers, every
 expert sharded 2-way, attention head-split. Quarter-width / 640-sliceability analysis and the 4-deep
@@ -2590,4 +2590,4 @@ rule and needs the PPL/KLD gate, not just greedy identity.
 - `--bg-blobs` is an approximation of a tier fill, not the engine's real ring: the ring's copies are
   O_DIRECT-fed and interleaved with compute. The queue-behind-the-copy-engine result is robust to that; the
   exact 2.4 ms is not a production measurement.
->>>>>>> tp2-tpstep0
+- `--mode ring`/`all2all` measure simultaneous pushes, which is how a ring AR actually behaves.
