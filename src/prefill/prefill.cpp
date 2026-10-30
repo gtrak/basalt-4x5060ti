@@ -2820,6 +2820,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool fused_nat = use_mmq && stream_all && lay.native && fused::native_supported(mmq_gt, mmq_dt);
                     const bool fused_l = (use_mmq && stream_all && !lay.native && fused::enabled()) || fused_nat;
                     bool peer_now = false;                // multi-GPU: the peer computed rows of this layer (MMQ path only)
+                    bool acts_sent = false;               // ... and this layer's activations reached its `P.mixed`
                     int64_t peer_lo = 0, peer_n = 0;      // ... and the block of Dm rows its share filled
                     // CPU share: this layer's CPU experts (rows [T * K - rows_cpu, T * K) of Dm) run on a thread that
                     // reads on_cpu, so the future (which waits for the thread) is declared after it
@@ -2914,6 +2915,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             fp4::quantize_tokens(P.mixed, T, N, N, P.f_a4x, P.f_gsx, ps);
                             m.tm.pmark(tl, ChunkTiming::kPQuant, ps);
                             cudaSetDevice(prevd);
+                            acts_sent = true;   // the peer's products below read the plane this copy wrote
                         }
                         // group the (token, k) pairs by expert on the host
                         // (the sync below also orders this layer's writes of slot/src/bounds after the previous
@@ -3195,6 +3197,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             PeerPrefill& P = *ppc;
                             if (!fp4_l) {
                                 err = "prefill: the peer's share of a streamed chunk needs the FP4 experts";
+                                return false;
+                            }
+                            if (!acts_sent) {   // its rows would be products of whatever an earlier layer left there
+                                err = "prefill: the peer was given a layer whose activations were not sent";
                                 return false;
                             }
                             // the peer's experts' rows, relative to its block, in pieces of at most G rows
