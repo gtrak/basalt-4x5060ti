@@ -43,14 +43,14 @@ pre-existing `expert_multi_test` (no AVX512-VNNI/VBMI here); boundary and stderr
 GPU numbers stay **TODO-for-the-window**.
 
 **Two gated boots refused, both for pack reasons, and the second read as the first.** The projections carry no
-canonical bytes here (native Q6_K/Q8_0 images only), so every figure built from the planes was 0, and the arm's
-resident projections had never been written; both fixed and priced from the pack (ledger §2k). The next boot then
-refused `blk.27.attn_output.weight ... cannot be cut at column 0 of 6144 (group 32, native 0 B)` on CUDA1 and the
-same on `blk.3` on CUDA2 — each card dying on the OTHER stage's first QSA layer. `qsa_pair_prepare` packed
-`[0, n_layers)` while a stage's table holds only its own layers' projections (`NativeDense` loads inside
-`set_layer_range(st.lo, st.hi)`): out-of-stage layers have neither form, 0 bytes, refusal. The pair now packs and
-prices `[lb, le)`, and an unprepared layer stays `!ok` and refuses rather than reading another stage's columns.
-The window's boots printed the arm line on both stage leads: 116 MiB held back, 12/24 heads, staging 8192x2560.
+canonical bytes here (native Q6_K images only, on all four projections and every QSA layer), so every figure built
+from the planes was 0, and the arm's resident projections had never been written; both fixed and priced from the
+pack (ledger §2k). The next boot then refused
+`blk.27.attn_output.weight ... cannot be cut at column 0 of 6144 (group 32, native 0 B)` on CUDA1 and the same on
+`blk.3` on CUDA2 — each card dying on the OTHER stage's first QSA layer. `qsa_pair_prepare` packed `[0, n_layers)`
+while a stage's table holds only its own layers' projections (`NativeDense`'s per-stage `set_layer_range`): out-of-
+stage layers have neither form, 0 bytes, refusal; the pair now packs its `[lb, le)` and an unprepared layer stays
+`!ok`. The window's boots printed the arm line on both stage leads: 116 MiB held back, 12/24 heads, 8192x2560 staging.
 
 **Landed since**: `span_valid` with its catch-up, invalidation sites and the `kv_span_import` gather (case 11); the
 **(c) tier reserve** (pinned symmetric cut, refusal naming both figures); the **all-reduce timeout fix**

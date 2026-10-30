@@ -277,23 +277,25 @@ untouched.
 The first `--exp tp_prompt_attn=1` boot priced the tier and refused: `the pack gave no figure for the partner's
 projections or attn_output columns`. Its dense-index rows say why - `blk.3.attn_{q,k,output}.weight` is
 `kind 0, dst_bytes 0, codes_bytes 0, scales_bytes 0, group 32`: F32 metadata with no canonical bytes, served from
-the pack's GGUF section. `meta.tensors` gives the forms - `attn_q`/`attn_k`/`attn_output` **Q6_K**, `attn_v`
-**Q8_0**, the four RMS norms **F32** - so `bytes` is 0 and every figure built from the planes was 0; the only bytes
-these tensors have are their native images. Cut and price those instead (`core::qsa_native_bytes`,
-`qsa_weight_has_planes`), and Q6_K's 210 B per 256 values give what the tier now holds:
+the pack's GGUF section. `meta.tensors` gives the form - `attn_q`/`attn_k`/`attn_v`/`attn_output` **all Q6_K on all
+twelve QSA layers** (from the pack's metadata, not remembered), and the four RMS norms **F32** (q/k 256 floats, the
+indexer's 128) - so `bytes` is 0 and every figure built from the planes was 0; the only bytes these
+tensors have are their native images. Cut and price those (`core::qsa_native_bytes`, `qsa_weight_has_planes`), and
+Q6_K's 210 B per 256 values give what the tier now holds:
 
-    q_row_bytes 2100 (Q6_K, ne1 2560); kv_row_bytes 2100 K, Q8_0's row for V
+    q_row_bytes 2100 (Q6_K, ne1 12288->rows)   kv_row_bytes 2100, shared by K and V because the pack is uniform
     attn_output image 12 902 400 B (the pack's own metadata figure); one card's columns 6 451 200 B a layer
     resident projections 6 x (6144x2100 + 256x2100 + 256x2100 + norms) = 80.0 MiB; TOTAL ~2.01 GiB (12.7% of carve)
 
-Next to it, the reason the refusal was the good outcome: the arm's `qs.wq/wk/wv/wqn/wkn/wiqn/wikn` were allocated,
-priced into the tier and read by `peer_qsa_layer` - and nothing had ever written them. `peer_qsa_resident_up`
-copies them off the lead's card at boot and checks each layer's own type and row width against the figures the span
-was priced from, since the sizer reads one QSA layer and multiplies. Pinned by `tp2_shard_weights_test`.
+That uniformity is what lets one `kv_row_bytes`/`kv_type` stand for both KV projections; `peer_qsa_resident_up`
+checks each layer's own type and row against those figures at boot, so a pack that split K from V - or one QSA layer
+from another - is a refusal naming them, not a copy wider than its buffer. The same function is the answer to the
+second hole of this class: the arm's `qs.wq/wk/wv/wqn/wkn/wiqn/wikn` were allocated, priced into the tier and read
+by `peer_qsa_layer`, and **nothing had ever written them** - the first gated prompt would have multiplied whatever
+`cudaMalloc` returned.
 
 And the range, because the tier figure above depends on it: a stage's table holds its OWN layers' projections only
 (`NativeDense` loads inside `set_layer_range(st.lo, st.hi)`), so `qsa_pair_prepare` and its sizer twin
-`qsa_pair_bytes` take `[lb, le)`. Asked for the whole model, the other stage's layers price 0 and the prepare
-refuses - the second boot's `blk.27 ... native 0 B` on CUDA1 and `blk.3` on CUDA2, each card naming the other's
-first QSA layer. `peer_qsa_span_test` pins that a stage table prices 6 x 6 451 200 B over its range, 0 over the
-other's, and the same figure over the whole model - which is what lets `lead_qsa_bytes` reserve conservatively.
+`qsa_pair_bytes` take `[lb, le)`. Asked for the whole model the other stage's layers price 0 and the prepare refuses
+- the second boot's `blk.27 ... native 0 B` on CUDA1 and `blk.3` on CUDA2, each naming the other stage's first QSA
+layer. `peer_qsa_span_test` pins a stage table at 6 x 6 451 200 B over its range and 0 over the other's.
