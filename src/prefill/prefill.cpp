@@ -1940,7 +1940,7 @@ static void peer_layout(PeerPrefill& pp, int64_t Tp, int64_t tf, const MmqPlan& 
 /// partner's expert tier leaves free is produced by the same code as the allocation that fills it, so a boot
 /// cannot pass sizing and then fail here.  `parts`, when given, gets the per-group figures for the boot line.
 struct PeerQsaParts {
-    uint64_t span = 0, wire = 0, scratch = 0, weights = 0, gemm = 0;
+    uint64_t span = 0, wire = 0, scratch = 0, weights = 0, gemm = 0, o_cols = 0;
     /// How many separate allocations the walk made.  The test pins it to the expected count, because the bytes
     /// alone do not catch a tensor taken once where it should be taken once a QSA layer: the first version of
     /// this priced six copies and allocated one, and the figure looked right.
@@ -2057,6 +2057,13 @@ void peer_qsa_layout(PeerPrefill::Qsa& qs, int64_t T, Take&& take, PeerQsaParts*
     qs.gscratch = (uint16_t*) take((size_t) GEMM_SCRATCH * 2);
     qs.gws = take(GEMM_WS);
     tmp.gemm = ((uint64_t) GEMM_SCRATCH * 2 + 255) / 256 * 256 + ((uint64_t) GEMM_WS + 255) / 256 * 256;
+
+    // The o_proj half: this shard's columns of `attn_output`, PACKED because a column slice of a blocked weight
+    // is not a pointer.  They are priced here and ALLOCATED by `qsa_pair_prepare` on this card, which is why the
+    // walk takes no pointer for them - but the tier still has to leave the room, or the boot that gets as far as
+    // the arm dies in an allocation the reserve was sized to exclude.  Priced from the caller's pack figure the
+    // same way the projections are: no figure, nothing.
+    if (sp.o_col_bytes > 0) tmp.o_cols = (uint64_t) nl * (((uint64_t) sp.o_col_bytes + 255) & ~uint64_t(255));
 
     if (parts) *parts = tmp;
 }
@@ -2264,7 +2271,7 @@ int64_t Prefill::PeerQsaSpan::n_qsa_layers() const {
 }
 
 void Prefill::PeerQsaSpan::bytes(int64_t T, uint64_t* span, uint64_t* wire, uint64_t* scratch, uint64_t* weights,
-                                 uint64_t* gemm, uint64_t* total) const {
+                                 uint64_t* gemm, uint64_t* o_cols, uint64_t* total) const {
     // The counting path of the ONE walk `make_peer` allocates through (`peer_qsa_layout`): the tier's reserve and
     // the partner's allocation are produced by the same code, which is the whole reason the boot cannot be sized
     // for one amount and then fail to allocate another.
@@ -2280,7 +2287,8 @@ void Prefill::PeerQsaSpan::bytes(int64_t T, uint64_t* span, uint64_t* wire, uint
     if (scratch) *scratch = p.scratch;
     if (weights) *weights = p.weights;
     if (gemm) *gemm = p.gemm;
-    if (total) *total = p.span + p.wire + p.scratch + p.weights + p.gemm;
+    if (o_cols) *o_cols = p.o_cols;
+    if (total) *total = p.span + p.wire + p.scratch + p.weights + p.gemm + p.o_cols;
     m_takes_ = p.takes;   // diagnostics; independent of which out-params the caller asked for
 }
 
@@ -2320,7 +2328,7 @@ uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_r
     // null, or the gate closed, adds nothing and the partner's tier is what it was before the slice existed.
     if (qsa) {
         uint64_t tot = 0;
-        qsa->bytes(Tp, nullptr, nullptr, nullptr, nullptr, nullptr, &tot);
+        qsa->bytes(Tp, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &tot);
         sum += tot;
     }
     return sum;

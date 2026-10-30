@@ -243,8 +243,10 @@ Still missing, and the gate still refuses at `Prefill::set_peer` with the messag
 ## Where the arithmetic lives
 
 The byte ledger, the funding figure, the span catch-up pricing and the filed predictions are in
-**`progress-tp2slice-ledger.md`** (§1 corrections, §2 the mix, §2b the catch-up, §2c/§2d the sizing rulings, §3
-the predictions and their re-basing). They were split out to keep each file under the project's 300-line cap.
+**`progress-tp2slice-ledger.md`** (§1 corrections, §2 the mix, §2b the catch-up, §2c/§2d the sizing rulings, §2f
+the funding bug, §2i the o_proj funding, §3 the predictions and their re-basing). The kernel side of the work —
+every hardcoded head count found, fixed and parity-tested — is in **`progress-tp2slice-kernels.md`**. Split to
+keep each file under the project's 300-line cap.
 The headline figures, restated so this file is usable on its own:
 
     wire traffic   104.9 MB a QSA layer        both modes; what the +10/+20 gates grade

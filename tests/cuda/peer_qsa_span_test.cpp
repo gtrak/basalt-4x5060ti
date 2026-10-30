@@ -44,10 +44,11 @@ Prefill::PeerQsaSpan span_for(int64_t lb, int64_t le, int64_t lead_heads, int ra
 }
 
 uint64_t part(const Prefill::PeerQsaSpan& s, int which) {
-    uint64_t a = 0, b = 0, c = 0, w = 0, g = 0, t = 0;
+    uint64_t a = 0, b = 0, c = 0, w = 0, g = 0, o = 0, t = 0;
     s.bytes(T, which == 0 ? &a : nullptr, which == 1 ? &b : nullptr, which == 2 ? &c : nullptr,
-            which == 3 ? &w : nullptr, which == 4 ? &g : nullptr, which == 5 ? &t : nullptr);
-    return which == 0 ? a : which == 1 ? b : which == 2 ? c : which == 3 ? w : which == 4 ? g : t;
+            which == 3 ? &w : nullptr, which == 4 ? &g : nullptr, which == 5 ? &o : nullptr,
+            which == 6 ? &t : nullptr);
+    return which == 0 ? a : which == 1 ? b : which == 2 ? c : which == 3 ? w : which == 4 ? g : which == 5 ? o : t;
 }
 
 // The ledger's "MB" are 10^6 bytes (how the wire figures are quoted) and its "GiB" are 2^30 (how the tier
@@ -58,16 +59,16 @@ constexpr double GiB = 1024.0 * MiB;
 
 void test_gate_closed() {
     const Prefill::PeerQsaSpan off = span_for(0, 24, 12, 1, /*on=*/false);
-    CHECK(part(off, 5) == 0);
+    CHECK(part(off, 6) == 0);
     CHECK(part(off, 0) == 0);
     // a span the caller never turned on must not shrink a tier
     const Prefill::PeerQsaSpan bad = span_for(0, 24, 12, 1);
     Prefill::PeerQsaSpan no_geom = bad;
     no_geom.g = nullptr;
-    CHECK(part(no_geom, 5) == 0);
+    CHECK(part(no_geom, 6) == 0);
     Prefill::PeerQsaSpan no_shard = bad;
     no_shard.heads = QsaHeadShard{};
-    CHECK(part(no_shard, 5) == 0);
+    CHECK(part(no_shard, 6) == 0);
 }
 
 void test_layer_count() {
@@ -144,7 +145,7 @@ void test_wire_is_the_filed_mix() {
 
 void test_total_is_the_sum_of_parts() {
     const Prefill::PeerQsaSpan s = span_for(0, 24, 12, 1);
-    const uint64_t a = part(s, 0), b = part(s, 1), c = part(s, 2), t = part(s, 5);
+    const uint64_t a = part(s, 0), b = part(s, 1), c = part(s, 2), t = part(s, 6);
     CHECK(t == a + b + c + part(s, 3) + part(s, 4));   // every term, so none can go unpriced
     CHECK(a > 0 && b > 0 && c > 0);
     // the span dominates, and it is the term the partner's tier pays for the slice: 6 QSA layers of KV + indexer
@@ -161,7 +162,7 @@ void test_total_is_the_sum_of_parts() {
     CHECK((double) a / GiB > 1.6 && (double) a / GiB < 1.85);
     // the shipped boot: --kv int8, which is what RUN 25's adopted ~1.0 GiB figure prices
     qsa_set_kv_int8(true);
-    const uint64_t i_a = part(s, 0), i_t = part(s, 5);
+    const uint64_t i_a = part(s, 0), i_t = part(s, 6);
     qsa_set_kv_int8(false);
     CHECK(i_a < a);   // int8 really did narrow it; a format the sizer ignored would fail here
     CHECK(i_t == i_a + b + c + part(s, 3) + part(s, 4));
@@ -194,7 +195,7 @@ void test_resident_projections_are_priced() {
     CHECK(part(s, 3) == 6ull * per_layer);
     // the allocation COUNT, not just the bytes: span 6 + wire 4x2 + scratch 8 + weights 7x6 + gemm 2.  A tensor
     // taken once instead of once a layer keeps the byte figure correct and this number wrong.
-    s.bytes(T, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    s.bytes(T, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     // one QSA state a layer, four wire buffers a set, ten scratch buffers, seven tensors a layer, two for the
     // partner's own Gemm
     const int expect_takes = 6 /*states*/ + 4 * Prefill::PeerQsaSpan::kWireSets + 10 /*scratch*/ + 7 * 6 + 2;
@@ -212,7 +213,7 @@ void test_resident_projections_are_priced() {
     heavy.q_row_bytes = qrow;
     heavy.kv_row_bytes = kvrow;
     CHECK(part(heavy, 3) > part(s, 3));
-    CHECK(part(heavy, 5) > part(s, 5));   // and the tier figure carries it, one honest number
+    CHECK(part(heavy, 6) > part(s, 6));   // and the tier figure carries it, one honest number
     // residency, not traffic: the projections do not grow with the chunk length or the context, only the span
     // does -- which is what makes them a boot-time cost rather than a per-layer one
     Prefill::PeerQsaSpan twice = s;
@@ -222,10 +223,50 @@ void test_resident_projections_are_priced() {
     // the selection-width buffers scale with the CHUNK, not the context: a shorter chunk is less scratch
     Prefill::PeerQsaSpan short_chunk = s;
     const uint64_t long_scratch = part(short_chunk, 2);
-    uint64_t a2 = 0, b2 = 0, c2 = 0, w2 = 0, g2 = 0, t2 = 0;
-    short_chunk.bytes(T / 2, &a2, &b2, &c2, &w2, &g2, &t2);
+    uint64_t a2 = 0, b2 = 0, c2 = 0, w2 = 0, g2 = 0, o2 = 0, t2 = 0;
+    short_chunk.bytes(T / 2, &a2, &b2, &c2, &w2, &g2, &o2, &t2);
     CHECK(c2 < long_scratch);
     CHECK(a2 == part(short_chunk, 0));   // the span is cells, not tokens: unchanged
+}
+
+void test_o_cols_and_types_are_funded() {
+    // The o_proj half of the partner's arm: its columns of attn_output, PACKED, because a column slice of a
+    // blocked weight is not a pointer.  qsa_pair_prepare allocates them on the partner's card, so nothing in the
+    // walk takes a pointer for them - which is exactly why they need their own priced part.  An unfunded copy
+    // is not a slow boot, it is an allocation failure at the first gated prompt, or an o_proj reading a buffer
+    // that was never reserved.
+    const int64_t qrow = 1280, kvrow = 1280, ocol = 3200;   // a Q2_0-class row, and one layer's packed columns
+    Prefill::PeerQsaSpan s = span_for(0, 24, 12, 1);
+    s.q_row_bytes = qrow; s.kv_row_bytes = kvrow;
+    // unset means the pack was never consulted: priced as nothing, not as a guessed block layout
+    CHECK(s.o_col_bytes == 0);
+    CHECK(part(s, 5) == 0);
+    CHECK(s.q_type == -1 && s.kv_type == -1 && s.o_type == -1);   // the arm reads these; unset must not look set
+
+    s.o_col_bytes = ocol;
+    const uint64_t per_layer = (ocol + 255) & ~uint64_t(255);      // rounded the way every other part is
+    CHECK(part(s, 5) == 6ull * per_layer);
+    // it is a real part of the tier figure, not a footnote: the total moved by exactly the columns
+    const uint64_t without = [&] { Prefill::PeerQsaSpan x = s; x.o_col_bytes = 0; return part(x, 6); }();
+    CHECK(part(s, 6) == without + 6ull * per_layer);
+    CHECK(part(s, 0) + part(s, 1) + part(s, 2) + part(s, 3) + part(s, 4) + part(s, 5) == part(s, 6));
+
+    // packed columns are per QSA layer, and narrower for a card that runs fewer heads - the byte figure has to
+    // follow the shard the way every other part does
+    Prefill::PeerQsaSpan narrow = span_for(0, 24, 20, 1);   // the partner takes 4 heads, not 12
+    narrow.o_col_bytes = ocol / 3;
+    CHECK(part(narrow, 5) < part(s, 5));
+    // and it is residency, not traffic: a longer context or a shorter chunk does not move it
+    Prefill::PeerQsaSpan twice = s; twice.max_cells = max_cells_for_test * 2;
+    CHECK(part(twice, 5) == part(s, 5));
+    Prefill::PeerQsaSpan shorty = s;
+    uint64_t o_short = 0, t_short = 0;
+    shorty.bytes(T / 2, nullptr, nullptr, nullptr, nullptr, nullptr, &o_short, &t_short);
+    CHECK(o_short == part(s, 5));
+    // MiB, not GiB: this prices a SYNTHETIC column size to test the arithmetic, and the real figure comes from
+    // the pack at boot (`qsa_weight_cols_bytes`), where the boot line reports it in the tier's own units
+    std::printf("packed attn_output columns: %.3f MiB over 6 QSA layers at %lld B a layer\n",
+                (double) part(s, 5) / MiB, (long long) ocol);
 }
 
 void test_uneven_ratio_stays_funded() {
@@ -239,13 +280,14 @@ void test_uneven_ratio_stays_funded() {
     // a ratio that is not a whole KV group is still priced (the attention kernels refuse it elsewhere, at
     // qsa_shard_whole_groups, and the sizing must not be the place that silently drops it)
     const Prefill::PeerQsaSpan straddle = span_for(0, 24, 10, 1);
-    CHECK(part(straddle, 5) > 0);
+    CHECK(part(straddle, 6) > 0);
     CHECK(!qsa_shard_whole_groups(straddle.heads));
 }
 
 }  // namespace
 
 int main() {
+    test_o_cols_and_types_are_funded();
     test_gate_closed();
     test_layer_count();
     test_span_tracks_the_session_sizer();

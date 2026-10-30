@@ -1,0 +1,94 @@
+# RUN 25 — the head split in the kernels: what was hardcoded, and what proved it
+
+The companion to `progress-tp2slice-ledger.md` (bytes, funding, predictions). The rule this file exists for:
+**a split is only real where the writer and the reader agree**, so every kernel the partner's arm passes through
+is audited on both sides, not just the ones that read a cache.
+
+## The two kernels the arm needs, found before writing the compute
+
+`split_q_kernel` and `gate_attn_kernel` (`src/prefill/kernels.cu:556-568`) **hardcode 24 query heads**:
+`if (i >= T * 24 * 256) return;` and `qf[t * 24 * 512 + h * 512 + d]`. Everything else the arm calls takes its
+counts as arguments — `rms_rows(x, w, rows, cols, ld, ...)`, `rope(x, T, heads, dim, ld, pos0, ...)`, and
+`qsa_prompt_attn_batch(..., s, ...)` which runs at shard shapes already (proven by case 6 of
+`tests/kernels/tp2_head_split_parity.cpp`, which calls it with `s0`/`s1`). So the head split reached the
+attention kernel and not the two elementwise ones around it.
+
+Two ways to give the partner a shard-width arm:
+
+- **(a) full-width scratch on the partner.** Allocate `Qf`/`q`/`attn`/`attn_h` for 24 heads and reuse the two
+  kernels unmodified. No new kernels, but the partner pays VRAM for heads it does not compute — `Qf` alone
+  doubles — taking scratch from 0.64 to roughly 1.0 GiB and the tier figure from 1.89 to ~2.3 GiB.
+- **(b) shard-width variants of the two kernels.** Two mechanical mirrors of the existing ones, taking the head
+  count and the `Qf` row stride as arguments. Keeps scratch at 0.64 GiB. AGENTS.md is explicit about what this
+  owes: every new kernel gets a parity test (random inputs + real geometry) and a microbench line.
+
+**Taking (b)**, because the head split's premise is that a card does not pay for heads it does not run, and
+`qsa_shard_shapes` exists to narrow exactly this; making the partner reserve 24 heads to save writing twelve lines
+of kernel would contradict the design to save effort. The parity test extends case 6's harness rather than
+inventing a new oracle, and the microbench line goes in the same run's table. If this is judged the wrong trade,
+(a) is the fallback and the tier figure above is the number that changes.
+
+Also settled while reading, and it changes what crosses the wire: **the lead ships its own `steps`** rather than
+the partner recomputing them. They are host-computed per token (`qsa_step_fill` at prefill.cpp:2703) and uploaded,
+they are a property of the chunk's positions rather than of a layer (so one set, not one per wire set), and
+shipping the lead's bits means `width` and `active` cannot disagree between the two cards' selections. Same
+reasoning took the indexer **q** norm off the partner's list: the lead ships `q_idx` already normalized and
+rotated — the exact bits it fed its own block scores — so the selection is the lead's by construction rather than
+by two cards repeating a computation and hoping. The indexer **k** norm stays resident, because the partner's
+append normalizes each cell's raw key by it into a pooled table of its own.
+
+## 2g. The third hardcoded-head site: the cache writer
+
+Found while transcribing the lead's QSA block into the partner's arm, and the most dangerous of the three:
+`kv_append_kernel` took its KV-head count, its `K`/`V` row stride **and both pool row formulas** from a literal 2
+(`dim3(T, 2, 8)`, `K[t * 512 + ...]`, `(page * 2 + kvh) * page_size`, `((pos / page_size) * 2 + kvh) * page_size`).
+A partner holding **one** KV head would have read one head past its own `K`/`V` and written each cell at a
+two-heads-per-page stride into a pool carved one head per page — a corrupted KV cache, which poisons every layer
+after the one that corrupted it and still produces plausible tokens.
+
+It was invisible because the *reader* was already shard-aware: `qsa_prompt_attn_batch` takes `QsaShapes`, which is
+why case 6 passed. A split is only real where both the writer and the reader agree on it, so a head-split audit
+has to cover writers too.
+
+Now `kv_append_nkv(..., nkv)` with `kv_append` = that at the model's `n_head_kv`, so lead and card share one body
+and `prefill.cpp` is untouched. Case 8 compares each card's pools against its KV heads' rows of the whole run's
+pools, in **both** the FP16 and the shipped INT8 layouts — the two take different branches of the kernel and
+share only the row formulas, so a formula error visible in one format but not the other is exactly what a
+single-format test would miss. Bitwise, unaligned `pos0` so the tail block has to land, and the card's `K`/`V`
+built as its own contiguous `[T, nkv, head_dim]` rather than a strided view, because that is what the arm hands it.
+
+Three sites now audited: `split_q`, `gate_attn`, `kv_append`. **Not yet audited**, and the arm will pass through
+each: `native_qsa_indexer_append_batch`, `qsa_block_scores_tc`, `qsa_block_topk`, `rope`, `rms_rows`, `fwht256`.
+The last two take their counts as arguments, so the arm must pass **its own head count and its own `Qf` stride**
+rather than the lead's `24`/`6144` — the same class, in the caller this time.
+
+## 2h. The audit's other three: the selection kernels need no parameterization
+
+The rule says audits cover writers, so the three the arm still passes through were read line by line rather than
+assumed safe. **Result: none of them hardcodes anything on the split axis, and none needs a head-count argument.**
+
+| kernel | what it reads of `QsaShapes` | on a geometry mismatch |
+|---|---|---|
+| `native_qsa_indexer_append_batch` | `idx_dim`, `idx_block`, `n_rot` | **throws** `std::invalid_argument` |
+| `qsa_block_scores_tc` | `idx_dim`, `idx_n_head`, `idx_block` | **returns false**; caller keeps the warp kernel |
+| `qsa_block_topk` | `idx_block`, and `cap` vs `qsa_selection_width` | **exits** with the geometry named |
+
+None names `n_head`, `n_head_kv` or `head_dim` — not in the wrapper and not in any kernel it launches
+(`block_scores_tc`, `block_scores_tail`, `block_topk_reg`, `block_topk_wide`, `block_topk_cluster`, the ref and seg
+variants). The reason is structural, not lucky: **the indexer does not split**, because two of four indexer heads
+would pick a different top-k, so both cards compute the same selection redundantly and every one of these shapes
+stays whole on the partner. `qsa_shard_shapes` narrows `n_head`/`n_head_kv` and nothing else.
+
+So the arm passes `core::qsa_shard_shapes(g, heads)` to all three unchanged, and the failure mode if that claim
+were ever broken is loud in each case — a throw, a refusal that falls back, or an exit naming the geometry. That
+is the property the other three kernels lacked: `kv_append` and friends were silently wrong where these are loud.
+
+The claim these three's safety rests on — the shard shapes keep the indexer whole — is pinned by
+`the_indexer_stays_whole()` in `tests/core/qsa_head_split_test.cpp`, which now also pins `head_dim` and `n_rot`
+staying whole, because the arm hands both straight to `rope` and `rms_rows` where a narrowed value is a wrong
+rotation rather than a crash.
+
+**Audit closed.** Hardcoded-head sites found and fixed: `split_q_kernel`, `gate_attn_kernel`, `kv_append_kernel`.
+Found and cleared as not-applicable: the three above. The remaining exposure is not hidden constants but the
+caller's own arguments: `rope` and `rms_rows` take head count and strides as parameters, so the arm must pass its
+**own** `nq`/`nkv` and its own `Qf` stride (`nq * 2 * head_dim`), never the lead's `24` and `6144`.

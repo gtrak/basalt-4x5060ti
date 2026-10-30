@@ -163,6 +163,19 @@ public:
         /// geometry only, and the block geometry is the pack's, so the figures come from the caller: zero means the
         /// pack was never consulted, and `bytes` prices NO weights rather than inventing a quantization table.
         int64_t q_row_bytes = 0, kv_row_bytes = 0;
+        /// The packed bytes ONE QSA layer's `attn_output` columns occupy for this shard, as the caller read them
+        /// (`qsa_weight_cols_bytes` over `qsa_out_cols`, the same figure `qsa_pair_bytes` sums per layer).  The
+        /// columns are PACKED rather than a pointer because a column slice of a blocked weight is not a slice:
+        /// `tp2_shard_weights.hpp`.  `qsa_pair_prepare` ALLOCATES these on the card that runs the shard, so they
+        /// are priced here but allocated there - and must still be funded, or the tier leaves no room for a copy
+        /// the partner's o_proj cannot run without.  Zero: the pack was never consulted, and nothing is priced.
+        int64_t o_col_bytes = 0;
+        /// The pack's GGUF types, as the caller read them from the `WeightRef`s (`attn_q`, `attn_k`/`attn_v`,
+        /// `attn_output`).  The walk's row bytes say HOW BIG a row is; the product needs to know how to READ it -
+        /// `Gemm::native` takes the type beside the pointer, and `verify.cpp`'s decode shard carries
+        /// `wo->native_type` for exactly this reason.  Negative means unset, and the arm refuses to project
+        /// rather than assume a quantization the pack never stated.
+        int q_type = -1, kv_type = -1, o_type = -1;
         /// How many allocations the last `bytes()` call walked.  Diagnostics for the sizing test, which pins it:
         /// the byte figures alone do not catch a tensor taken once where it should be taken once a QSA layer.
         mutable int m_takes_ = 0;
@@ -178,8 +191,9 @@ public:
         /// `wire` reports the RESIDENT bytes (`kWireSets` sets); one set is the per-layer traffic figure.
         /// `weights` is the resident shard copies of the projections and the q/k norms, `gemm` the partner's own
         /// dequant scratch and cuBLAS workspace.  Any of them may be null.
+        /// `o_cols` is the packed `attn_output` columns, priced here and allocated by `qsa_pair_prepare`.
         void bytes(int64_t T, uint64_t* span, uint64_t* wire, uint64_t* scratch, uint64_t* weights,
-                   uint64_t* gemm, uint64_t* total) const;
+                   uint64_t* gemm, uint64_t* o_cols, uint64_t* total) const;
         /// One set of the wire: the bytes a QSA layer actually moves across the pair's link, which is what the
         /// ledger prices and what the +10/+20 gates are graded against.
         uint64_t wire_one_set(int64_t T) const;
