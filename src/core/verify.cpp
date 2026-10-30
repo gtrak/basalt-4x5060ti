@@ -593,8 +593,12 @@ void Verifier::diag(std::FILE* f) const {
     if (dm_ != nullptr) std::fprintf(f, "  %s\n", dm_note().c_str() + 2);
 }
 
-// The peer's QSA attention item: the half of the decode head split that runs inside the peer's persistent window.
-// It does not exist yet; TP2PP2-NOTES run 17 carries its spec.  The flag refuses at init until it lands.
+// The peer's QSA attention item for the DECODE window: the half of the decode head split that runs as an item of
+// the peer's persistent `dm_peer_kernel`, specced in TP2PP2-NOTES RUN 17.  It does not exist yet, so
+// `--exp decode_headsplit=1` refuses at init: the lead's shard alone would leave `dec_moe_mix_combine` waiting a
+// done-word nothing raises, and decode would stop being collective-free (RUN 24 review #5 verdict 2).
+// This is the DECODE gate only.  The prompt path's peer attention is a different seam and a different flag
+// (`--exp tp_prompt_attn`, refused in `Prefill::set_peer`); arming one must never arm the other.
 static bool qhs_peer_item() { return false; }
 
 bool Verifier::dm_init(std::string& err) {

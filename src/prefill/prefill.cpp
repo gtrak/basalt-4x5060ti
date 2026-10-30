@@ -2089,6 +2089,20 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
     // kernels, for as long as that round trip is the cheaper side of the pair's link (PeerLink): PeerPrefill::T_fp4.
     // Those bytes cross the same way when the pair has peer access, and through pinned host buffers when it does not.
     if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
+    // `--exp tp_prompt_attn`: the partner's half of the prompt QSA attention (TP2PP2-NOTES RUN 22 Ruling B, RUN 25).
+    // The peer's half needs four things that do not exist yet - the peer's QSA leg beside prefill.cpp's own, the
+    // partner's KV span and indexer pooled table funded from its expert tier, the per-turn span catch-up for the
+    // cells the lead appended while the peer was out of the loop (decode, prefix reuse), and the o_proj partial's
+    // reduce-to-lead.  Half an attention with no error and plausible tokens is the failure this branch refuses
+    // everywhere else (RUN 17), so the flag refuses here until all four land.  The gate is the prompt path's only:
+    // it never arms the decode head split, whose own refusal lives in verify.cpp's `qhs_peer_item`.
+    const double prompt_attn = core::exp_flag("tp_prompt_attn", 0.0);
+    if (prompt_attn != 0) {
+        err = "prefill peer: --exp tp_prompt_attn=" + std::to_string(static_cast<int>(prompt_attn)) +
+              " is refused: the peer's prompt-attention leg is not built (no peer QSA arm, no partner KV span, no "
+              "span catch-up, no o_proj reduce-to-lead); the lead runs the whole attention";
+        return false;
+    }
     const int64_t ne = m.g ? m.g->n_expert : basalt::kernels::cpu::expert_layout().n_expert;
     const int64_t lb = stage_lb_, le = stage_le_ < 0 ? (m.g ? m.g->n_layers : 0) : stage_le_;
     // The RAM band, priced at the longest chunk the partner could be given; `--peer-ram-rows` off, or a placement
