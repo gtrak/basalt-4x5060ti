@@ -1668,3 +1668,121 @@ BF16 + per-stage re-pricing (`89190c7e` + `0a941f88`), merged with the decode he
 - Decode canary: acc 61-65% (in the 53-67% band), solo 78.3 t/s, hit 94.6% — parity holds under BF16.
 - Next lever: the peer stragglers (phase-separated link scheduling: RAM-band compute first, P2P return
   streamed behind VRAM-band compute) target the 18-40 ms per layer.
+
+## RUN 19 — the peer's window, phase-separated: RAM band first, activations when they are written (unmeasured)
+
+Targets run 18's remaining wall, the per-layer peer straggler (18.0 ms stage A, 40.1 ms stage B). Two commits,
+each one lever, each revertable on its own. Nothing here was measured: this worktree has no pair, so every number
+below is a prediction for the reviewer to confirm or kill.
+
+### What the code actually did (read before changing it)
+
+- **The result-row return was already per group**, not end-of-window: the peer's group loop records
+  `PeerPrefill::ev_grp[g2 % kGrpEv]` on its compute stream `P.s` after that group's products, `P.s_out` waits that
+  event and immediately copies the group's rows (`P.row_dst(m.Dm, rows_local, r0)`, `back = nr * P.row_bytes()`);
+  `kPRowsA` is marked at `g2 == 0` and `kPRowsB` after the last. So task item (b) needed no change - the rows of a
+  group leave as soon as that group is done.
+- **The peer's group order was plain expert-id order.** `order_peer` was built ascending over the experts the split
+  gave the peer, and the peer walked it group by group. The RAM band (`ram_take`, `PeerRamShare::taken`, one expert
+  in `kDen`) is spread through the ids, so with the band on, *every* group mixed experts whose blob the peer must
+  read off its own host link with experts whose blob is already in its tier: each group stalled on the downlink
+  while `s_out` was pushing the previous group's rows over the pair's link. Not banded - the review's premise held.
+- **The peer's window started after the lead's whole row split.** The acts' copy was issued at the `kPeerEnq` site,
+  waiting on `PeerPrefill::ev_in` recorded on the lead's stream there - i.e. after the router projection, the shared
+  expert, the `cudaStreamSynchronize` that reads the routing back, the counts/offsets/slot/src loops and the lead's
+  own activation quantize. The acts themselves are produced earlier, by `up_mix` at the top of the FFN half.
+
+### Change 1 (`2769e354`) - the peer runs its RAM band first, its tier-resident experts after
+
+`order_peer` is put RAM-band-first (`peer_reads_it_from_ram`, one predicate now shared by the split, the order and
+the ring walk) and the peer's rows in `Dm` are laid out in that order, so each group's rows stay contiguous. The
+lead's own `order` is untouched. Invariants that had to survive:
+
+- ids stay **ascending inside each half**, because the ring walk claims entries as it walks (`p_release_to(e)`,
+  `p_cur` monotone) and waits one copy per group on the highest entry claimed in it (`p_hi`). Band half first, then
+  the tier half, each ascending: both hold.
+- the peer's issuer thread is paced by `p_consumed = min(p_cur, p_hold)` with `kRing` = 48 slots; in-flight entries
+  are bounded by two adjacent groups (<= 2 x `fp4::kMaxExperts`) either way, so no new stall or spread path. With
+  the band claimed up front, `p_cur` reaches the layer's end early and the issuer runs ahead into the **next**
+  layer's blobs during this layer's tier-resident phase.
+- with the band off (`--peer-ram-rows`, or a placement with no band) every peer expert is tier-resident, the sort is
+  a no-op, and the order is the id order it has always been.
+- **bitwise neutral**: which experts share a `fp4::run_experts` run changes `max_rows`, the grid shape and the tile
+  padding, but a row's codes and its down-product chain over K are its own (`quantize_kernel` is one warp per row;
+  `plan_kernel` only moves where a row is stored, and the down product reads it back through the same `tile_off`),
+  and the combine still sums a token's rows in `k` order. Same bits; only the physical row order inside the peer's
+  block of `Dm` changes, and every reader derives it from `m.off`.
+
+### Change 2 (`079c8c25`) - the activations cross when they are written, not after the split
+
+New event `PeerPrefill::ev_act`, recorded on the lead's stream immediately after `up_mix` writes the FFN half's
+mixed rows; the peer's act copy (both the P2P and the host-relay form) and the peer's `fp4::quantize_tokens` of them
+are issued from the top of the host-grouping branch, before the ids' D2H and the host's readback. The peer's
+`P.src`/`P.f_rel` uploads and the whole group walk stay where the split decides them, on the same stream, so they
+are still ordered after the copy.
+
+- **The review's "start it at attention-dispatch time" is not reachable**: the plane the peer receives is
+  `m.mixed`, written by the FFN half's `up_mix`, which consumes `m.R` - the attention half's own output. The acts
+  for layer `l` do not exist until layer `l`'s attention is done, so no amount of early issuing hides `act` under
+  the same layer's attention. What *is* hideable is everything the lead does between the acts existing and the peer
+  being told about them: the router projection, the shared expert, the routing readback and the host-side split
+  (the `kRouter -> kQuant -> kPeerEnq` span). That is what this buys.
+- The buffer lifetimes are unchanged: `m.mixed`'s next write is the next layer's `up_mix`, queued on the lead's
+  stream behind that layer's wait on `ev_done`/`ev_res`, which is recorded after the peer's last group's rows left,
+  which is after its products, which are after this layer's acts copy on `P.s`. Same for the relay's `P.hx` chain
+  (`ev_hx` / `ev_hx_free`). The copy can only start earlier than before, never later.
+- `peer_holds` (per layer: the peer holds one of its experts, or the band leaves one to it) gates the copy, so a
+  layer the peer computes nothing of ships no activations - the copy is never issued for a layer that will not
+  consume it, except the vanishing case where the routing gives every peer-held expert of a layer zero rows.
+- The routed (sub-streaming-floor) MMQ peer leg is untouched: it keeps its own `ev_in` copy at its own site, and the
+  RAM band never rides it. The FP4 leg's fields keep their meaning, with one shift worth knowing when reading the
+  chunk line: the `P.src`/`P.f_rel` uploads used to sit inside `quant` and now sit inside `comp`.
+
+### Predictions (all labelled: development predictions, no pair here, nothing measured)
+
+Baseline: run 18, BF16 return, per-stage pricing, chunk 8192; stage A `act 21.3 quant 0.3 comp 52.3 rows 56.3`,
+`attn 53.9`, `lead-experts 78.1`, `peer-wait 18.0`; stage B `peer-wait 40.1`.
+
+| field (per stage) | change 1 (band first) | change 2 (acts at production) |
+|---|---|---|
+| `act` | unchanged 21.3 | unchanged 21.3 in expectation; may rise a little (the copy now overlaps the previous layer's row return instead of sitting after it) |
+| `quant` | unchanged 0.3 | the two table uploads move out of it, so -0.1 to -0.3 ms |
+| `comp` | stage A -0 to -8 (only ~1 group of 16 is band-heavy at the 1/8 share, so the front-loading is small); stage B -5 to -15 (larger share, larger blob stall) | +0.1 to +0.3 (the uploads land here), otherwise unchanged |
+| `rows` | unchanged to -10%: the last groups are blob-free, so their rows start back as soon as the previous group finishes instead of after a blob wait | unchanged |
+| `peer-wait` | stage A 18.0 -> 13-18; stage B 40.1 -> 28-40 | stage A 18.0 -> 8-14; stage B 40.1 -> 28-36 |
+| t/s at 8192 | within noise of 1905, or +1-3% | +2-5% if `peer-wait` really halves |
+
+Falsifiers, to be read off one boot each:
+
+- change 1 hurts if `peer-wait` **rises** at either stage (the ring cannot keep ahead of a front-loaded band), or
+  if `comp` rises at stage B while `rows` is flat. Revert `2769e354`.
+- change 2 hurts if `act` roughly doubles (the copy then fights the previous layer's row return for the link and the
+  queue got deeper for nothing) or if `peer-wait` does not move at all (the host's split was not on the peer's
+  critical path). Revert `079c8c25`.
+- both together help if `peer-wait` at stage A lands under ~12 and at stage B under ~30 with `rows` no worse than 56.
+
+### Reviewer checklist
+
+1. Fresh boot, run 18's geometry (same packs, tiers pinned, `--peer-ram-rows` on, BF16 wire, chunk 8192; both
+   stages). Quote the chunk line's `act`/`quant`/`comp`/`rows` and `peer-wait` per stage, plus t/s, and the boot
+   line's band clause (share unchanged - neither commit touches the pricing).
+2. Engagement: `exp_peer` and `exp_peer_ram` non-zero in the chunk summary (if `exp_peer_ram` is 0 the band is off
+   and change 1 is a no-op - say so rather than reporting it as neutral).
+3. Numerics: this is a bitwise-neutral reordering, so the gate is the **greedy-identity check**, not a PPL/KLD run -
+   same greedy text as the run-18 binary on both packs. `docs/precision/` needs no update (no format, accumulation
+   or reduction order changed; `docs/precision/index.md` already states a token's output is bitwise independent of
+   its tile and neighbours). If any doubt remains, `basalt-bench --quality` on the decode path.
+4. Flag paths: `--peer-rows-fp32` unchanged output bits (it shares the ordering code; the permutation is
+   value-neutral); peer absent = no change at all.
+5. Watch for the failure modes named above, and for the peer's issuer thread stalling (`wait_pissued` spinning:
+   a layer whose `comp` rises while its `rows` falls is that signature).
+
+### Not taken, for the maintainer to decide
+
+`act` is 21.3 ms to move 84 MiB of FP32 activations a layer, and the peer then quantizes them to FP4 - while the
+lead has *already* produced those exact FP4 token planes for its own leg (`fp4::quantize_tokens(m.mixed, ...)`).
+Shipping the planes instead of the acts (10.5 MiB + 32 KiB at 8192 tokens, bitwise the bytes the peer computes
+today) would cut `act` roughly 8x and delete `quant`. It is not in this run because it changes what crosses the
+link, the peer's staging reserve (`peer_bytes`, `peer_layout`) and the relay's buffer sizing - a new decision, not
+a scheduling one. It is the biggest remaining item on the peer's critical path if the two changes here leave
+`act` where it is.
