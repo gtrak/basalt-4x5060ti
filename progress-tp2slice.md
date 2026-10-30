@@ -36,25 +36,22 @@
 
 **The gate is open at 1.** `--exp tp_prompt_attn=1` arms the prompt-attention slice at `Prefill::set_peer`; 0
 (the default) leaves the path byte-identical — the flag is read once, on the peer arm's setup, and no other code
-observes it. It is the prompt path's only flag: `qhs_peer_item()` in `src/core/verify.cpp` still returns false
-(decode's window item, RUN 17's spec, still unbuilt; `--exp decode_headsplit=1` still refuses), so the two seams
-cannot be confused — the seam the RUN 24 brief pointed at for the prompt gate was decode's.
+observes it. It is the prompt path's only flag: decode's seam (`qhs_peer_item()`, §4) stays shut, so the two gates
+cannot be mistaken for one another.
 
 Gates, current: build green under `-j4`; `ctest -L cpu` **68/69** with the count verified at 69 — only the
-pre-existing `expert_multi_test` (this CPU lacks AVX512-VNNI/VBMI); boundary and stderr-logging checks ok.
-`:8000` never contacted, no engine started, decode paths untouched. GPU numbers below stay
-**TODO-for-the-window**.
+pre-existing `expert_multi_test` (no AVX512-VNNI/VBMI here); boundary and stderr checks ok. `:8000` never contacted,
+no engine started, decode untouched; GPU numbers stay **TODO-for-the-window**.
 
-**Built along the way** — detail in `progress-tp2slice-kernels.md`: the arm's container and its sizing walk, the
-resident projections and the partner's own `Gemm`, the shard-width kernels (`split_q_span`, `gate_attn_span`) and
-the shard-aware cache writer (`kv_append_nkv`), the packed `attn_output` column funding and the pack's GGUF types,
-and `peer_qsa_layer()` — the partner's QSA block, through the gate.
+**The first gated boot refused for a pack reason, not a plumbing one:** the projections carry no canonical bytes
+here (native Q6_K/Q8_0 images only), so every figure built from the planes was 0, and the arm's resident
+projections had never been written. Both are fixed and priced from the pack; ledger §2k has the corrected tier.
 
-**Landed since**: `span_valid` with its catch-up, invalidation sites and the `kv_span_import` gather (case 11);
-the **(c) tier reserve** (pinned symmetric cut, `set_peer` refuses a wider split by naming both figures); the
-**all-reduce timeout fix** (`b34904ba`); and **pair bring-up** — `peer_qsa_pair_up()` opens one `Tp2Pair` across
-the stage's two cards sized for a PROMPT partial (`chunk x n_embd`, not the decode shard's `1 x n_embd`) and packs
-`attn_output` columns on BOTH cards, refusing if either card's set is missing on any QSA layer of the stage.
+**Landed since**: `span_valid` with its catch-up, invalidation sites and the `kv_span_import` gather (case 11); the
+**(c) tier reserve** (pinned symmetric cut, refusal naming both figures); the **all-reduce timeout fix**
+(`b34904ba`); and **pair bring-up** — `peer_qsa_pair_up()` opens one `Tp2Pair` across the stage's two cards sized
+for a PROMPT partial (`chunk x n_embd`, not the decode shard's `1 x n_embd`) and packs `attn_output` columns on
+BOTH cards, refusing if either card's set is missing on any QSA layer of the stage.
 
 **LANDED (`b4cc1f70`, `e786401c`): the serialized slice runs.** (a) `peer_qsa_publish()` ships the lead's
 `mixed_h` / `q_idx` / `idx_raw` — and the chunk's step counts once — into the wire set on the LEAD's compute
@@ -240,9 +237,9 @@ that is the number the window must read rather than assume:
   **TODO-for-the-window:** the chunk-line field must print `span_valid`, cells copied, and the
   copy's wall time, so this is read and not argued.
 
-If that measured term eats the margin, the P3 fallback verdict stands as filed: with a
-peer-resident span the slice cannot pay on this fabric, and peer-reads-the-lead's-pool-over-P2P is
-not the escape — it is ~50 GB a chunk (cap 2048 x 256 dim x 2 B x 8192 queries) and dead.
+If that measured term eats the margin, the P3 fallback verdict stands as filed: with a peer-resident span the
+slice cannot pay on this fabric, and peer-reads-the-lead's-pool-over-P2P is not the escape — ~50 GB a chunk
+(cap 2048 x 256 dim x 2 B x 8192 queries) and dead.
 
 ## Item (2) so far: the arm's container, allocated by the sizing walk itself
 
@@ -257,11 +254,10 @@ on, so the lead's scratch and cuBLAS workspace cannot cross the link), and its o
 same code, not two ledgers kept in step by hand, and the states are carved with `qsa_prompt_state_carve` over an
 allocation of `qsa_prompt_state_bytes`, so the pools cannot come out a different width than the tier was shrunk by.
 
-**The arm today:** `peer_qsa_layer()` has its caller (the lead, per QSA layer) and waits on the publish before it
-reads the wire; its o_proj product lives in `peer_qsa_finish()`, beside the pair's collective, since both need the
-packed columns. The head-split audit is closed: `split_q`, `gate_attn`, `kv_append` fixed; the selection kernels
-cleared. Still unexecuted: the pair opening across two physical GPUs, the publish landing, the reduce summing and
-the chunk-line verdicts — **TODO-for-the-window**, refused rather than degraded.
+**The arm today:** its o_proj product lives in `peer_qsa_finish()`, beside the pair's collective, since both need
+the packed columns. The head-split audit is closed: `split_q`, `gate_attn`, `kv_append` fixed; the selection
+kernels cleared. Still unexecuted: the pair opening across two physical GPUs, the publish landing, the reduce
+summing and the chunk-line verdicts — **TODO-for-the-window**, refused rather than degraded.
 
 ## Building this tree after a reboot
 
@@ -280,12 +276,15 @@ A suite of zero passes exactly as well as a suite of sixty-nine.
 ## Where the arithmetic lives
 
 The byte ledger, funding, catch-up pricing and filed predictions are in **`progress-tp2slice-ledger.md`**; the
-kernel side — every hardcoded head count found, fixed and parity-tested — in **`progress-tp2slice-kernels.md`**.
-Headline figures, restated so this file stands alone:
+kernel and arm pieces — container and sizing walk, resident projections (`peer_qsa_resident_up`), the partner's own
+`Gemm`, the shard-width kernels and cache writer, the packed `attn_output` column funding, `peer_qsa_layer()`, and
+every hardcoded head count found, fixed and parity-tested — are in **`progress-tp2slice-kernels.md`**. The
+headline figures, restated so this file stands alone:
 
     wire traffic   104.9 MB in a QSA layer    what the +10/+20 gates grade; the RETURN leg is FP32 today
                                               (83.9 MB, not the filed 41.9 BF16) -- see the findings above
-    tier reserve   1.89 GiB int8               span 0.96 + wire 0.20 + scratch 0.64 + weights 0.05 + gemm 0.09
+    tier reserve   2.01 GiB int8               span 0.96 + wire 0.20 + scratch 0.64 + weights 0.08 + cols 0.04
+                                              + gemm 0.09
     span copy      <= 0.96 GiB per TURN        zero on a fresh prompt; ~254 ms worst case
     predictions    serialized -2/-4 ms         pipelined +18/+15 ms as an UPPER BOUND (no-extra-eviction)
 
