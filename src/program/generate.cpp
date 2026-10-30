@@ -9107,6 +9107,11 @@ int main(int argc, char** argv) {
                 // a snapshot that cannot be restored is dropped and the prompt read from the start
                 bool restored = basalt::core::conversation_snapshot_restore(*incoming, *rsp,
                         g, mtp_kv, err) == basalt::core::ConversationRestore::restored;
+                // A parked conversation's K/V lands in the session whole, written by nobody's attention and not
+                // through `session_copy_state`, so it is the one resume path the copy sites above cannot see.
+                // The partner holds whatever the previous occupant of this conversation left behind, which is
+                // exactly a span that proves nothing about the cells about to be attended over.
+                for (auto& stg : stages) stg->sp.invalidate_peer_qsa_span("a parked conversation restored");
                 int failed_stage = -1;
                 for (size_t i = 0; restored && i < stages.size(); ++i) {   // the later stages' parts
                     const basalt::core::OnDevice on(stages[i]->dev);
@@ -9623,6 +9628,8 @@ int main(int argc, char** argv) {
                         return false;
                     }
                     basalt::core::prompt_session_clear(st.ss, g, (void*) st.stream);
+                    // The cells this stage's partner pools hold belonged to the session that was just cleared.
+                    st.sp.invalidate_peer_qsa_span("prompt_session_clear");
                 }
                 // a part after the start of the context: each stage's layers' state so far, every cell (after the clear),
                 // all cards at once
@@ -9635,6 +9642,9 @@ int main(int argc, char** argv) {
                                                               [&](void* d, const void* sr, uint64_t nb) {
                                                                   return st->state_in.copy(d, sr, nb, e);
                                                               }, e);
+                        // A prefix reused from another session arrived whole, through nobody's attention: the
+                        // partner never appended these cells, so its span is a claim it can no longer support.
+                        st->sp.invalidate_peer_qsa_span("a stage's state from the main session");
                     }
                     for (PromptStage* st : run) ok = ok && st->state_in.wait(e);
                     if (!ok) {
@@ -9766,11 +9776,16 @@ int main(int argc, char** argv) {
                 auto state_back = [&](int64_t c_end, std::string& ce) -> bool {
                     const auto tc = Clock::now();
                     bool ok = true;
-                    for (PromptStage* st : run)
+                    for (PromptStage* st : run) {
                         ok = ok && basalt::core::session_copy_state(*rsp, st->ss, g, st->l0, st->l1, a0, c_end,
                                                                     [&](void* d, const void* sr, uint64_t nb) {
                                                                         return st->state_back.copy(d, sr, nb, ce);
                                                                     }, ce);
+                        // ... and the way back moves the main session's cells, which is the same doubt from the
+                        // other side: whichever session a prompt resumes from, the partner re-imports rather
+                        // than attends over what the previous one left in its pools.
+                        st->sp.invalidate_peer_qsa_span("a stage's state back to the main session");
+                    }
                     for (PromptStage* st : run) ok = ok && st->state_back.wait(ce);
                     if (!ok) {
                         if (ce.empty()) ce = "prompt split: a stage's state back to the main session";

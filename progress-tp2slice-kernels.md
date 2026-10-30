@@ -144,3 +144,39 @@ exactly like a test that fails on a kernel bug; the only way to tell them apart 
 
 **Status change worth noting: the GPU-labelled parity cases are no longer unrun.** All of cases 1–10 report bitwise,
 including both KV formats. Which means the remaining unverified surface is the run path, not the kernels.
+
+## Step 4: the span's proof, and why decode does not need one
+
+`span_valid` is the number of cells `[0, span_valid)` that the partner's pools and indexer planes provably hold,
+for every QSA layer of its stage. One number for the stage, not one a layer: the layers advance with the sequence
+and are invalidated together, and a per-layer value would only add a way for one layer to be quietly left behind.
+
+It is a **proof, not an estimate**. The partner writes its own cells during a prompt and knows them first-hand;
+what it cannot know is what the lead appended while it was out of the loop. Anything that can move the lead's
+state without the partner appending it drops the number to 0 and the next prompt re-imports — re-importing is
+correct and merely slow, while believing a stale number is the silent-corruption class this branch refuses
+everywhere. `invalidate_peer_qsa_span(why)` names the site on the log line, so a boot that keeps invalidating
+shows up as cost rather than as a mystery.
+
+**Sites that invalidate**: `Prefill::set_session`; `prompt_session_clear`; the state copied *in* from the main
+session; the state copied *back*. **The parked-conversation restore** is the one that is easy to miss —
+`conversation_snapshot_restore` writes K/V directly into a session and goes through neither copy, so the copy
+sites above cannot see it.
+
+**Site that deliberately does not: the end of a decode window.** Decode only ever *appends* cells past everything
+a prompt attended over, so `[0, span_valid)` still holds the lead's bits afterwards and the proof survives; the
+catch-up then imports exactly what decode added. Dropping the span at every window's end would be *safe*, and
+would re-import the whole context on nearly every prompt a server reads, to defend a claim that was never broken.
+If a future change lets decode overwrite rather than append — a rollback in place, a ring that reuses cells — this
+reasoning stops holding and that site becomes necessary.
+
+**The catch-up runs once a turn**, before the first chunk, not once a layer: the gap is a property of the
+sequence, and pricing it per layer would charge for the same bytes six times.
+
+Two things the import refuses rather than approximating: a KV format it cannot represent (q4, rotated, hybrid,
+streamed) and **any disagreement between the two cards' KV format** — the bytes copied are raw, so INT8 codes
+written into an FP16 pool would be a plausible cache of nonsense. It also refuses outright when the lead's states
+or their card were never handed over: importing nothing while reporting the span caught up is the exact failure
+shape this slice keeps hitting, so the run fails instead of degrading. `lead_dev` exists because a peer copy is
+stated as `(dst, dstDev, src, srcDev)` and `QsaState` carries no device of its own — guessing it would make a copy
+read this card's own memory and call it done.

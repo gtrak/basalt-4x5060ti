@@ -216,6 +216,19 @@ public:
     /// The longest routed-only chunk whose rows of its experts the peer computes (0: no peer share).
     int64_t peer_routed_rows_max() const;
 
+    /// Hand the partner the LEAD's QSA states, one per QSA layer of this stage, and the card they live on, so a
+    /// prompt can catch its span up from them.  Borrowed pointers, as `set_ring_remotes` borrows the experts
+    /// another card's cache holds: this Prefill neither owns them nor frees them, and the lead's session must
+    /// outlive every prompt that imports from it.  Drops the span's proof: nothing has been copied by handing
+    /// them over.
+    void set_peer_qsa_lead(std::vector<const core::QsaState*> lead, int lead_dev);
+    /// Forget the proof that the partner's pools hold the lead's cells, so the next prompt re-imports the whole
+    /// span rather than attending over a context that has moved underneath it.  Call it wherever the lead's KV
+    /// or indexer state can change without the partner having appended it itself: a session swap, a prefix
+    /// copied in or back, a cleared prompt session, a park or resume, the end of a decode window.  Cheap and
+    /// idempotent - a no-op with no peer arm or an already-empty span - so the sites err toward calling it.
+    void invalidate_peer_qsa_span(const char* why);
+
     /// The CPU expert pool (idle while a prompt is read). A chunk below stream_all_min() tokens hands it the
     /// non-resident experts with a host copy that few of its tokens route to, instead of streaming them; their rows
     /// go to the tail of Dm unweighted, like the peer's, and the combine weights them. The share is set by

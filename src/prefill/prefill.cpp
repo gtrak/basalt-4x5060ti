@@ -788,6 +788,34 @@ struct PeerPrefill {
         cudaEvent_t ev_in = nullptr;  // the lead published this layer's rows
         cudaEvent_t ev_out = nullptr; // this card's partial has landed for the lead
         bool live = false;
+
+        // The span this card's pools provably hold, in CELLS: [0, span_valid) is present, for EVERY QSA layer of
+        // the stage, in this card's KV pools and the indexer's pooled table.  One number for the whole stage,
+        // because the layers advance with the sequence and are invalidated together - a per-layer value would
+        // only add a way for one layer to be quietly left behind.
+        //
+        // It is a PROOF, not an estimate.  The partner writes its own cells as the prompt runs, so it knows them
+        // first-hand; what it cannot know is what the lead appended while the partner was out of the loop - the
+        // decode window between two prompts, a prefix reused from another session, a park/resume.  Those leave
+        // the partner attending over a stale span and producing plausible tokens, which is the failure this
+        // branch refuses everywhere (RUN 17), so anything that can move the lead's state without the partner
+        // seeing it drops this to 0 and the next prompt re-imports the whole thing.  Re-importing is correct
+        // and merely slower; believing a stale number is neither.
+        int64_t span_valid = 0;
+        // Reported on the chunk line, so a boot that keeps invalidating is visible as cost rather than as a
+        // mystery: the figures say whether the catch-up is being paid for and how often.
+        int64_t imports = 0;            ///< catch-up imports this run
+        int64_t last_import_cells = 0;  ///< cells the last one moved
+        double last_import_ms = 0.0;    ///< its wall time on this card
+        int64_t invalidations = 0;      ///< times the span was dropped
+        const char* last_invalidation = nullptr;   ///< which site dropped it last
+        /// The lead's QSA states, one per QSA layer of this stage, and the card they live on.  Given by the
+        /// engine when it opens the pair, the way `set_ring_remotes` hands over the experts another card holds:
+        /// this Prefill borrows the pointers, it does not own the states or their session.  `lead_dev` is needed
+        /// because a peer copy is stated as (dst, dstDev, src, srcDev) - the state carries no device of its own,
+        /// and guessing it would make a copy read this card's memory and call the span caught up.
+        std::vector<const core::QsaState*> lead_states;
+        int lead_dev = -1;
     } qsa;
 
     cudaStream_t copy = nullptr;            // this card's own host->device copy stream
@@ -1293,7 +1321,40 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
 }
 }
 
-void Prefill::set_session(core::SessionState& ss) { impl_->ss = &ss; }
+void Prefill::set_session(core::SessionState& ss) {
+    // A different session is a different context: whatever this card's pools hold for the old one says nothing
+    // about the new one's cells, so the proof goes before the pointer does - a caller that swaps sessions and
+    // never prompts is left holding 0, which is the safe direction.
+    invalidate_peer_qsa_span("set_session");
+    impl_->ss = &ss;
+}
+
+void Prefill::invalidate_peer_qsa_span(const char* why) {
+    if (impl_->pp == nullptr) return;   // no peer arm: there is no span to doubt, and this runs on every session
+                                        // swap, so it must be a no-op rather than a fault for the vast majority of
+                                        // runs, which never open a pair at all
+    PeerPrefill& P = *impl_->pp;
+    if (why == nullptr) why = "unnamed";
+    // Every site drops the whole span rather than trimming it.  A trim needs to know WHICH cells moved; the
+    // sites that call this are session swaps, prefix copies and a decode window's end, and none of them can say.
+    // Re-importing a context that had not moved costs one copy; importing too little costs correctness.
+    if (P.qsa.span_valid != 0 || P.qsa.last_invalidation == nullptr) {
+        P.qsa.span_valid = 0;
+        ++P.qsa.invalidations;
+        P.qsa.last_invalidation = why;
+        basalt::log::info("basalt", "peer qsa span: invalidated by %s", why);
+    }
+}
+
+void Prefill::set_peer_qsa_lead(std::vector<const core::QsaState*> lead, int lead_dev) {
+    if (impl_->pp == nullptr) return;   // no peer arm to hand them to
+    PeerPrefill& P = *impl_->pp;
+    P.qsa.lead_states = std::move(lead);
+    P.qsa.lead_dev = lead_dev;
+    // Handing over the lead's states is the pair being opened, not the span being established: nothing has been
+    // copied yet, so the span stays empty until a catch-up proves otherwise.
+    P.qsa.span_valid = 0;
+}
 
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
@@ -2202,6 +2263,103 @@ bool peer_qsa_layer(PeerPrefill::Qsa& qs, int64_t li, int64_t wire, int64_t T, i
     return true;
 }
 
+/// Make the partner's pools hold the lead's cells [span_valid, p0), so its arm can attend over the whole
+/// context rather than over the part of it this card happens to have written itself.
+///
+/// Once a turn, not once a layer or once a chunk: the gap is a property of the SEQUENCE (what the lead appended
+/// while this card was out of the loop), and pricing it per layer would charge for the same bytes six times.
+/// Nothing here recomputes or requantizes - the bytes are the lead's, which is the entire point: the partner's
+/// cache must hold the lead's bits, not a value that happens to agree with them.
+///
+/// A no-op when the span is already whole (`span_valid >= p0`), which is the common case for a prompt that
+/// follows its own decode on the same session only when nothing invalidated it - and the cheap case worth
+/// making cheap, because the alternative is moving the context every prompt.
+///
+/// A decode window needs NO invalidation, and that is deliberate rather than an omission: decode only ever
+/// APPENDS cells at positions past everything a prompt attended over, so cells [0, span_valid) are still the
+/// lead's afterwards and the proof still holds.  The gap this function imports then covers exactly what decode
+/// added.  Dropping the span at the end of a window instead would be safe but would re-import the whole context
+/// on every prompt after a decode - which, in a server, is nearly every prompt - to protect a claim that was
+/// never broken.  What DOES break it is a state arriving from elsewhere (a session swap, a prefix copy, a
+/// restored snapshot), and those are the sites that call `invalidate_peer_qsa_span`.
+bool peer_qsa_span_catch_up(PeerPrefill& P, int64_t p0, std::string& err) {
+    PeerPrefill::Qsa& qs = P.qsa;
+    if (!qs.live || !qs.span.on) return true;
+    if (qs.span_valid >= p0) return true;
+    if (qs.span_valid < 0) { err = "peer QSA span: a negative span is not a span"; return false; }
+    if (qs.lead_dev < 0) {
+        err = "peer QSA span: the lead's card was never given to the partner";
+        return false;
+    }
+    if (qs.lead_states.size() != qs.states.size()) {
+        // Without the lead's states there is nothing to import, and importing nothing while believing the span is
+        // whole is precisely the silent-corruption shape this refuses.  Fail the run, do not degrade it.
+        err = "peer QSA span: the lead's QSA states were never given to the partner, so the span cannot be caught up";
+        return false;
+    }
+    const core::ModelGeometry& g = *qs.span.g;
+    // The shapes the states were CARVED with, so the import's page size and indexer block are the same numbers
+    // the sizer used.  Read from the same helper rather than restated: `qsa_prompt_layout` sized these pools
+    // from `s.page_size` and `s.idx_block`, and an import that used a different one would land every cell in
+    // the wrong row while looking entirely reasonable.
+    const basalt::kernels::QsaShapes sh = core::qsa_shard_shapes(g, qs.span.heads);
+    const int nkv = (int) qs.span.heads.nkv();
+    const int64_t c0 = qs.span_valid;
+    const auto t0 = Clock::now();
+    for (size_t i = 0; i < qs.states.size(); ++i) {
+        const core::QsaState& ls = *qs.lead_states[i];
+        const core::QsaState& ps = qs.states[i];
+        if (ps.kv_q4 || ps.kv_hybrid || ps.kv_rot || ps.kv_mode != 0) {
+            err = "peer QSA span: this state's KV format cannot be imported (q4, rotated, hybrid or streamed)";
+            return false;
+        }
+        if (ls.kv_int8 != ps.kv_int8) {
+            err = "peer QSA span: the lead and the partner disagree on the KV format";
+            return false;
+        }
+        if (ls.heads.nkv() <= 0) {
+            err = "peer QSA span: the lead's state records no head shard, so its rows cannot be located";
+            return false;
+        }
+        QsaSpanImport im;
+        im.s_k_pool = ls.k_pool; im.s_v_pool = ls.v_pool;
+        im.s_k_q = ls.k_q; im.s_v_q = ls.v_q; im.s_k_scale = ls.k_scale; im.s_v_scale = ls.v_scale;
+        im.d_k_pool = ps.k_pool; im.d_v_pool = ps.v_pool;
+        im.d_k_q = ps.k_q; im.d_v_q = ps.v_q; im.d_k_scale = ps.k_scale; im.d_v_scale = ps.v_scale;
+        im.s_table = ls.page_table; im.d_table = ps.page_table;
+        im.src_nkv = (int) ls.heads.nkv(); im.dst_nkv = nkv; im.kvh0 = (int) qs.span.heads.kv0();
+        im.page_size = (int) sh.page_size; im.int8_mode = ps.kv_int8;
+        kv_span_import(im, c0, p0, qs.s);
+        // The indexer's planes are head-independent, so unlike the KV pools they may be copied flat.  Only the
+        // blocks the gap covers, and only whole ones: a partial block belongs to the partner's own next append,
+        // which recomputes it, so importing a half-written one would give the two cards different tails.  The
+        // three small tables go whole every time - the tail, the dead key and the single block position are a
+        // few KB and range-tracking them would cost more than it saves.
+        const int64_t b0 = c0 / sh.idx_block, b1 = p0 / sh.idx_block;
+        auto peer_to = [&](void* dst, const void* src, size_t bytes) {
+            if (bytes == 0) return;
+            if (cudaMemcpyPeerAsync(dst, P.dev, const_cast<void*>(src), qs.lead_dev, bytes, qs.s) != cudaSuccess)
+                return;   // the caller's cudaGetLastError check below reports it
+        };
+        if (b1 > b0)
+            peer_to(ps.idx_pooled + (size_t) b0 * sh.idx_dim, ls.idx_pooled + (size_t) b0 * sh.idx_dim,
+                    (size_t) (b1 - b0) * sh.idx_dim * sizeof(float));
+        peer_to(ps.idx_tail, ls.idx_tail, (size_t) (sh.idx_block - 1) * sh.idx_dim * sizeof(float));
+        peer_to(ps.idx_dead, ls.idx_dead, (size_t) sh.idx_dim * sizeof(float));
+        peer_to(ps.idx_block_pos, ls.idx_block_pos, sizeof(int32_t));
+    }
+    cudaEventRecord(qs.ev_out, qs.s);
+    cudaEventSynchronize(qs.ev_out);
+    qs.last_import_ms = ms_since(t0);
+    qs.last_import_cells = p0 - c0;
+    ++qs.imports;
+    qs.span_valid = p0;
+    basalt::log::info("basalt", "peer qsa span: imported %lld cells [%lld,%lld) over %d layers in %.2f ms",
+                      (long long) (p0 - c0), (long long) c0, (long long) p0, (int) qs.states.size(),
+                      qs.last_import_ms);
+    return true;
+}
+
 static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, int64_t tf, bool rows_fp32,
                       bool acts_fp32, const PeerRamShare* ram,
                       std::unique_ptr<PeerPrefill>& out, std::string& err) {
@@ -2759,6 +2917,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     std::string ple_next_err;
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
     int ple_buf = 0;
+
+    // Once per prompt, before the first chunk: the partner's pools must already hold the cells this prompt will
+    // attend over.  It prices the gap between what this card proved it holds and where the prompt starts, which
+    // is what the lead appended while the partner was out of the loop - the decode window since the last prompt,
+    // a reused prefix, a resume.  A no-op when nothing invalidated the span, which is the case worth keeping
+    // cheap; the cost, when it is paid, is on the log line rather than hidden in a chunk's time.
+    if (m.pp != nullptr && m.pp->qsa.live) {
+        if (!peer_qsa_span_catch_up(*m.pp, pos0, err)) return false;
+    }
 
     for (int64_t c0 = 0; c0 < n; c0 += chunk_len(c0)) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
