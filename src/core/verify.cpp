@@ -315,11 +315,16 @@ bool g_commit_async = false;   // see Verifier::set_commit_async
 
 // Every layer's BF16 router [n_expert x n_embd] with one scale per 32 values, read once: as int8 codes for the peer's
 // warm-up (`q8`, `s8`) and as 4-bit codes in CpuWarm's layout for the CPU pool's (`q4`, `s4`); either may be null.  A
-// prediction only.  False when a layer's router is not such a table.
+// prediction only.  A layer the table does not hold (a layer split's foreign layers keep their row without bytes)
+// leaves its rows zero: no peer of the stage holds an expert of such a layer, so its pointer table maps the
+// prediction to no blob.  False when a held layer's router is not such a table; `why` names it.
 bool router_codes(const WeightTable& wt, const ModelGeometry& g, std::vector<int8_t>* q8, std::vector<float>* s8,
-                  std::vector<uint8_t>* q4, std::vector<float>* s4) {
+                  std::vector<uint8_t>* q4, std::vector<float>* s4, std::string* why) {
     const int64_t N = g.n_embd, NE = g.n_expert, L = g.n_layers, NB = N / 32;
-    if (NE > basalt::kernels::kDmPredExperts || N % 32 != 0) return false;
+    if (NE > basalt::kernels::kDmPredExperts || N % 32 != 0) {
+        if (why != nullptr) *why = "the router's shape is outside the predictor's";
+        return false;
+    }
     std::vector<uint16_t> src((size_t) (NE * N));
     if (q8 != nullptr) {
         q8->assign((size_t) (L * NE * N), 0);
@@ -331,9 +336,20 @@ bool router_codes(const WeightTable& wt, const ModelGeometry& g, std::vector<int
     }
     for (int64_t l = 0; l < L; ++l) {
         const WeightRef* w = LayerView(wt, l).get("ffn_gate_inp.weight");
-        if (w == nullptr || w->bytes != (uint64_t) (NE * N * 2)) return false;
+        if (w == nullptr) {
+            if (why != nullptr) *why = "layer " + std::to_string(l) + "'s router is missing";
+            return false;
+        }
+        if (w->data == nullptr) continue;   // a layer the table does not hold: its rows stay zero
+        if (w->bytes != (uint64_t) (NE * N * 2)) {
+            if (why != nullptr)
+                *why = "layer " + std::to_string(l) + "'s router is not a " + std::to_string(NE) + "x" + std::to_string(N) +
+                       " BF16 table (has " + std::to_string(w->bytes) + " bytes)";
+            return false;
+        }
         if (cudaMemcpy(src.data(), w->data, (size_t) w->bytes, cudaMemcpyDefault) != cudaSuccess) {
             cudaGetLastError();
+            if (why != nullptr) *why = "layer " + std::to_string(l) + "'s router could not be read";
             return false;
         }
         for (int64_t r = 0; r < NE; ++r)
@@ -657,10 +673,11 @@ bool Verifier::dm_init(std::string& err) {
     std::vector<float> rs_h;
     std::vector<uint8_t> rq4_h;
     std::vector<float> rs4_h;
+    std::string codes_why;
     const bool peer_on = peer_ != nullptr && peer_->valid();
     const bool codes_ok = (cpu_warm || peer_on) &&
                           router_codes(*wt_, g, peer_on ? &rq_h : nullptr, peer_on ? &rs_h : nullptr,
-                                       cpu_warm ? &rq4_h : nullptr, cpu_warm ? &rs4_h : nullptr);
+                                       cpu_warm ? &rq4_h : nullptr, cpu_warm ? &rs4_h : nullptr, &codes_why);
     const bool router_ok = peer_on && codes_ok;
     if (peer_ != nullptr && peer_->valid()) {
         const OnDevice on(peer_->device());
@@ -685,8 +702,25 @@ bool Verifier::dm_init(std::string& err) {
         for (size_t i = 0; i < d->rows_words; ++i) ((volatile uint32_t*) d->h_rows)[i] = basalt::kernels::dec_moe_tag_word();
         if (!ok) { err = "verify: device-planned MoE peer buffers"; return false; }
         d->shadow1.assign((size_t) LE, INT32_MIN);
-        if (!router_ok || !warm_router(rq_h, rs_h, &d->rq, &d->rs))
-            basalt::log::warn("basalt verify", "the peer's L2 warm-up is off (a router the predictor does not cover)");
+        // --exp l2warm_force=1: the warm-up on despite an uncovered router, when the geometry fits the predictor;
+        // a layer without a covered router predicts from its zero rows (the lowest expert ids)
+        std::string warm_reason;
+        bool warm_ok = router_ok;
+        if (!warm_ok) {
+            warm_reason = codes_why;
+            if (exp_flag("l2warm_force", 0) != 0 && g.n_expert <= basalt::kernels::kDmPredExperts && N % 32 == 0) {
+                warm_ok = true;
+                warm_reason = "forced by --exp l2warm_force=1 despite: " + codes_why;
+            }
+        }
+        if (warm_ok && !warm_router(rq_h, rs_h, &d->rq, &d->rs)) {
+            warm_ok = false;
+            warm_reason = "the predictor's buffers could not be placed on the peer";
+        }
+        if (!warm_ok)
+            basalt::log::warn("basalt verify", "the peer's L2 warm-up is off (%s)", warm_reason.c_str());
+        else if (!router_ok)
+            basalt::log::info("basalt verify", "the peer's L2 warm-up is on, forced despite an uncovered router");
         // further peers: a window, ring and doorbell each; cards that hold several peers split their blocks
         std::vector<int> devs = {d->pdev};
         for (PeerExperts* xpe : xpeers_)
@@ -723,7 +757,7 @@ bool Verifier::dm_init(std::string& err) {
                      cudaMalloc(&x.pscr, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
                      cudaMemset(x.pscr, 0, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
                      cudaMalloc((void**) &x.parr, 64) == cudaSuccess;
-                if (ok && router_ok && d->rq != nullptr) (void) warm_router(rq_h, rs_h, &x.rq, &x.rs);
+                if (ok && d->rq != nullptr) (void) warm_router(rq_h, rs_h, &x.rq, &x.rs);
             }
             x.shadow.assign((size_t) LE, INT32_MIN);
             if (!ok) { err = "verify: device-planned MoE buffers of a further peer"; return false; }

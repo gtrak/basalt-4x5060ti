@@ -2020,3 +2020,86 @@ against the "blind on GPU" rule. Every failure in it was `cudaMalloc ... out of 
 GPU number in the predictions above came from it. The server process was untouched (same pid, still listening on
 :8000) and no engine was started. The parity lines are the reviewer's to read.
 **Ready for reviewer measurement.**
+
+## RUN 20 — the peer's L2 warm-up: the "uncovered router" was the stage split's trimmed table (DECODE-NEXT item 2)
+
+Static analysis only; GPU untouched (no engine start). Two commits on `tp2-l2warm`.
+
+### The predictor's coverage rule, and why the warm-up was off
+
+The warm-up: at boot every layer's BF16 router `[n_expert x n_embd]` is quantized once (int8, one scale
+per 32 values) and uploaded to the peer (`router_codes` + `warm_router` in verify.cpp). Between rings of
+its persistent window the peer re-runs the NEXT layer's router on the ring's q8_1 rows, takes each
+token's top-k, and does one plain-load pass over the predicted experts' blobs, addressed through the
+peer's residency pointer table (`ptab`; a zero entry maps to no blob), so the next ring's expert reads
+find them in L2 instead of streaming.
+
+Coverage rule (before): `router_codes` requires EVERY layer's `blk.<l>.ffn_gate_inp.weight` to be a
+resident `[n_expert x n_embd]` BF16 table in the verifier's OWN weight table (exactly NE×N×2 bytes),
+with NE ≤ kDmPredExperts (512) and N % 32 == 0.
+
+This pack's router is shape-covered: the NVFP4 pack's dense index carries
+`blk.<l>.ffn_gate_inp.weight` as kind 4 (BF16), 2,621,440 B = 512×2560×2, exactly NE×N×2; NE = 512 ≤ 512;
+N = 2560 % 32 == 0. The kernel-side gates fit too (k = 10 ≤ 32; 8×10 ≤ kDmCap 128).
+
+The real cause: on ANY multi-GPU split `stage_trim = multi_gpu` — each stage's dense table holds only
+its stage's layers; the foreign layers keep their index row WITHOUT bytes (`data == nullptr`).
+`router_codes` walks all 48 layers from the stage's table, hits the first foreign router, and its
+`cudaMemcpy` from the null pointer fails → `codes_ok = false` → warm-up off on BOTH stages of every
+split boot. The warning's parenthetical ("a router the predictor does not cover") misdiagnosed it: the
+router IS covered; it is just not resident in the stage's table. (Single-card boots were never affected:
+one table holds every layer.)
+
+Why zero rows are safe for the layers a stage does not hold: no peer of the stage holds an expert of a
+foreign layer, so that layer's `ptab` entries are 0 and `dm_warm` maps its prediction to no blob — a
+zero-row prediction (all logits 0 → the lowest expert ids) can never fetch a wrong weight. The CPU
+pool's warm-up (CpuWarm) fires only for `l + 1 < le_`, the next layer of this stage, so it never
+consumes a foreign layer's row either.
+
+### The changes
+
+1. `d5ffca34` — `router_codes` skips a layer the table does not hold (`data == nullptr`; its rows stay
+   zero) and fails only on a real coverage miss: the router absent from the table, a held router with
+   the wrong shape/bytes, or an unreadable router. The warning now names the failure: the specific
+   layer with expected vs actual bytes, the shape gate, or "the predictor's buffers could not be
+   placed on the peer".
+2. `974a81bb` — `--exp l2warm_force=1`: takes the warm-up on despite an uncovered router, gated to the
+   geometry the predictor fits (NE ≤ 512, N % 32 == 0). A layer without a covered router predicts from
+   its zero rows (the lowest expert ids) — an A/B handle, not a default; an info line says when the
+   force is what turned the warm-up on. The further peers follow the main peer's placed buffers.
+
+### Per-change predictions (reviewer to measure)
+
+Boot line:
+- "the peer's L2 warm-up is off (a router the predictor does not cover)" DISAPPEARS — it printed once
+  per stage verifier per split boot; expect zero warm-up lines on a default boot (the warm-up is
+  quietly on). If a router is genuinely uncovered, the warning now names the layer or the shape.
+- `--exp l2warm_force=1` on top of the fixed default: NO extra line and no behaviour change (coverage
+  now holds, so the force is a no-op here).
+
+Decode profile (`decode_profile=1`, run 18 addendum baseline: solo peer push 0.1-0.2 / concurrent 1.7;
+wait 0.0):
+- **peer push**: the predictor's router pass and the predicted-blob touch-loads run INSIDE the peer's
+  persistent window, so the field moves up a little: solo ~0.1-0.2 → ~0.2-0.4; concurrent 1.7 →
+  ~1.8-2.2. If the predicted blobs hit L2, the peer's expert streaming shortens by the predicted
+  share's cost, so the net is roughly flat to slightly up.
+- **wait** (the benefit's field): 0.0 → 0.0 in the solo regime (the peer already kept up); in the
+  concurrent regime, where the peer's expert streaming is the straggler, the warm-up's win shows as
+  the concurrent peer push falling toward the solo value. The dev A/B at 4f3bdef7 (NVFP4, both GPUs,
+  400 W) measured -0.13 ms/window prose, -0.3 ms conv.
+- **hit%**: unchanged (94.6% canary). The warm-up touches L2, not the expert cache; nothing here
+  moves the residency tables.
+- Numerics: the warm-up writes nothing the rings read (touch-loads only) — bitwise neutral; the
+  greedy-identity check is the regression net.
+
+### Reviewer checklist
+
+1. Fresh 4-GPU tp2/pp2 boot: grep the boot log for "L2 warm-up" — expect ZERO lines (before: one
+   warning per stage verifier).
+2. Same traffic as the run 18 addendum (solo + concurrent, `decode_profile=1`): compare `peer push`
+   and `wait` against the baseline above.
+3. Greedy identity: same prompt, default flags, this binary vs the pre-change branch head
+   (`1f7b77fc`) — identical tokens.
+4. `--exp l2warm_force=1` boot: expect no change vs the default (no extra line).
+5. Build green `-j4`; `ctest -L cpu` 67/68 (`expert_multi_test` pre-existing);
+   `tools/check_platform_boundary.sh` + `tools/check_stderr_logging.sh` ok.
