@@ -92,3 +92,55 @@ rotation rather than a crash.
 Found and cleared as not-applicable: the three above. The remaining exposure is not hidden constants but the
 caller's own arguments: `rope` and `rms_rows` take head count and strides as parameters, so the arm must pass its
 **own** `nq`/`nkv` and its own `Qf` stride (`nq * 2 * head_dim`), never the lead's `24` and `6144`.
+
+## The arm, and the selection claim it is built to satisfy
+
+`peer_qsa_layer()` in `src/prefill/prefill.cpp` is the mirror of the lead's QSA block for one card: the lead's
+shipped rows in, this card's own `Gemm` over its boot-copied weights, its heads split and rotated at **its** head
+count and **its** `Qf` stride, its cells into **its** pools via `kv_append_nkv`, the indexer appended into its own
+pooled table, the selection, its heads' attention, the gate. It runs on `qs.s` and refuses rather than approximates
+wherever it could not match the lead bit-for-bit: a KV format it does not implement (q4, rotated, hybrid,
+streamed), a pack type it was never given, weights it was never handed. Every one of those refusals is the
+silent-corruption class this slice keeps hitting, arriving as an error instead of as plausible tokens.
+
+Two deliberate asymmetries with the lead, both load-bearing:
+
+- **the selection is the lead's by construction.** The partner receives the lead's `steps` and its already-normalized,
+  already-rotated `q_idx`, and skips the q norm and the q rope the lead applies - applying them again would rotate
+  bits twice. Case 9 is the check that this works: it runs the selection at the whole layer's shapes and at each
+  card's shard shapes and asserts the ids are identical, slot for slot. This is a *different* claim from case 6's
+  (which covers outputs), and a wrong answer there means the card attended to different cells than the lead - no
+  bad number anywhere, no way for anything downstream to notice. It also pins the audit result: if
+  `qsa_shard_shapes` ever narrowed an indexer field, or one of the selection kernels started following `n_head`,
+  the ids part here.
+- **it ends at `attn_h`, not at the partial.** The o_proj product needs this card's packed `attn_output` columns,
+  which `qsa_pair_prepare` allocates and which arrive with the pair's collective. The product, the BF16 conversion
+  and the reduce to the lead are one unit; splitting them would leave a half-finished reduce on the branch. The
+  arm therefore has **no caller yet** - it is wired by the `span_valid` and reduce-to-lead steps, not before.
+
+The attention has no decode fallback, unlike the lead's: that fallback exists for shapes this arm already refused
+above, and it would need scratch the walk does not fund. A refusal there is an error naming itself, not a slow path.
+
+## The suite ran, and found one the audit missed
+
+The parity cases above were written in earlier windows and **had never executed** — GPU-labelled, cards busy every
+time. With the cards idle they ran, and case 8 failed immediately: `gate_attn_kernel` took a head offset and applied
+it to `qf` but not to `attn`, so a wide buffer plus a head span multiplied head `h0+h`'s activations by head `h`'s
+gate. Plausible numbers, no crash, in the kernel whose output feeds o_proj.
+
+It is not the same bug as the three hardcoded counts, and the audit did not catch it because the audit asked *does
+this kernel assume a head count* — and this one took its count as an argument, correctly. The question it should
+also have asked is **does it apply every one of its index arguments to every input consistently**. A one-sided
+offset is invisible to a head-count audit.
+
+The offset is gone rather than fixed, because both of the kernel's inputs are the card's own rows and no caller ever
+wanted it. `split_q_span` keeps its offset — it genuinely reads wide and writes narrow — and the header now states
+the two contracts separately instead of one comment covering both.
+
+The GPU run also found two ways the *tests* could lie, both fixed: the cache-writer case compared the INT8 **scale**
+plane at the data stride (one amax per 64 dims, not 256), so it was comparing untouched memory and reporting it as
+a mismatch — and the V scales were allocated and never compared at all. A test that fails on a stride bug looks
+exactly like a test that fails on a kernel bug; the only way to tell them apart is to read the indexing.
+
+**Status change worth noting: the GPU-labelled parity cases are no longer unrun.** All of cases 1–10 report bitwise,
+including both KV formats. Which means the remaining unverified surface is the run path, not the kernels.

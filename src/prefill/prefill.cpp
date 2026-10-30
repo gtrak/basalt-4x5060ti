@@ -2068,6 +2068,140 @@ void peer_qsa_layout(PeerPrefill::Qsa& qs, int64_t T, Take&& take, PeerQsaParts*
     if (parts) *parts = tmp;
 }
 
+/// Queries per selection launch on the partner, matching the `sel_scores` the walk sizes (256 rows, like the
+/// lead's `sel_batch`): the arm must not launch wider than the score buffer it was funded for.
+static constexpr int64_t kPeerSelBatch = 256;
+
+/// One QSA layer of the partner's half of the prompt attention, on this card's own stream.
+///
+/// The mirror of the lead's QSA block, with three differences that are the whole point of the slice:
+///
+///   - the activations arrive over the link (`mixed_h`, `q_idx`, `idx_raw` of wire set `wire`) rather than being
+///     computed here, and the SELECTION arrives with them: the lead's `steps` and its already-normalized, already
+///     rotated `q_idx`, so the top-k is the lead's by construction rather than by two cards repeating a float
+///     computation and hoping to agree.  The partner therefore skips the q norm and the q rope the lead applies -
+///     it would be rotating bits twice.
+///   - every projection runs on THIS card's own `Gemm` over rows copied to it at boot.  P2P weight reads are
+///     rejected: they would put unpriced bytes on the link every layer, on the leg the gates grade.
+///   - every head count and stride is the CARD's, never the lead's: `nq`, `nkv`, and `Qf` laid out for `nq`
+///     heads.  That is what the shard-width kernels and `kv_append_nkv` exist for.
+///
+/// REFUSES rather than approximates wherever it cannot match the lead bit-for-bit: a KV format it does not
+/// implement (q4, rotated, hybrid, streamed), a pack type it was never told, weights it was never given.  A peer
+/// attending over state that does not match the lead's is the silent-corruption class this slice keeps hitting,
+/// and a refusal is the only safe answer to it.
+///
+/// ENDS at the gated rows (`attn_h`).  The o_proj product is NOT here: it needs this card's packed
+/// `attn_output` columns, which `qsa_pair_prepare` allocates and which arrive with the pair's collective - so
+/// the product, the BF16 conversion into `part_out` and the reduce to the lead are one unit, not half of one.
+/// What is here is everything up to the last multiply, which is why the parity tests below can already assert
+/// that the partner reproduces the lead's rows and its SELECTION.
+///
+/// `active` is the chunk's widest n_bid + 1, from whoever shipped the steps: it is a property of the chunk's
+/// positions, not of a layer, so the arm takes it rather than reading a host copy per layer.
+bool peer_qsa_layer(PeerPrefill::Qsa& qs, int64_t li, int64_t wire, int64_t T, int64_t p0, int64_t active,
+                    std::string& err) {
+    const Prefill::PeerQsaSpan& sp = qs.span;
+    if (!qs.live || !sp.on || sp.g == nullptr) { err = "peer QSA: the arm is not live"; return false; }
+    if (li < 0 || li >= (int64_t) qs.states.size() || qs.states[(size_t) li].page_table == nullptr) {
+        err = "peer QSA: no state for layer index " + std::to_string(li);
+        return false;
+    }
+    if (wire < 0 || wire >= Prefill::PeerQsaSpan::kWireSets) { err = "peer QSA: bad wire set"; return false; }
+    core::QsaState& st = qs.states[(size_t) li];
+    const core::ModelGeometry& g = *sp.g;
+    // The shard's shapes for everything that follows the heads; the indexer's stay whole, which is what lets the
+    // three selection kernels below be handed this unchanged (progress-tp2slice-kernels.md).
+    const basalt::kernels::QsaShapes sh = core::qsa_shard_shapes(g, sp.heads);
+    const int64_t nq = sp.heads.nq(), nkv = sp.heads.nkv(), D = g.head_dim, N = g.n_embd;
+    if (nq <= 0 || nkv <= 0 || D <= 0 || T <= 0 || p0 < 0) { err = "peer QSA: bad geometry"; return false; }
+
+    // Nothing here may guess at a format.  The row bytes say how big a weight is; only the pack's type says how to
+    // read it, and the sizer sees geometry only - so a type left unset means the pack was never consulted.
+    if (sp.q_type < 0 || sp.kv_type < 0) {
+        err = "peer QSA: the pack's projection types were never given to the span sizer";
+        return false;
+    }
+    if (qs.wq.empty() || li >= (int64_t) qs.wq.size() || !qs.wq[(size_t) li] || !qs.wk[(size_t) li] ||
+        !qs.wv[(size_t) li] || !qs.wqn[(size_t) li] || !qs.wkn[(size_t) li] || !qs.wikn[(size_t) li]) {
+        err = "peer QSA: this layer's projections are not resident on the partner";
+        return false;
+    }
+    // The shipped configuration is the prompt state's FP16 or INT8 pools.  The other KV formats each need work
+    // this arm does not do (a rotation the partner and the lead would have to agree on cell by cell, or a q4
+    // pool the attention would have to dequantize), and a mismatched one is wrong in a way no test would see.
+    if (st.kv_q4 || st.kv_hybrid || st.kv_rot || st.kv_mode == 1) {
+        err = "peer QSA: this state's KV format is not implemented on the partner (q4, rotated, hybrid or streamed)";
+        return false;
+    }
+    cudaStream_t cs = qs.s;
+
+    // ---- the projections, from the lead's own mixed rows, on this card's own weights
+    // N = the card's output rows, K = n_embd; the same call the lead makes, at the shard's N
+    qs.gemm.native(qs.mixed_h[wire], sp.kv_type, qs.wk[(size_t) li], qs.Kc, T, nkv * D, N, 0);
+    qs.gemm.native(qs.mixed_h[wire], sp.kv_type, qs.wv[(size_t) li], qs.Vc, T, nkv * D, N, 0);
+    qs.gemm.native(qs.mixed_h[wire], sp.q_type, qs.wq[(size_t) li], qs.Qf, T, nq * 2 * D, N, 0);
+
+    // The indexer's k comes over the wire already projected, so the partner appends it into a pooled table of
+    // its own; its k norm is its own copy of the same tensor, so the pooled bits are the lead's.
+    rms_rows(qs.Kc, qs.wkn[(size_t) li], T * nkv, D, D, EPS, cs);
+    rope(qs.Kc, T, nkv, D, nkv * D, p0, basalt::kernels::rope_scaling(), cs);
+
+    // ---- this card's cells into THIS card's pools.  The lead keeps both KV heads and its own cache (Ruling B);
+    // the partner maintains the state for its own heads, so the two caches are deliberately redundant rather
+    // than one of them being wrong.  No host mirror: the lead's is the authority.
+    kv_append_nkv(qs.Kc, qs.Vc, T, p0, st.page_table, sh.page_size, st.kv_int8 ? nullptr : st.k_pool,
+                  st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, cs, nullptr, nullptr,
+                  (int) nkv);
+
+    // ---- the queries: this card's heads out of its own Qf, then normed and rotated at ITS head count and ITS
+    // Qf stride.  Both are the card's width now, so a lead-side 24 or 6144 here would read heads this card does
+    // not have - which is the bug class this slice has now found three times.
+    split_q_span(qs.Qf, qs.q, T, 0, nq, nq * 2 * D, cs);
+    rms_rows(qs.q, qs.wqn[(size_t) li], T * nq, D, D, EPS, cs);
+    rope(qs.q, T, nq, D, nq * D, p0, basalt::kernels::rope_scaling(), cs);
+
+    // ---- the indexer's pooled table, then the SELECTION.  The q side is the lead's shipped bits: no norm, no
+    // rope, because the lead applied both before shipping.  `q_idx` is laid out [T, idx_n_head * idx_dim], the
+    // same stride the lead used, since the indexer does not split.
+    const basalt::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+    try {
+        basalt::kernels::native_qsa_indexer_append_batch(qs.idx_raw[wire], T, p0, 0, qs.wikn[(size_t) li], EPS, ib,
+                                                         sh, st.max_cells, basalt::kernels::rope_scaling(), cs);
+    } catch (const std::exception& e) {
+        err = std::string("peer QSA indexer: ") + e.what();
+        return false;
+    }
+    const int64_t cap = basalt::kernels::qsa_selection_width(basalt::kernels::kTopkMaxCells, sh);
+    const int64_t max_blocks = st.max_cells / sh.idx_block + 2;
+    for (int64_t t0 = 0; t0 < T; t0 += kPeerSelBatch) {
+        const int64_t nb = std::min(kPeerSelBatch, T - t0);
+        const int32_t* steps0 = qs.steps + t0 * basalt::kernels::kStepCount;
+        if (!basalt::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, qs.q_idx[wire] + t0 * sh.idx_n_head *
+                                                                             sh.idx_dim, steps0, nb, max_blocks, sh,
+                                                                             qs.sel_scores, cs, active))
+            basalt::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead,
+                                              qs.q_idx[wire] + t0 * sh.idx_n_head * sh.idx_dim, steps0, nb, max_blocks,
+                                              sh, qs.sel_scores, cs, active);
+        basalt::kernels::qsa_block_topk(qs.sel_scores, steps0, nb, max_blocks, cap, sh, qs.sel_ids + t0 * cap, cs,
+                                       active);
+    }
+
+    // ---- this card's heads' attention over its own pools.  The tensor kernel takes the shipped configuration;
+    // the decode fallback the lead uses exists for shapes this arm already refused above, so a refusal here is an
+    // error rather than a slower path, and it is named rather than silently falling back to a kernel whose
+    // scratch this arm does not hold.
+    const basalt::kernels::QsaAttnPools pools = core::qsa_attn_pools(st);
+    if (!basalt::kernels::qsa_prompt_attn_batch(qs.q, pools, qs.sel_ids, qs.steps, cap, sh, qs.attn, T, cs)) {
+        err = "peer QSA: the prompt attention refused this geometry";
+        return false;
+    }
+
+    // ---- the gate, over this card's heads.  `attn_h` is what the o_proj product will read.
+    gate_attn_span(qs.attn, qs.Qf, qs.attn_h, T, nq, nq * 2 * D, cs);
+    return true;
+}
+
 static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, int64_t tf, bool rows_fp32,
                       bool acts_fp32, const PeerRamShare* ram,
                       std::unique_ptr<PeerPrefill>& out, std::string& err) {

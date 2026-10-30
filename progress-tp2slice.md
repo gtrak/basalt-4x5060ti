@@ -240,6 +240,15 @@ Still missing, and the gate still refuses at `Prefill::set_peer` with the messag
 - the `o_proj` reduce-to-lead via `qsa_pair_prepare` + `Tp2Pair` SM push (item 4),
 - the tier's call sites (`generate.cpp:3104/3111`) still pass no span, so `stage_room` leaves no room yet.
 
+## The arm's status (this window)
+
+`peer_qsa_layer()` exists and compiles: the partner's QSA block, on its own stream, refusing rather than
+approximating. It has **no caller yet** - it is wired once `span_valid` and the reduce-to-lead land, and the
+o_proj product goes with the reduce because both need `qsa_pair_prepare`'s packed columns. Case 9 now asserts the
+selection-equality claim in `tests/kernels/tp2_head_split_parity.cpp`. The head-split audit is closed:
+`split_q`, `gate_attn`, `kv_append` fixed; the three selection kernels cleared as not applicable. Details in
+**`progress-tp2slice-kernels.md`**.
+
 ## Where the arithmetic lives
 
 The byte ledger, the funding figure, the span catch-up pricing and the filed predictions are in

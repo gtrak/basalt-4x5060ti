@@ -858,6 +858,83 @@ int main(int argc, char** argv) {
         cudaFree(qf_d); cudaFree(at_d); cudaFree(qf_whole); cudaFree(g_whole);
     }
 
+    // ---- 9. the SELECTION: a card recomputes it and must return the lead's ids
+    //
+    // This is the slice's central claim, and it is a different claim from 6's.  Case 6 says a card's attention
+    // OUTPUTS match the lead's for its heads.  This says the card's SELECTION - which cells it attends to at all -
+    // is the lead's, exactly.  A wrong selection is not a slightly wrong number: the card attends to a different
+    // set of cells, produces plausible rows, and nothing downstream can tell.  It is why the partner ships the
+    // lead's `steps` and its already-rotated `q_idx` rather than recomputing either; this test is what makes that
+    // choice checkable rather than merely asserted in a comment.
+    //
+    // It also pins the audit's finding for the three selection kernels: handing them the SHARD's shapes must be
+    // indistinguishable from handing them the whole layer's, because the indexer does not split.  If
+    // `qsa_shard_shapes` ever narrowed an indexer field, or one of those kernels started following `n_head`, the
+    // two cards' ids would part here.
+    {
+        const int64_t n_q = 8, pos0 = 64;
+        const int64_t cells = pos0 + n_q;
+        const int64_t max_blocks = cells / full.idx_block + 2;
+        std::uniform_real_distribution<float> u(-1.f, 1.f);
+        // the lead's own step counts, shipped to the card exactly as the arm ships them
+        std::vector<int32_t> st_h((size_t) n_q * k::kStepCount);
+        for (int64_t i = 0; i < n_q; ++i) k::qsa_step_fill(st_h.data() + (size_t) i * k::kStepCount, pos0 + i, full);
+        std::vector<float> pooled((size_t) max_blocks * full.idx_dim), dead((size_t) n_q * full.idx_dim),
+                qi((size_t) n_q * full.idx_n_head * full.idx_dim);
+        for (auto& x : pooled) x = nd(rng) * 2.0f;
+        for (auto& x : dead) x = nd(rng) * 2.0f;
+        for (auto& x : qi) x = nd(rng) * 2.0f;   // the lead's post-norm, post-rope bits; both cards read THESE
+        float* pl_d = dalloc<float>(pooled.size());
+        float* dd_d = dalloc<float>(dead.size());
+        float* qi_d = dalloc<float>(qi.size());
+        int32_t* st_d = dalloc<int32_t>(st_h.size());
+        up(pl_d, pooled); up(dd_d, dead); up(qi_d, qi); up(st_d, st_h);
+
+        // one run of the selection, at whatever shapes the caller hands the kernels
+        auto run = [&](const k::QsaShapes& sh, std::vector<int32_t>& ids) {
+            const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, sh);
+            ids.assign((size_t) n_q * cap, -1);
+            float* sc_d = dalloc<float>((size_t) 256 * max_blocks);
+            int32_t* id_d = dalloc<int32_t>(ids.size());
+            const int64_t active = (int64_t) st_h[(size_t) (n_q - 1) * k::kStepCount + k::kStepNBid] + 1;
+            // the same fall-through the arm uses, so the test covers the path the arm takes on this card
+            if (!k::qsa_block_scores_tc(pl_d, dd_d, qi_d, st_d, n_q, max_blocks, sh, sc_d, nullptr, active))
+                k::qsa_block_scores(pl_d, dd_d, qi_d, st_d, n_q, max_blocks, sh, sc_d, nullptr, active);
+            k::qsa_block_topk(sc_d, st_d, n_q, max_blocks, cap, sh, id_d, nullptr, active);
+            ids = down(id_d, ids.size());
+            cudaFree(sc_d); cudaFree(id_d);
+            return cap;
+        };
+        std::vector<int32_t> lead_ids, card_ids;
+        const int64_t cap_lead = run(full, lead_ids);
+        bool ids_equal = true;
+        for (const QsaHeadShard* r : {&r0, &r1}) {
+            const k::QsaShapes& sh = r->rank == 0 ? s0 : s1;
+            const int64_t cap = run(sh, card_ids);
+            // a different width would make the comparison below meaningless rather than failing it
+            CHECK(cap == cap_lead);
+            if (card_ids.size() != lead_ids.size()) { ids_equal = false; ++g_fail; continue; }
+            int rep = 0;
+            for (size_t i = 0; i < lead_ids.size(); ++i) {
+                if (lead_ids[i] == card_ids[i]) continue;
+                if (rep < 4) {
+                    std::printf("FAIL selection rank %d: query %zu slot %lld: lead %d vs card %d\n", r->rank,
+                            i / (size_t) cap_lead, (long long) (i % (size_t) cap_lead), lead_ids[i], card_ids[i]);
+                    ++g_fail; ++rep;
+                }
+                ids_equal = false;
+            }
+        }
+        // a selection that is all -1 would make the equality above pass vacuously; the fill must have happened
+        int chosen = 0;
+        for (int32_t x : lead_ids) if (x >= 0) ++chosen;
+        CHECK(chosen > 0);
+        std::printf("[selection] %lld queries from pos %lld, %lld blocks, width %lld: %s (%d ids chosen)\n",
+                (long long) n_q, (long long) pos0, (long long) max_blocks, (long long) cap_lead,
+                ids_equal ? "the cards' ids are the lead's, exactly" : "IDS DIVERGE", chosen);
+        cudaFree(pl_d); cudaFree(dd_d); cudaFree(qi_d); cudaFree(st_d);
+    }
+
     // ---- 10. kv_append over one card's KV run: the cache writer, both formats
     //
     // The third hardcoded-head site found while writing the partner's arm, and the worst of the three:
