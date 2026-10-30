@@ -4619,9 +4619,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     // The summed `o_proj` exactly as the model reads it, sliced or whole: the one component all
                     // three boots must agree on, which is what makes a gate-off chain the reference for the other
-                    // two rather than a fourth opinion.
+                    // two rather than a fourth opinion.  The row pitch is `o_proj`'s output width - `n_embd`, the
+                    // same figure `native_proj` sizes `bo` by - not the attention's `ZV`: fingerprinting it at the
+                    // attention's width walks past the end of the buffer and reports whatever the arena holds there.
                     if (m.chain_on)
-                        qsa_chain_put(m.chain[0], l, basalt::kernels::kChainBo, m.bo, T, ZV, m.cs);
+                        qsa_chain_put(m.chain[0], l, basalt::kernels::kChainBo, m.bo, T, g.n_embd, m.cs);
                     ++qsa_index;
                 } else {
                     // ======================= MoE =======================
