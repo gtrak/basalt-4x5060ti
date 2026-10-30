@@ -771,7 +771,7 @@ struct PeerPrefill {
         uint16_t* attn_h = nullptr;   // the gated FP16 rows the o_proj product reads
         int32_t* sel_ids = nullptr;
         float* sel_scores = nullptr;
-        int32_t* steps = nullptr;     // the lead's per-query step counts, shipped: same bits, same selection
+        int32_t* steps[2] = {};       // the lead's per-query step counts, shipped: same bits, same selection
         float* part_f32[2] = {};    // the o_proj partial as the product leaves it, before the BF16 conversion
 
         // The projections this card owns: its shard's rows of attn_q, its KV head's rows of attn_k/attn_v, and
@@ -2128,8 +2128,14 @@ void peer_qsa_layout(PeerPrefill::Qsa& qs, int64_t T, Take&& take, PeerQsaParts*
     // The step counts the selection and the attention read per query.  They are pure position arithmetic that
     // the lead computes on the host and uploads, so the LEAD's copy crosses rather than the partner's own
     // recomputation: identical bits, so `width` and `active` cannot disagree between the two cards' selections.
-    // One set, not one per wire set: they are a property of the chunk's positions, not of a layer.
-    qs.steps = (int32_t*) one_scratch((size_t) T * basalt::kernels::kStepCount * 4);
+    // They are a property of the CHUNK, which is not the same thing as being safe across one: under the pipelined
+    // gate the lead starts the next chunk while this card is still attending over the last one, so a single buffer
+    // would hand the partner the NEXT chunk's positions to select with - a wrong top-k, and a wrong-but-plausible
+    // token. One set per staging set, published with every layer's other inbound bytes, so the wire's own
+    // free-ness protocol (`ev_out`) covers them exactly as it covers `mixed_h` (`PeerQsaSpan::staging_sets`).
+    for (int b = 0; b < Prefill::PeerQsaSpan::kWireSets; ++b)
+        qs.steps[b] = b < sp.staging_sets ? (int32_t*) one_scratch((size_t) T * basalt::kernels::kStepCount * 4)
+                                          : nullptr;
     tmp.scratch = sc;
 
     // the projections, RESIDENT: this shard's rows of attn_q, its KV head's rows of attn_k and attn_v, and the
@@ -2429,11 +2435,13 @@ bool peer_qsa_resident_up(PeerPrefill& P, const core::WeightTable& wt, int lead_
 }
 
 /// The lead's side of the wire for one QSA layer: the FP16 mixed rows its own `attn_q` read, its indexer q
-/// already normed and rotated, and its raw indexer key, copied from this card into the partner's wire set
-/// `wire`.  With `steps` non-null the chunk's step counts go too - they are a property of the chunk's positions
-/// and the arm holds ONE set, so a chunk ships them once and every layer's arm reads the same bits the lead's own
-/// selection read (`qsa_block_topk` on two cards over different step bits is a different top-k, which is a
-/// different attention input and a different token).
+/// already normed and rotated, its raw indexer key, and the chunk's per-query step counts, copied from this card
+/// into the partner's wire set `wire`.  The step counts travel with every layer rather than once per chunk: they
+/// are a property of the chunk's positions, but the pipelined gate lets the lead begin the NEXT chunk while this
+/// card still attends over the last one, and one shared set would give the partner another chunk's positions to
+/// select with (`qsa_block_topk` on two cards over different step bits is a different top-k, which is a different
+/// attention input and a different token).  Being a set of the wire, they are freed by the same `ev_out` the rest
+/// of the set is.
 ///
 /// ISSUED ON THE LEAD'S COMPUTE STREAM, which is the protocol rather than a convenience: every source buffer here
 /// is single-set on this card and is rewritten by a later kernel of the same stream (`up_mix` for `mixed_h`, the
@@ -2461,8 +2469,9 @@ bool peer_qsa_publish(PeerPrefill& P, const uint16_t* mixed_h, const float* q_id
         return false;
     }
     if (!P.p2p) { err = "peer QSA: the publish needs peer access between CUDA" + std::to_string(P.prim) + " and CUDA" + std::to_string(P.dev); return false; }
-    if (mixed_h == nullptr || q_idx == nullptr || idx_raw == nullptr || qs.mixed_h[wire] == nullptr ||
-        qs.q_idx[wire] == nullptr || qs.idx_raw[wire] == nullptr) {
+    if (mixed_h == nullptr || q_idx == nullptr || idx_raw == nullptr || steps == nullptr ||
+        qs.mixed_h[wire] == nullptr || qs.q_idx[wire] == nullptr || qs.idx_raw[wire] == nullptr ||
+        qs.steps[qs.pipeline >= 2 ? wire : 0] == nullptr) {
         err = "peer QSA: this layer's wire set is not allocated";
         return false;
     }
@@ -2483,8 +2492,12 @@ bool peer_qsa_publish(PeerPrefill& P, const uint16_t* mixed_h, const float* q_id
     if (!across(qs.mixed_h[wire], mixed_h, N * (uint64_t) T * 2u, "mixed rows")) return false;
     if (!across(qs.q_idx[wire], q_idx, (uint64_t) T * sh.idx_n_head * sh.idx_dim * 4u, "indexer q")) return false;
     if (!across(qs.idx_raw[wire], idx_raw, (uint64_t) T * sh.idx_dim * 4u, "indexer k")) return false;
-    if (steps != nullptr &&
-        !across(qs.steps, steps, (uint64_t) T * basalt::kernels::kStepCount * 4u, "step counts")) return false;
+    // The step counts are staged like the `o_proj` partial rather than like the rows above: the arm holds a second
+    // set only when the gate pipelines, so under the serialized gate every layer's arm uses set 0 - the same
+    // collapse `peer_qsa_finish` makes for `part_f32`.  Under the pipelined gate they follow `wire`, which is what
+    // puts them under the `ev_out` that frees the rest of the set.
+    const int64_t w = qs.pipeline >= 2 ? wire : 0;
+    if (!across(qs.steps[w], steps, (uint64_t) T * basalt::kernels::kStepCount * 4u, "step counts")) return false;
     // `ev_in` lives on the LEAD's context because it is recorded on the lead's compute stream; only
     // `cudaStreamWaitEvent` may reach across devices, `cudaEventRecord` may not (see `make_peer`).
     cudaError_t erec = cudaErrorUnknown;
@@ -2579,7 +2592,7 @@ bool peer_qsa_layer(PeerPrefill::Qsa& qs, int64_t li, int64_t wire, int64_t T, i
     const int64_t max_blocks = st.max_cells / sh.idx_block + 2;
     for (int64_t t0 = 0; t0 < T; t0 += kPeerSelBatch) {
         const int64_t nb = std::min(kPeerSelBatch, T - t0);
-        const int32_t* steps0 = qs.steps + t0 * basalt::kernels::kStepCount;
+        const int32_t* steps0 = qs.steps[qs.pipeline >= 2 ? wire : 0] + t0 * basalt::kernels::kStepCount;
         if (!basalt::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, qs.q_idx[wire] + t0 * sh.idx_n_head *
                                                                              sh.idx_dim, steps0, nb, max_blocks, sh,
                                                                              qs.sel_scores, cs, active))
@@ -2594,8 +2607,10 @@ bool peer_qsa_layer(PeerPrefill::Qsa& qs, int64_t li, int64_t wire, int64_t T, i
     // the decode fallback the lead uses exists for shapes this arm already refused above, so a refusal here is an
     // error rather than a slower path, and it is named rather than silently falling back to a kernel whose
     // scratch this arm does not hold.
+
     const basalt::kernels::QsaAttnPools pools = core::qsa_attn_pools(st);
-    if (!basalt::kernels::qsa_prompt_attn_batch(qs.q, pools, qs.sel_ids, qs.steps, cap, sh, qs.attn, T, cs)) {
+    if (!basalt::kernels::qsa_prompt_attn_batch(qs.q, pools, qs.sel_ids, qs.steps[qs.pipeline >= 2 ? wire : 0], cap,
+                                               sh, qs.attn, T, cs)) {
         err = "peer QSA: the prompt attention refused this geometry";
         return false;
     }
@@ -4181,8 +4196,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const int64_t qsa_ord = qsa_index - qsa_first;
                     const int64_t wire = sap != nullptr ? qsa_ord % Prefill::PeerQsaSpan::kWireSets : 0;
                     if (sap != nullptr &&
-                        !peer_qsa_publish(*sap, m.mixed_h, m.q_idx, m.idx_raw,
-                                          qsa_ord == 0 ? m.steps_dev : nullptr, wire, T, m.cs, err)) {
+                        !peer_qsa_publish(*sap, m.mixed_h, m.q_idx, m.idx_raw, m.steps_dev, wire, T, m.cs, err)) {
                         m.qsa_refused = true;   // the arm declined this chunk; the request is what fails, not the engine
                         return false;
                     }

@@ -206,9 +206,11 @@ void test_resident_projections_are_priced() {
     const int expect_takes = 6 /*states*/ + 4 * Prefill::PeerQsaSpan::kWireSets + 10 /*scratch*/ + 7 * 6 + 2;
     std::printf("the walk made %d allocations, as counted\n", s.last_takes());
     CHECK(s.last_takes() == expect_takes);
-    // The PIPELINED gate (`--exp tp_prompt_attn=2`) holds a second `o_proj` staging set, so the walk takes ONE
-    // more buffer and the tier must have left its bytes free: an arm that allocates what the reserve did not
-    // price is an allocation failure at the first gated prompt, not a slower boot.
+    // The PIPELINED gate (`--exp tp_prompt_attn=2`) holds a second set of everything the pair keeps two of at
+    // once: the `o_proj` staging, and the lead's shipped step counts (they belong to a chunk, but the lead can
+    // begin the next chunk while this card still attends over the last one).  The walk must take TWO more buffers
+    // and price BOTH, or the arm allocates what the reserve did not count and the first gated prompt fails an
+    // allocation instead of booting slower.
     {
         Prefill::PeerQsaSpan pip = span_for(0, 24, 12, 1);
         pip.staging_sets = 1;
@@ -216,15 +218,18 @@ void test_resident_projections_are_priced() {
         const int serial_takes = pip.last_takes();
         pip.staging_sets = Prefill::PeerQsaSpan::kStagingSets;
         const uint64_t pipelined_scratch = part(pip, 2);
-        const uint64_t row = ((uint64_t) T * 2560ull * 4ull + 255) & ~uint64_t(255);   // rows x n_embd x FP32
         pip.bytes(T, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
         const int pipelined_takes = pip.last_takes();
         pip.staging_sets = 1;
         const uint64_t serial_scratch = part(pip, 2);
-        CHECK(pipelined_scratch == serial_scratch + row);
-        CHECK(pipelined_takes == serial_takes + 1);
-        std::printf("pipelined staging: %d allocations against %d, +%.2f GiB for the second o_proj set\n",
-                    pipelined_takes, serial_takes, (double) (pipelined_scratch - serial_scratch) / GiB);
+        const uint64_t row = ((uint64_t) T * 2560ull * 4ull + 255) & ~uint64_t(255);   // rows x n_embd x FP32
+        const uint64_t step_row = ((uint64_t) T * basalt::kernels::kStepCount * 4ull + 255) & ~uint64_t(255);
+        CHECK(pipelined_scratch == serial_scratch + row + step_row);
+        CHECK(pipelined_takes == serial_takes + 2);
+        std::printf("pipelined staging: %d allocations against %d, +%.2f GiB for the second o_proj set (+%llu KiB "
+                    "for the second step-count set)\n", pipelined_takes, serial_takes,
+                    (double) (pipelined_scratch - serial_scratch - step_row) / GiB,
+                    (unsigned long long) (step_row >> 10));
     }
     std::printf("resident projections: %.3f GiB over 6 QSA layers (attn_q rows 6144, attn_k/v rows 256)\n",
                 (double) part(s, 3) / GiB);
@@ -478,6 +483,46 @@ int replay_collective(int n, int sets, bool serialized) {
     return 0;
 }
 
+/// The step counts the partner selects and attends with, replayed the same way.  The lead publishes a layer's rows
+/// into the wire set `l % kWireSets` (the ordinal restarts each chunk, exactly as the driver computes it) and the
+/// partner reads them when its own layer runs; publishing into a set waits for the partner's finish of the last
+/// item that used it, which is the wire's `ev_out`.  `mode` picks where the step bits live:
+///   0 - one set shared by the whole prompt, refreshed on each chunk's first layer: the lead reaches the next
+///       chunk while the partner still attends over the last, and hands it another chunk's positions to select with;
+///   1 - one set of the WIRE, published with every layer, so the gate above frees them with no new handshake.
+/// (A set per CHUNK is clean too - the lead cannot get two chunks ahead - but it needs a gate of its own, which is
+/// the reason the arm copies the wire's sets instead.)  0 = clean, 1 = a read saw another chunk's bits, -1 = stuck.
+int replay_steps(int layers, int chunks, int sets, int mode, bool serialized) {
+    if (layers < 1 || chunks < 1 || sets < 1) return -2;
+    const int n = layers * chunks;
+    std::vector<char> fin(n, 0);
+    std::vector<int> tag(sets, 0);                     // which chunk's step bits a set holds (1-based, 0 = none)
+    auto wire = [&](int i) { return (i % layers) % (int) Prefill::PeerQsaSpan::kWireSets; };
+    auto sset = [&](int i) { return mode == 0 ? ((i / layers) % sets) : ((i % layers) % sets); };
+    auto chunk_of = [&](int i) { return i / layers + 1; };
+    auto prev_in_set = [&](int i) {                     // the item whose finish gates this publish
+        for (int j = i - 1; j >= 0; --j) {
+            if (wire(j) == wire(i)) return j;            // the wire's own gate, in both modes
+        }
+        return -1;
+    };
+    int li = 0, pi = 0;
+    while (pi < n) {
+        while (li < n) {                                // the lead charges as far as the gate allows
+            if (serialized && li > pi && !fin[li - 1]) break;
+            const int p = prev_in_set(li);
+            if (p >= 0 && !fin[p]) break;
+            tag[sset(li)] = chunk_of(li);               // the publish ships this chunk's step bits
+            ++li;
+        }
+        if (li <= pi) return -1;                        // the partner can never be served
+        if (tag[sset(pi)] != chunk_of(pi)) return 1;    // it selected with another chunk's positions
+        fin[pi] = 1;
+        ++pi;
+    }
+    return 0;
+}
+
 void test_the_pair_funds_the_depth_it_runs() {
     // The pair's own pure rules: sets are counted from one, a region is addressable only below the count, and the
     // allocation is sets x the widest partial - which is what the tier's reserve has to book.
@@ -506,6 +551,18 @@ void test_the_pair_funds_the_depth_it_runs() {
     CHECK(replay_collective(6, 2, false) == 0);
     CHECK(replay_collective(12, 2, false) == 0);
     std::printf("collective staging: one region corrupts at depth 2 with the lead ungated; two regions do not, to 12\n");
+
+    // THE SHIPPED STEP COUNTS, same question: the partner selects its blocks and attends with the lead's per-query
+    // step bits, so a buffer shared by the whole prompt is the next chunk's selection read as this chunk's - a
+    // wrong top-k with nothing to see, and only under the pipelined gate, because the serialized one keeps the
+    // lead a layer behind this card's finish.  One set corrupts; sets of the wire do not, at the real stage's depth.
+    CHECK(replay_steps(2, 3, 1, 0, false) == 1);
+    CHECK(replay_steps(6, 4, 1, 0, false) == 1);
+    CHECK(replay_steps(2, 3, 1, 0, true) == 0);          // =1 was never affected: that is why it read as correct
+    CHECK(replay_steps(2, 3, 2, 1, false) == 0);
+    CHECK(replay_steps(6, 6, 2, 1, false) == 0);         // 6 QSA layers a stage, six chunks deep
+    CHECK(replay_steps(1, 8, 2, 1, false) == 0);
+    std::printf("shipped step counts: one set hands the partner the next chunk's positions; sets of the wire do not\n");
 
     // And the reserves must book what the pair allocates, or the second region is an allocation failure at the
     // first gated prompt.  `lead_qsa_bytes` reads the depth from the same gate `set_peer` refuses on, so the gate
