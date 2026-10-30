@@ -42,20 +42,16 @@ Gates, current: build green under `-j4`; `ctest -L cpu` **68/69** with the count
 pre-existing `expert_multi_test` (no AVX512-VNNI/VBMI here); boundary and stderr checks ok. `:8000` never contacted;
 GPU numbers stay **TODO-for-the-window**.
 
-**Two gated boots refused, both for pack reasons, and the second read as the first.** The projections carry no
-canonical bytes here (native Q6_K images only, on all four projections and every QSA layer), so every figure built
-from the planes was 0, and the arm's resident projections had never been written; both fixed and priced from the
-pack (ledger §2k). The next boot then refused
-`blk.27.attn_output.weight ... cannot be cut at column 0 of 6144 (group 32, native 0 B)` on CUDA1 and the same on
-`blk.3` on CUDA2 — each card dying on the OTHER stage's first QSA layer. `qsa_pair_prepare` packed `[0, n_layers)`
-while a stage's table holds only its own layers' projections (`NativeDense`'s per-stage `set_layer_range`): out-of-
-stage layers have neither form, 0 bytes, refusal; the pair now packs its `[lb, le)` and an unprepared layer stays
-`!ok`. The window's boots printed the arm line on both stage leads: 116 MiB held back, 12/24 heads, 8192x2560 staging.
-
-**Landed since**: `span_valid` with its catch-up, invalidation sites and the `kv_span_import` gather (case 11); the
-**(c) tier reserve** (pinned symmetric cut, refusal naming both figures); the **all-reduce timeout fix**
-(`b34904ba`); and **pair bring-up** — `peer_qsa_pair_up()` opens one `Tp2Pair` across the stage's two cards sized
-for a PROMPT partial (`chunk x n_embd`) and packs the stage range's `attn_output` columns on BOTH cards.
+**Three gated boots refused, each one step further than the last.** Boots 1 and 2 were pack arithmetic — the
+projections carry no canonical bytes here (native Q6_K images only, all four, every QSA layer), and the pair packed
+`[0, n_layers)` while a stage's table holds only its own layers — both fixed and priced from the pack (ledger §2k).
+Boot 3 brought the pair UP on both stages — every boot line below printed — and died at the FIRST publish of a
+122k-token prompt on both slots: `the publish would not be recorded`, whose only producer is
+`cudaEventRecord(qs.ev_in, cs)`: `ev_in`/`ev_red` lived on the PARTNER's context while the LEAD's stream records
+them (`ev_out`, on the arm's own stream, was the only correct one). Each now lives where it is recorded, every
+record site scopes its card, and both refusals print the CUDA error and the bytes queued (`22cc023e`). The passing
+8-token probe proves less than it looks like: nothing logs that a chunk was sliced, so "the publish works at small
+T" is NOT on the record.
 
 **LANDED (`b4cc1f70`, `e786401c`): the serialized slice runs.** (a) `peer_qsa_publish()` ships the lead's
 `mixed_h` / `q_idx` / `idx_raw` — and the chunk's step counts once — into the wire set on the LEAD's compute
@@ -97,12 +93,16 @@ lead's stream.
 
     grep "peer prompt-attention pair CUDA"     # pair open, staging floats, columns on both cards, N QSA layers
     grep "peer prompt-attention arm, lead card" # the lead's reserve, the split, and the chunk ceiling
+    grep "peer prompt-attention arm:"           # the shard projections copied resident on the partner card
+
+What boot 3 read off, the first measurement of any of it: staging **20 971 520 floats = 8192 x 2560**, so the
+wire's funded width and the publisher's `rows_max` are one number as its check assumes; **79 MiB** of shard
+projections per partner (the ledger's 80.0 MiB truncated); **116 MiB** off each stage lead's tier. The partner's
+card delta is not that — the gate-off boot also differed in its RAM split — so ~2.01 GiB stays arithmetic.
 
 **Why the reduce was never allowed ahead of (a)+(b)**: `tp2_add_wait` spins, gives up, and returns leaving the
-buffer a HALF sum while the collective still reported success. With no publisher and no driver, a lead-side reduce
-would add the lead's heads alone and call it the model's output — RUN 17's class, caught at the wrapper
-(`b34904ba`) but only late, which is why the pieces that make the peer's push exist had to land with it.
-
+buffer a HALF sum while the collective still reported success — RUN 17's class, caught at the wrapper
+(`b34904ba`) but only late.
 ## 0. Rulings taken mid-run (the supervisor's, applied to this file)
 **Branch doctrine (supervisor):** *cases unrun are cases that have not passed.* A GPU-labelled test that
 has never executed is not evidence. Adopted after the first execution of `tp2_head_split_parity`
