@@ -288,11 +288,10 @@ Q6_K's 210 B per 256 values give what the tier now holds:
     resident projections 6 x (6144x2100 + 256x2100 + 256x2100 + norms) = 80.0 MiB; TOTAL ~2.01 GiB (12.7% of carve)
 
 That uniformity is what lets one `kv_row_bytes`/`kv_type` stand for both KV projections; `peer_qsa_resident_up`
-checks each layer's own type and row against those figures at boot, so a pack that split K from V - or one QSA layer
-from another - is a refusal naming them, not a copy wider than its buffer. The same function is the answer to the
-second hole of this class: the arm's `qs.wq/wk/wv/wqn/wkn/wiqn/wikn` were allocated, priced into the tier and read
-by `peer_qsa_layer`, and **nothing had ever written them** - the first gated prompt would have multiplied whatever
-`cudaMalloc` returned.
+checks each layer's own type and row against those figures at boot, so a pack that split K from V - or one layer from
+another - is a refusal naming them, not a copy wider than its buffer. The same function is the answer to the second
+hole of this class: the arm's `qs.wq/wk/wv/wqn/wkn/wiqn/wikn` were allocated, priced into the tier and read by
+`peer_qsa_layer` - and **nothing had ever written them** (a plausible token from whatever `cudaMalloc` left).
 
 And the range, because the tier figure above depends on it: a stage's table holds its OWN layers' projections only
 (`NativeDense` loads inside `set_layer_range(st.lo, st.hi)`), so `qsa_pair_prepare` and its sizer twin
