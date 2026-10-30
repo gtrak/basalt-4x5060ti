@@ -88,7 +88,17 @@ void test_span_tracks_the_session_sizer() {
     for (int64_t i = 0; i < 6; ++i) want += qsa_prompt_state_bytes(g, CELLS, whole);
     // the whole-layer shard prices the same as the pair's rank 0 at the symmetric cut for the INDEXER part, but
     // not for the KV: compare against the partner's own shard, which is what funds
-    CHECK(part(s, 0) == 6 * qsa_prompt_state_bytes(g, CELLS, s.heads));
+    // the walk reports what is actually HELD, so each layer's allocation carries the 256 B round-up `take`
+    // applies; the raw sizer figure is the floor, and the gap must be rounding only, never a missing term
+    uint64_t raw = 0, rounded = 0;
+    for (int64_t i = 0; i < 6; ++i) {
+        const uint64_t b = qsa_prompt_state_bytes(g, CELLS, s.heads);
+        raw += b;
+        rounded += (b + 255) & ~uint64_t(255);
+    }
+    CHECK(part(s, 0) == rounded);
+    CHECK(part(s, 0) >= raw);
+    CHECK(part(s, 0) - raw < 6u * 256u);
     CHECK(want > part(s, 0));   // the partner holds half the KV, so strictly less than a whole layer
 }
 

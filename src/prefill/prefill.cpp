@@ -737,6 +737,52 @@ struct PeerPrefill {
                   "the peer's ring must outlive two groups' blobs");   // over into it - and a group's span reads
     static_assert(kSpan >= fp4::kMaxExperts,       // one span slot per expert a group reads, taken in turn
                   "a group must not reuse a span slot it still reads");
+    // ===================== the prompt-attention arm (--exp tp_prompt_attn, RUN 25) =====================
+    //
+    // This card's OWN half of the prompt QSA attention: it projects its shard's q, k and v from the lead's FP16
+    // mixed rows, appends its KV span to pools of its own, re-runs the indexer against a pooled table of its own
+    // so the selection stays the lead's bit for bit, attends its query heads, and produces the o_proj PARTIAL
+    // that the lead sums with its own.  Live only with the gate on; `PeerQsaSpan` is what sizes it, and BOTH the
+    // tier's reserve and this allocation come out of the one `peer_qsa_layout` walk below, so a boot cannot
+    // survive sizing and then die here.
+    //
+    // The projections are RESIDENT on this card, copied at boot: a QSA layer moves no weight bytes across the
+    // link.  And this card runs its OWN `Gemm`, because `Gemm::native` dequantizes a weight's GGUF blocks into a
+    // scratch on the device the product runs on - the lead's scratch and cuBLAS workspace cannot be borrowed
+    // across the link.
+    struct Qsa {
+        Prefill::PeerQsaSpan span;              ///< what this was sized for: geometry, shard, stage range, cells
+        std::vector<core::QsaState> states;     ///< one per QSA layer of the stage, carved on this card
+        std::vector<void*> state_base;          ///< the allocation each state was carved from (freed via owned)
+
+        // The wire: `kWireSets` sets, so layer l+1's inbound can land while layer l's arm runs.  One set is the
+        // per-layer traffic the ledger prices; the second is the tier's cost of the overlap.
+        uint16_t* mixed_h[2] = {};   // in: the lead's FP16 m.mixed_h, the same bits its own attn_q read
+        float* q_idx[2] = {};        // in: the lead's indexer q projection (the selection stays the lead's)
+        float* idx_raw[2] = {};      // in: the lead's indexer k projection
+        uint16_t* part_out[2] = {};  // out: this card's BF16 o_proj partial, on its way to the lead
+
+        // This card's own per-chunk scratch, ONE set: every buffer here is written and read inside one layer's
+        // arm on `s` and is dead once that layer's partial has been pushed.
+        float *Qf = nullptr, *q = nullptr, *attn = nullptr, *Kc = nullptr, *Vc = nullptr;
+        int32_t* sel_ids = nullptr;
+        float* sel_scores = nullptr;
+
+        // The projections this card owns: its shard's rows of attn_q, its KV head's rows of attn_k/attn_v, and
+        // the two RMS norms those projections are normalized by.  Boot-time copies, no per-layer traffic.
+        void *wq = nullptr, *wk = nullptr, *wv = nullptr;
+        float *wqn = nullptr, *wkn = nullptr;
+
+        Gemm gemm;                    // this card's own (see the header note)
+        uint16_t* gscratch = nullptr;
+        void* gws = nullptr;
+
+        cudaStream_t s = nullptr;     // this card's attention stream, behind its expert-row stream
+        cudaEvent_t ev_in = nullptr;  // the lead published this layer's rows
+        cudaEvent_t ev_out = nullptr; // this card's partial has landed for the lead
+        bool live = false;
+    } qsa;
+
     cudaStream_t copy = nullptr;            // this card's own host->device copy stream
     cudaStream_t span_copy = nullptr;       // ... and the stream the re-reads take, so they queue behind nothing
     std::vector<uint8_t*> stage;            // [ring + span] blob slots on this card
@@ -755,6 +801,12 @@ struct PeerPrefill {
         if (s_out) cudaStreamSynchronize(s_out);
         if (copy) cudaStreamSynchronize(copy);
         if (span_copy) cudaStreamSynchronize(span_copy);
+        // the prompt-attention arm's stream and events.  Its buffers are all `take` allocations and go with
+        // `owned` above; its Gemm was init_external'd, so it frees nothing of its own.
+        if (qsa.s) cudaStreamSynchronize(qsa.s);
+        if (qsa.ev_in) cudaEventDestroy(qsa.ev_in);
+        if (qsa.ev_out) cudaEventDestroy(qsa.ev_out);
+        if (qsa.s) cudaStreamDestroy(qsa.s);
         for (cudaEvent_t e : copied) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : used) if (e) cudaEventDestroy(e);
         if (copy) cudaStreamDestroy(copy);
@@ -1876,6 +1928,104 @@ static void peer_layout(PeerPrefill& pp, int64_t Tp, int64_t tf, const MmqPlan& 
     }
 }
 
+/// The partner's prompt-attention buffers, laid out by ONE walk that BOTH callers use: `make_peer` with a
+/// cudaMalloc `take`, and the tier's sizing with a counting one.  That identity is the point - the reserve the
+/// partner's expert tier leaves free is produced by the same code as the allocation that fills it, so a boot
+/// cannot pass sizing and then fail here.  `parts`, when given, gets the per-group figures for the boot line.
+struct PeerQsaParts {
+    uint64_t span = 0, wire = 0, scratch = 0, weights = 0, gemm = 0;
+};
+
+template <typename Take>
+void peer_qsa_layout(PeerPrefill::Qsa& qs, int64_t T, Take&& take, PeerQsaParts* parts) {
+    const Prefill::PeerQsaSpan& sp = qs.span;
+    PeerQsaParts tmp;
+    // a span the caller never turned on, or one it cannot price, reserves nothing.  The shard must be `ok()`:
+    // a malformed one would size pools for a head run that does not exist.
+    if (!sp.on || T <= 0 || sp.g == nullptr || sp.max_cells <= 0 || !sp.heads.ok()) return;
+    const core::ModelGeometry& g = *sp.g;
+    const basalt::kernels::QsaShapes sh = core::qsa_shard_shapes(g, sp.heads);
+    const int64_t N = g.n_embd;
+    const int64_t nl = sp.n_qsa_layers();
+    if (nl <= 0) return;
+
+    // the span: one prompt-time QSA state a QSA layer, at this card's shard, carved over an allocation of the
+    // session sizer's own figure.  Same call both sides, so the pools cannot come out a different width than
+    // the tier was shrunk by.
+    qs.states.assign((size_t) nl, core::QsaState{});
+    qs.state_base.assign((size_t) nl, nullptr);
+    for (int64_t i = 0; i < nl; ++i) {
+        const uint64_t bytes = core::qsa_prompt_state_bytes(g, sp.max_cells, sp.heads);
+        void* base = take((size_t) bytes);
+        tmp.span += (bytes + 255) & ~uint64_t(255);
+        if (base == nullptr) continue;   // counting, or a failed allocation: the caller checks `take`'s failure
+        qs.state_base[(size_t) i] = base;
+        core::qsa_prompt_state_carve(g, sp.max_cells, base, qs.states[(size_t) i], sp.heads);
+    }
+
+    // the wire: `kWireSets` resident sets of what one QSA layer moves.  Two so the pipelined gate can put layer
+    // l+1's inbound on the link under layer l's compute; a single set would make the lead wait for this card to
+    // finish reading the previous layer's rows, which is the serialization the mode exists to remove.
+    for (int b = 0; b < Prefill::PeerQsaSpan::kWireSets; ++b) {
+        qs.mixed_h[b] = (uint16_t*) take((size_t) T * N * 2);
+        qs.q_idx[b] = (float*) take((size_t) T * sh.idx_n_head * sh.idx_dim * 4);
+        qs.idx_raw[b] = (float*) take((size_t) T * sh.idx_dim * 4);
+        qs.part_out[b] = (uint16_t*) take((size_t) T * N * 2);
+    }
+    // round each resident buffer the way `take` does, so the figure matches what was actually held
+    {
+        uint64_t r = 0;
+        for (uint64_t x : {(uint64_t) T * N * 2, (uint64_t) T * sh.idx_n_head * sh.idx_dim * 4,
+                           (uint64_t) T * sh.idx_dim * 4, (uint64_t) T * N * 2})
+            r += (x + 255) & ~uint64_t(255);
+        tmp.wire = r * Prefill::PeerQsaSpan::kWireSets;
+    }
+
+    // this card's own per-chunk scratch, at the SHARD's widths: where the head split pays in VRAM as well as in
+    // time.  One set - see the note on `PeerPrefill::Qsa`.
+    const int64_t cap = basalt::kernels::qsa_selection_width(basalt::kernels::kTopkMaxCells, sh);
+    const int64_t max_blocks = sp.max_cells / sh.idx_block + 2;
+    uint64_t sc = 0;
+    auto one_scratch = [&](size_t bytes) { sc += (bytes + 255) & ~uint64_t(255); return take(bytes); };
+    qs.Qf = (float*) one_scratch((size_t) T * sp.heads.nq() * 2 * sh.head_dim * 4);
+    qs.q = (float*) one_scratch((size_t) T * sp.heads.nq() * sh.head_dim * 4);
+    qs.attn = (float*) one_scratch((size_t) T * sp.heads.nq() * sh.head_dim * 4);
+    qs.Kc = (float*) one_scratch((size_t) T * sp.heads.nkv() * sh.head_dim * 4);
+    qs.Vc = (float*) one_scratch((size_t) T * sp.heads.nkv() * sh.head_dim * 4);
+    qs.sel_ids = (int32_t*) one_scratch((size_t) T * cap * 4);
+    qs.sel_scores = (float*) one_scratch(256 * (size_t) max_blocks * 4);
+    tmp.scratch = sc;
+
+    // the projections, RESIDENT: this shard's rows of attn_q, its KV head's rows of attn_k and attn_v, and the
+    // q/k norms.  Copied at boot by the arm's setup, so no QSA layer moves weight bytes across the link.  The
+    // row bytes come from the pack (this walk sees geometry only); unset means the pack was never consulted and
+    // nothing is priced here rather than guessed at a block layout.
+    if (sp.q_row_bytes > 0 && sp.kv_row_bytes > 0) {
+        const core::QsaHeadRun qr = core::qsa_q_rows(sp.heads, sh.head_dim);
+        const core::QsaHeadRun kr = core::qsa_kv_rows(sp.heads, sh.head_dim);
+        qs.wq = take((size_t) qr.len * sp.q_row_bytes);
+        qs.wk = take((size_t) kr.len * sp.kv_row_bytes);
+        qs.wv = take((size_t) kr.len * sp.kv_row_bytes);
+        qs.wqn = (float*) take((size_t) sh.head_dim * 4);
+        qs.wkn = (float*) take((size_t) sh.head_dim * 4);
+        uint64_t w = 0;
+        for (int64_t i = 0; i < nl; ++i)
+            for (uint64_t x : {(uint64_t) qr.len * sp.q_row_bytes, (uint64_t) kr.len * sp.kv_row_bytes,
+                               (uint64_t) kr.len * sp.kv_row_bytes, (uint64_t) sh.head_dim * 4,
+                               (uint64_t) sh.head_dim * 4})
+                w += (x + 255) & ~uint64_t(255);
+        tmp.weights = w;
+    }
+
+    // this card's OWN Gemm: `Gemm::native` dequantizes into a scratch on the device the product runs on, so the
+    // pair's second card needs its own scratch and cuBLAS workspace.
+    qs.gscratch = (uint16_t*) take((size_t) GEMM_SCRATCH * 2);
+    qs.gws = take(GEMM_WS);
+    tmp.gemm = ((uint64_t) GEMM_SCRATCH * 2 + 255) / 256 * 256 + ((uint64_t) GEMM_WS + 255) / 256 * 256;
+
+    if (parts) *parts = tmp;
+}
+
 static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, int64_t tf, bool rows_fp32,
                       bool acts_fp32, const PeerRamShare* ram,
                       std::unique_ptr<PeerPrefill>& out, std::string& err) {
@@ -1935,6 +2085,18 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
         return p;
     };
     peer_layout(*pp, Tp, tf, mp, take);
+    // the prompt-attention arm's buffers, from the SAME walk the tier's reserve was counted from
+    if (pp->qsa.span.on) {
+        peer_qsa_layout(pp->qsa, Tp, take, nullptr);
+        if (ok) {
+            ok = cudaStreamCreateWithFlags(&pp->qsa.s, cudaStreamNonBlocking) == cudaSuccess &&
+                 cudaEventCreateWithFlags(&pp->qsa.ev_in, cudaEventDisableTiming) == cudaSuccess &&
+                 cudaEventCreateWithFlags(&pp->qsa.ev_out, cudaEventDisableTiming) == cudaSuccess;
+        }
+        if (ok)
+            ok = pp->qsa.gemm.init_external(pp->qsa.s, pp->qsa.gscratch, GEMM_SCRATCH, pp->qsa.gws, GEMM_WS, err);
+        if (ok) pp->qsa.live = true;
+    }
     if (pp->ram_rows) {   // its own link: a copy stream of its own, and one wait/release event per slot
         ok = ok && cudaStreamCreateWithFlags(&pp->copy, cudaStreamNonBlocking) == cudaSuccess &&
              cudaStreamCreateWithFlags(&pp->span_copy, cudaStreamNonBlocking) == cudaSuccess;
@@ -2068,92 +2230,22 @@ int64_t Prefill::PeerQsaSpan::n_qsa_layers() const {
 
 void Prefill::PeerQsaSpan::bytes(int64_t T, uint64_t* span, uint64_t* wire, uint64_t* scratch, uint64_t* weights,
                                  uint64_t* gemm, uint64_t* total) const {
-    if (span) *span = 0;
-    if (wire) *wire = 0;
-    if (scratch) *scratch = 0;
-    if (weights) *weights = 0;
-    if (gemm) *gemm = 0;
-    if (total) *total = 0;
-    if (!on || !g || T <= 0 || max_cells <= 0 || !heads.ok()) return;
-    const int64_t nl = n_qsa_layers();
-    if (nl <= 0) return;
-
-    // 1. the span: the partner's own QSA state a QSA layer, at its shard - its KV heads' pools, its page table,
-    // and the indexer's pooled table / tail / spare / block position it re-runs the indexer against.  The
-    // session's own sizer prices it, so a KV format change (--kv int8 / q4_0 / k8v4) moves this with it instead
-    // of needing a second ledger to be updated by hand.
-    uint64_t sp = 0;
-    for (int64_t i = 0; i < nl; ++i) sp += core::qsa_prompt_state_bytes(*g, max_cells, heads);
-
-    // 2. the wire: what lands on the partner's card per chunk, plus its partial on the way back.  The mix RUN 25
-    // settled on: the lead's FP16 mixed rows (the SAME bits its own attn_q read, so the partner's q is its own
-    // half of the lead's q), and the lead's indexer projections, which keep the selection the lead's.
-    //
-    // TWO sets.  The pipelined gate (`=2`) exists to put layer l+1's inbound on the link under layer l's compute,
-    // and a single staging set would serialize exactly that: the lead could not write the next layer's rows until
-    // the partner had finished reading the previous layer's.  The returning partial is doubled for the same
-    // reason - the partner starts layer l+1's arm while layer l's partial is still in flight to the lead.  The
-    // per-layer TRAFFIC is unchanged (the ledger prices one set); this is resident bytes, not bytes moved.
-    const int64_t N = g->n_embd;
-    const basalt::kernels::QsaShapes s = core::qsa_shard_shapes(*g, heads);
-    uint64_t one = 0;
-    one += (uint64_t) T * N * 2;                                // in: the lead's FP16 m.mixed_h
-    one += (uint64_t) T * s.idx_n_head * s.idx_dim * 4;         // in: q_idx (the lead's indexer q projection)
-    one += (uint64_t) T * s.idx_dim * 4;                        // in: idx_raw (the lead's indexer k projection)
-    one += (uint64_t) T * N * 2;                                // out: the o_proj partial, BF16
-    const uint64_t w = one * kWireSets;
-
-    // 3. the scratch: the partner's own per-chunk buffers for the arm it runs - its q/k/v projections, its
-    // attention, and the selection its re-run indexer produces.  At the SHARD's widths, which is where the
-    // head split pays in VRAM as well as in time.
-    //
-    // ONE set, on purpose (unlike the wire above): every buffer here is written and read inside the partner's
-    // own compute for one layer, on its own stream, and is dead once that layer's partial has been pushed.  The
-    // pair of layers the pipeline overlaps share nothing here - the overlap is on the link, not on the
-    // partner's compute - so a second set would be 0.5 GiB of tier bought for nothing.  If the arm's structure
-    // ever does hold one of these across the overlap boundary, it gets its own second set and this comment
-    // says which; do not double the whole block on spec.
-    Alloc a;
-    a.count_only = true;
-    bool ok = true;
-    const int64_t cap = basalt::kernels::qsa_selection_width(basalt::kernels::kTopkMaxCells, s);
-    const int64_t max_blocks = max_cells / s.idx_block + 2;
-    a.take<float>((size_t) T * heads.nq() * 2 * s.head_dim, ok);   // Qf: its query heads and their gates
-    a.take<float>((size_t) T * heads.nq() * s.head_dim, ok);       // q: the query half, post split/norm/rope
-    a.take<float>((size_t) T * heads.nq() * s.head_dim, ok);       // attn: the attention's output
-    a.take<float>((size_t) T * heads.nkv() * s.head_dim, ok);      // Kc
-    a.take<float>((size_t) T * heads.nkv() * s.head_dim, ok);      // Vc
-    a.take<int32_t>((size_t) T * cap, ok);                         // its selection
-    a.take<float>(256 * (size_t) max_blocks, ok);                  // the block scores, one selection batch
-    if (!ok) return;
-
-    // 4. the projections, RESIDENT on the partner's card (the RUN 25 ruling).  The partner projects its own q, k
-    // and v from the lead's FP16 mixed rows, so it needs its shard's rows of `attn_q` and its KV head's rows of
-    // `attn_k`/`attn_v`, plus the q/k RMS norms those projections are normalized by.  Copied once at boot, so a
-    // QSA layer moves no weight bytes across the link: P2P weight reads were rejected precisely because they
-    // would put an unpriced ~weight-sized transfer on every chunk and void the 104.9 MB the gates grade against.
-    // The bytes-per-row come from the pack (this sizer sees geometry only); with the caller never having read
-    // them, nothing is priced here rather than guessed at a block layout the pack may not use.
-    uint64_t wt = 0;
-    if (q_row_bytes > 0 && kv_row_bytes > 0) {
-        const core::QsaHeadRun qr = core::qsa_q_rows(heads, s.head_dim);
-        const core::QsaHeadRun kr = core::qsa_kv_rows(heads, s.head_dim);
-        wt += (uint64_t) nl * ((uint64_t) qr.len * q_row_bytes + 2u * (uint64_t) kr.len * kv_row_bytes);
-        wt += (uint64_t) nl * 2u * (uint64_t) s.head_dim * 4;   // attn_q_norm, attn_k_norm (FP32 vectors)
-    }
-
-    // 5. the partner's OWN GEMM context: `Gemm::native` dequantizes each weight's GGUF blocks into a scratch on
-    // the device the product runs on, and the partner's products run on the partner.  It cannot borrow the lead's
-    // scratch or workspace across the link, so the pair's second card needs its own of both.
-    const uint64_t gm = (uint64_t) GEMM_SCRATCH * 2 + GEMM_WS;
-
-    if (span) *span = sp;
-    if (wire) *wire = w;
-    if (scratch) *scratch = a.used;
-    if (weights) *weights = wt;
-    if (gemm) *gemm = gm;
-    if (total) *total = sp + w + a.used + wt + gm;
+    // The counting path of the ONE walk `make_peer` allocates through (`peer_qsa_layout`): the tier's reserve and
+    // the partner's allocation are produced by the same code, which is the whole reason the boot cannot be sized
+    // for one amount and then fail to allocate another.
+    PeerPrefill pp;
+    pp.qsa.span = *this;
+    PeerQsaParts p;
+    auto count = [&](size_t bytes) -> void* { return nullptr; };
+    peer_qsa_layout(pp.qsa, T, count, on ? &p : nullptr);
+    if (span) *span = p.span;
+    if (wire) *wire = p.wire;
+    if (scratch) *scratch = p.scratch;
+    if (weights) *weights = p.weights;
+    if (gemm) *gemm = p.gemm;
+    if (total) *total = p.span + p.wire + p.scratch + p.weights + p.gemm;
 }
+
 
 uint64_t Prefill::PeerQsaSpan::wire_one_set(int64_t T) const {
     if (!on || !g || T <= 0 || max_cells <= 0 || !heads.ok()) return 0;
@@ -2183,9 +2275,11 @@ uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_r
     // allocation, over-reserving only costs the partner a few tier slots the boot line reports
     pp.ram_rows = peer_ram_rows && tf > 0;
     uint64_t sum = 0;
-    peer_layout(pp, Tp, tf, mmq_plan(), [&](size_t bytes) -> void* { sum += (bytes + 255) & ~size_t(255); return nullptr; });
-    // the prompt-attention span the partner holds resident for its half of the attention (RUN 25); null, or the
-    // gate closed, adds nothing and the partner's tier is what it was before the slice existed
+    auto count = [&](size_t bytes) -> void* { sum += (bytes + 255) & ~size_t(255); return nullptr; };
+    peer_layout(pp, Tp, tf, mmq_plan(), count);
+    // the prompt-attention span the partner holds resident for its half of the attention (RUN 25).  Counted
+    // through the SAME walk `make_peer` allocates with, so the reserve cannot disagree with the allocation;
+    // null, or the gate closed, adds nothing and the partner's tier is what it was before the slice existed.
     if (qsa) {
         uint64_t tot = 0;
         qsa->bytes(Tp, nullptr, nullptr, nullptr, nullptr, nullptr, &tot);
@@ -2212,9 +2306,14 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
     // it never arms the decode head split, whose own refusal lives in verify.cpp's `qhs_peer_item`.
     const double prompt_attn = core::exp_flag("tp_prompt_attn", 0.0);
     if (prompt_attn != 0) {
+        // Named against what is actually missing, so the line does not go stale as the pieces land: the buffers
+        // (span, wire, scratch, resident projections, the partner's Gemm) ARE sized and allocated now, by the
+        // same walk the tier's reserve is counted from.  What is absent is the compute and the two protocols.
         err = "prefill peer: --exp tp_prompt_attn=" + std::to_string(static_cast<int>(prompt_attn)) +
-              " is refused: the peer's prompt-attention leg is not built (no peer QSA arm, no partner KV span, no "
-              "span catch-up, no o_proj reduce-to-lead); the lead runs the whole attention";
+              " is refused: the partner's prompt-attention arm is not built (no per-layer QSA compute on the "
+              "partner, no span_valid catch-up for the cells the lead appended while the partner was out of the "
+              "loop, no o_proj reduce-to-lead, and the tier's call sites do not reserve the span yet); the lead "
+              "runs the whole attention";
         return false;
     }
     const int64_t ne = m.g ? m.g->n_expert : basalt::kernels::cpu::expert_layout().n_expert;

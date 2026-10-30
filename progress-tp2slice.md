@@ -218,6 +218,28 @@ If that measured term eats the margin, the P3 fallback verdict stands as filed: 
 peer-resident span the slice cannot pay on this fabric, and peer-reads-the-lead's-pool-over-P2P is
 not the escape — it is ~50 GB a chunk (cap 2048 x 256 dim x 2 B x 8192 queries) and dead.
 
+## Item (2) so far: the arm's container, allocated by the sizing walk itself
+
+`PeerPrefill::Qsa` now exists: the partner's per-QSA-layer `QsaState` array, two wire sets, its shard-width
+scratch, its resident projection pointers, its **own** `Gemm` (ruled: `Gemm::native` dequantizes on the device
+the product runs on, so the lead's scratch and cuBLAS workspace cannot cross the link), and its own stream with
+an `ev_in`/`ev_out` pair — the event-not-sync shape the ruling asked for, matching RUN 19's early transport.
+
+**The anti-drift property, which is the point of this unit:** the buffers are laid out by ONE function,
+`peer_qsa_layout`, and both callers drive it with a different `take` — `make_peer` with `cudaMalloc`, and
+`Prefill::PeerQsaSpan::bytes()` with a counting no-op. The tier's reserve and the allocation are therefore the
+same code, not two ledgers kept in step by hand. The states are carved with `qsa_prompt_state_carve` over an
+allocation of `qsa_prompt_state_bytes`, so the pools cannot come out a different width than the tier was shrunk
+by. `bytes()` no longer computes wire/scratch/weights/gemm itself; it reads them out of that walk.
+
+Still missing, and the gate still refuses at `Prefill::set_peer` with the message updated to name exactly these
+(the old message claimed the span and Gemm were absent; they are not):
+
+- the per-layer QSA compute on the partner (item 2 proper, mirroring `prefill.cpp:2844-2953`),
+- `span_valid` + the per-turn catch-up + its invalidation sites (item 3),
+- the `o_proj` reduce-to-lead via `qsa_pair_prepare` + `Tp2Pair` SM push (item 4),
+- the tier's call sites (`generate.cpp:3104/3111`) still pass no span, so `stage_room` leaves no room yet.
+
 ## Where the arithmetic lives
 
 The byte ledger, the funding figure, the span catch-up pricing and the filed predictions are in
