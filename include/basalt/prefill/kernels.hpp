@@ -97,13 +97,19 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
 void split_q(const float* q_full, float* q, int64_t T, void* stream);
 /// attn[t, h, d] *= sigmoid(q_full[t, h, 256 + d]) -> out16 (fp16 bits: the o-projection is quantized), whole.
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream);
-/// The same two over ONE card's query-head run [h0, h0+nh) of `qf`, whose per-token float stride is `ld`
-/// (`heads_in_qf * 512`, not `nh * 512`, when the run is a slice of a wider matrix).  Outputs are
-/// [T, nh, 256] contiguous.  The whole-layer pair above is these with the whole run, so the pair's shard and the
-/// lead's layer share one kernel body and cannot drift (`qsa_head_split.hpp`; the pair's own arm calls these).
+/// The same two over ONE card's query-head run.  The whole-layer pair above is these with the whole run, so the
+/// pair's shard and the lead's layer share one kernel body and cannot drift (`qsa_head_split.hpp`; the pair's own
+/// arm calls these).
+///
+/// `split_q_span` READS WIDE: `qf` holds every head, `[h0, h0+nh)` is this card's run, and its per-token float
+/// stride is `heads_in_qf * 512` - not `nh * 512` - when the run is a slice of a wider matrix.  It writes narrow:
+/// `q` is [T, nh, 256] contiguous.
+/// `gate_attn_span` takes no head offset, because BOTH its inputs are the card's OWN rows: `attn` and `qf` are
+/// laid out for `nh` heads and the output is [T, nh, 256] contiguous.  It used to take an offset that it applied
+/// to `qf` but not to `attn`, which silently gated one head with another's activations.
 void split_q_span(const float* qf, float* q, int64_t T, int64_t h0, int64_t nh, int64_t ld, void* stream);
-void gate_attn_span(const float* attn, const float* qf, uint16_t* out16, int64_t T, int64_t h0, int64_t nh,
-                    int64_t ld, void* stream);
+void gate_attn_span(const float* attn, const float* qf, uint16_t* out16, int64_t T, int64_t nh, int64_t ld,
+                    void* stream);
 
 /// K and V of T consecutive cells (positions pos0..pos0+T-1; K normed and rotated) into the paged pools: FP16
 /// (`k_pool`/`v_pool`) or INT8 codes + FP16 scale per 64 (`k_q`...), the decode append's arithmetic.

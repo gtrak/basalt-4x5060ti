@@ -567,12 +567,18 @@ __global__ void split_q_kernel(const float* __restrict__ qf, float* __restrict__
     const int64_t t = i / (nh * 256), h = (i / 256) % nh, d = i % 256;
     q[i] = qf[t * ld + (h0 + h) * 512 + d];
 }
+// Both inputs are this card's OWN rows, laid out for `nh` heads: `a` [T, nh, 256] and `qf` [T, nh, 2*256].  The
+// kernel once took a head offset for `qf` and applied no offset to `a`, so a caller handing it a wide buffer and
+// a head span got the gate of one head applied to another head's activations - a plausible number, not a crash.
+// Nothing in the engine ever wanted the offset (its two inputs are both the card's own rows), so it is gone
+// rather than made consistent: one contract, no way to get half of it wrong.  `split_q_span` keeps its offset
+// because it genuinely reads wide and writes narrow.
 __global__ void gate_attn_kernel(const float* __restrict__ a, const float* __restrict__ qf, uint16_t* __restrict__ o16,
-                                 int64_t T, int64_t nh, int64_t h0, int64_t ld) {
+                                 int64_t T, int64_t nh, int64_t ld) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * nh * 256) return;
     const int64_t t = i / (nh * 256), h = (i / 256) % nh, d = i % 256;
-    o16[i] = hf(a[i] * (1.0f / (1.0f + expf(-qf[t * ld + (h0 + h) * 512 + 256 + d]))));
+    o16[i] = hf(a[i] * (1.0f / (1.0f + expf(-qf[t * ld + h * 512 + 256 + d]))));
 }
 
 // one block per (token, kv head, 64-value group); 64 threads. KV streaming: the pool page only if the block is
@@ -858,17 +864,17 @@ void split_q(const float* q_full, float* q, int64_t T, void* stream) {
 }
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream) {
     const basalt::kernels::QsaShapes s = basalt::kernels::qsa_real_shapes();
-    gate_attn_span(attn, q_full, out16, T, 0, s.n_head, s.n_head * 2 * s.head_dim, stream);
+    gate_attn_span(attn, q_full, out16, T, s.n_head, s.n_head * 2 * s.head_dim, stream);
 }
 void split_q_span(const float* qf, float* q, int64_t T, int64_t h0, int64_t nh, int64_t ld, void* stream) {
     if (nh <= 0) return;
     split_q_kernel<<<blocks_for(T * nh * 256), 256, 0, (cudaStream_t) stream>>>(qf, q, T, nh, h0, ld);
     check("split_q_span");
 }
-void gate_attn_span(const float* attn, const float* qf, uint16_t* out16, int64_t T, int64_t h0, int64_t nh, int64_t ld,
+void gate_attn_span(const float* attn, const float* qf, uint16_t* out16, int64_t T, int64_t nh, int64_t ld,
                     void* stream) {
     if (nh <= 0) return;
-    gate_attn_kernel<<<blocks_for(T * nh * 256), 256, 0, (cudaStream_t) stream>>>(attn, qf, out16, T, nh, h0, ld);
+    gate_attn_kernel<<<blocks_for(T * nh * 256), 256, 0, (cudaStream_t) stream>>>(attn, qf, out16, T, nh, ld);
     check("gate_attn_span");
 }
 

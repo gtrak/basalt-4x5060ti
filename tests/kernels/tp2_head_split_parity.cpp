@@ -23,6 +23,7 @@
 #include "basalt/kernels/qsa_dec_attn.hpp"
 #include "basalt/kernels/qsa_decode_attn.hpp"
 #include "basalt/kernels/qsa_prompt_attn.hpp"
+#include "basalt/kernels/qsa_select.hpp"
 #include "basalt/kernels/quantize_act.hpp"
 #include "basalt/kernels/s_gemv.hpp"
 #include "basalt/kernels/tp2_collective.hpp"
@@ -741,7 +742,7 @@ int main(int argc, char** argv) {
         cudaFree(pattn_f); cudaFree(pattn0); cudaFree(pattn1);
     }
 
-    // ---- 7. split_q and gate_attn, split vs whole: the two kernels the prompt-attention arm needed widened
+    // ---- 8. split_q and gate_attn, split vs whole: the two kernels the prompt-attention arm needed widened
     //
     // These two were the head split's blind spot: every other entry point here takes its counts as arguments,
     // but these hardcoded 24 query heads and a 24-head q_full stride, so a card running 12 heads would have
@@ -776,7 +777,23 @@ int main(int argc, char** argv) {
             float* qs_d = dalloc<float>((size_t) T7 * nh * D);
             uint16_t* gs_d = dalloc<uint16_t>((size_t) T7 * nh * D);
             pr::split_q_span(qf_d, qs_d, T7, r->q0(), nh, NH * nq7, nullptr);
-            pr::gate_attn_span(at_d, qf_d, gs_d, T7, r->q0(), nh, NH * nq7, nullptr);
+            // the card's OWN attn and Qf: [T, nh, 256] and [T, nh, 512], exactly as this card's own
+            // qsa_prompt_attn_batch and native_proj leave them - not a strided view of the lead's buffers,
+            // which is what let a one-sided head offset survive here unnoticed
+            std::vector<float> at_c((size_t) T7 * nh * D), qf_c((size_t) T7 * nh * 2 * D);
+            for (int64_t t = 0; t < T7; ++t)
+                for (int64_t h = 0; h < nh; ++h) {
+                    for (int64_t d = 0; d < D; ++d)
+                        at_c[(size_t) t * nh * D + h * D + d] = attn[(size_t) t * NH * D + (r->q0() + h) * D + d];
+                    for (int64_t k = 0; k < 2 * D; ++k)
+                        qf_c[(size_t) t * nh * 2 * D + h * 2 * D + k] =
+                            qf[(size_t) t * NH * 2 * D + (r->q0() + h) * 2 * D + k];
+                }
+            float* at_c_d = dalloc<float>(at_c.size());
+            float* qf_c_d = dalloc<float>(qf_c.size());
+            up(at_c_d, at_c); up(qf_c_d, qf_c);
+            pr::gate_attn_span(at_c_d, qf_c_d, gs_d, T7, nh, nh * 2 * D, nullptr);
+            cudaFree(at_c_d); cudaFree(qf_c_d);
             const std::vector<float> gq = down(qs_d, (size_t) T7 * nh * D);
             const std::vector<uint16_t> gg = down(gs_d, (size_t) T7 * nh * D);
             int reported = 0;
@@ -807,11 +824,19 @@ int main(int argc, char** argv) {
             cudaEventCreate(&e0); cudaEventCreate(&e1);
             float* qs_d = dalloc<float>((size_t) T7 * r0.nq() * D);
             uint16_t* gs_d = dalloc<uint16_t>((size_t) T7 * r0.nq() * D);
+            // the shard side of the bench runs on the card's OWN rows, as the arm does - timing the wide
+            // buffers here would measure a call the engine never makes
+            std::vector<float> at_l((size_t) T7 * r0.nq() * D), qf_l((size_t) T7 * r0.nq() * 2 * D);
+            for (auto& x : at_l) x = nd(rng);
+            for (auto& x : qf_l) x = nd(rng);
+            float* at_l_d = dalloc<float>(at_l.size());
+            float* qf_l_d = dalloc<float>(qf_l.size());
+            up(at_l_d, at_l); up(qf_l_d, qf_l);
             for (int i = 0; i < 5; ++i) {   // warm up: the first launch pays module load and clock ramp
                 pr::split_q(qf_d, qf_whole, T7, nullptr);
                 pr::gate_attn(at_d, qf_d, g_whole, T7, nullptr);
                 pr::split_q_span(qf_d, qs_d, T7, r0.q0(), r0.nq(), NH * nq7, nullptr);
-                pr::gate_attn_span(at_d, qf_d, gs_d, T7, r0.q0(), r0.nq(), NH * nq7, nullptr);
+                pr::gate_attn_span(at_l_d, qf_l_d, gs_d, T7, r0.nq(), r0.nq() * 2 * D, nullptr);
             }
             cudaEventRecord(e0);
             for (int i = 0; i < reps; ++i) { pr::split_q(qf_d, qf_whole, T7, nullptr);
@@ -820,7 +845,7 @@ int main(int argc, char** argv) {
             float whole_ms = 0; cudaEventElapsedTime(&whole_ms, e0, e1);
             cudaEventRecord(e0);
             for (int i = 0; i < reps; ++i) { pr::split_q_span(qf_d, qs_d, T7, r0.q0(), r0.nq(), NH * nq7, nullptr);
-                                             pr::gate_attn_span(at_d, qf_d, gs_d, T7, r0.q0(), r0.nq(), NH * nq7, nullptr); }
+                                             pr::gate_attn_span(at_l_d, qf_l_d, gs_d, T7, r0.nq(), r0.nq() * 2 * D, nullptr); }
             cudaEventRecord(e1); cudaEventSynchronize(e1);
             float span_ms = 0; cudaEventElapsedTime(&span_ms, e0, e1);
             std::printf("[split/gate span] microbench over %d reps: whole %.3f us a launch-pair, shard %.3f us "
@@ -828,12 +853,12 @@ int main(int argc, char** argv) {
                     whole_ms > 0 ? span_ms / whole_ms : 0.0, (long long) r0.nq(), (long long) NH);
             CHECK(span_ms <= whole_ms * 1.25f);   // half the elements must not cost more than the whole
             cudaEventDestroy(e0); cudaEventDestroy(e1);
-            cudaFree(qs_d); cudaFree(gs_d);
+            cudaFree(qs_d); cudaFree(gs_d); cudaFree(at_l_d); cudaFree(qf_l_d);
         }
         cudaFree(qf_d); cudaFree(at_d); cudaFree(qf_whole); cudaFree(g_whole);
     }
 
-    // ---- 8. kv_append over one card's KV run: the cache writer, both formats
+    // ---- 10. kv_append over one card's KV run: the cache writer, both formats
     //
     // The third hardcoded-head site found while writing the partner's arm, and the worst of the three:
     // kv_append_kernel took its KV-head count, its K/V row stride and BOTH pool row formulas from a literal 2.
@@ -917,19 +942,22 @@ int main(int argc, char** argv) {
                                 ++g_fail; ++rep;
                             }
                 };
-                auto cmp16 = [&](const uint16_t* a, const uint16_t* b, const char* what) {
+                // one row of the data planes is D elements; one row of a SCALE plane is D/64 (one amax per
+                // 64-dim block), so the two need different strides - comparing scales at the data stride reads
+                // past what the kernel wrote and "fails" on untouched memory
+                auto cmp16 = [&](const uint16_t* a, const uint16_t* b, const char* what, int64_t stride) {
                     int rep = 0;
                     for (int64_t pos = pos8; pos < cells && rep < 3; ++pos)
                         for (int64_t h = 0; h < nkv && rep < 3; ++h)
-                            for (int64_t d = 0; d < D && rep < 3; ++d) {
+                            for (int64_t d = 0; d < stride && rep < 3; ++d) {
                                 const int64_t page = pos / PS;
                                 const size_t cf = ((size_t) page * 2 + (r->kv0() + h)) * PS + pos % PS;
                                 const size_t cc = ((size_t) page * nkv + h) * PS + pos % PS;
-                                if (a[cc * D + d] == b[cf * D + d]) continue;
+                                if (a[cc * stride + d] == b[cf * stride + d]) continue;
                                 bitwise = false;
                                 std::printf("FAIL kv_append %s rank %d pos %lld kv %lld dim %lld: %u vs %u\n", what,
                                         r->rank, (long long) pos, (long long) (r->kv0() + h), (long long) d,
-                                        (unsigned) a[cc * D + d], (unsigned) b[cf * D + d]);
+                                        (unsigned) a[cc * stride + d], (unsigned) b[cf * stride + d]);
                                 ++g_fail; ++rep;
                             }
                 };
@@ -941,13 +969,16 @@ int main(int argc, char** argv) {
                     a_ks = down(ks, a_ks.size()); b_ks = down(ks_f, b_ks.size());
                     cmp(a_k.data(), b_k.data(), "int8 K");
                     cmp(a_v.data(), b_v.data(), "int8 V");
-                    cmp16(a_ks.data(), b_ks.data(), "int8 K scale");
+                    cmp16(a_ks.data(), b_ks.data(), "int8 K scale", D / 64);
+                    std::vector<uint16_t> a_vs(nrow_c * D / 64), b_vs(nrow_f * D / 64);
+                    a_vs = down(vs, a_vs.size()); b_vs = down(vs_f, b_vs.size());
+                    cmp16(a_vs.data(), b_vs.data(), "int8 V scale", D / 64);
                 } else {
                     std::vector<uint16_t> a_k(nrow_c * D), b_k(nrow_f * D), a_v(nrow_c * D), b_v(nrow_f * D);
                     a_k = down(kp, a_k.size()); b_k = down(kp_f, b_k.size());
                     a_v = down(vp, a_v.size()); b_v = down(vp_f, b_v.size());
-                    cmp16(a_k.data(), b_k.data(), "fp16 K");
-                    cmp16(a_v.data(), b_v.data(), "fp16 V");
+                    cmp16(a_k.data(), b_k.data(), "fp16 K", D);
+                    cmp16(a_v.data(), b_v.data(), "fp16 V", D);
                 }
                 cudaFree(Ks_d); cudaFree(Vs_d); cudaFree(kp); cudaFree(vp);
                 cudaFree(kq); cudaFree(vq); cudaFree(ks); cudaFree(vs);
