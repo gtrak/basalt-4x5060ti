@@ -3170,6 +3170,12 @@ int main(int argc, char** argv) {
             lead.push_back(&ss.qsa_states[(size_t) ss.qsa_ord0 + j]);
         pf.set_peer_qsa_lead(std::move(lead), lead_dev);
     };
+    // Whether a refused prompt peer must stop the boot.  A `set_peer` refusal drops the stage's ENTIRE peer share,
+    // not just the prompt-attention arm: every partner-held expert row falls back to the lead's link, the chunk
+    // lines read `no peer -1/0`, and the boot measures ~25% slower with a crushed decode floor.  With
+    // `--exp tp_prompt_attn` set the operator named a mode, so its refusal is a start failure that prints its own
+    // reason; with the flag off the peer share is a capability negotiation and stays the warning below.
+    auto peer_share_refusal_is_fatal = []() { return basalt::core::exp_flag("tp_prompt_attn", 0.0) != 0; };
     // the GDN mixer split is priced once, before either card sizes its experts: its peer reserve displaces experts
     // only when the cards cannot hold them all
     if (o.peer_device >= 1) {
@@ -5463,6 +5469,13 @@ int main(int argc, char** argv) {
                     const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
                     if (!st.sp.set_peer(st.pair.get(), rows, pair_streamed_share(st.dev, st.pair_dev),
                                         o.peer_ram_rows, o.peer_rows_fp32, o.peer_acts_fp32, err)) {
+                        if (peer_share_refusal_is_fatal()) {
+                            // The slice was asked for by name and the pair's share is gone with it: say so and stop,
+                            // rather than serve a boot whose number means "the peer never engaged".
+                            basalt::log::error("basalt serve", "layer split, CUDA%d prompt peer: %s", st.dev,
+                                               err.c_str());
+                            return 1;
+                        }
                         basalt::log::warn("basalt serve", "layer split, CUDA%d prompt peer: %s - its stage's prompt "
                                              "path stays on its lead card", st.dev, err.c_str());
                         err.clear();   // a stage without its prompt peer reads slower; it is not a start failure
@@ -5577,6 +5590,10 @@ int main(int argc, char** argv) {
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
             if (!sp.set_peer(&peer, rows, peer_streamed_share, o.peer_ram_rows, o.peer_rows_fp32, o.peer_acts_fp32,
                              err)) {
+                if (peer_share_refusal_is_fatal()) {
+                    basalt::log::error("basalt serve", "prompt peer: %s", err.c_str());
+                    return 1;
+                }
                 basalt::log::warn("basalt serve", "%s - the prompt path stays on the primary GPU", err.c_str());
                 err.clear();
             }
@@ -5590,6 +5607,10 @@ int main(int argc, char** argv) {
             if (!sp.set_peer(stage0_pair.get(), rows,
                              pair_streamed_share(basalt::program::pair_lead_dev(0, o.tp_size), stage0_pair_dev),
                              o.peer_ram_rows, o.peer_rows_fp32, o.peer_acts_fp32, err)) {
+                if (peer_share_refusal_is_fatal()) {
+                    basalt::log::error("basalt serve", "CUDA%d prompt peer: %s", stage0_pair_dev, err.c_str());
+                    return 1;
+                }
                 basalt::log::warn("basalt serve", "CUDA%d prompt peer: %s - the prompt path stays on the primary GPU",
                              stage0_pair_dev, err.c_str());
                 err.clear();
