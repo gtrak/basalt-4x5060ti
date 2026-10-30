@@ -12,6 +12,18 @@
   funded only if the slice clears its ship bar, and dies with the slice if it does not.
 - **Erratum to the delegating brief: the 0.6 GB / 3-QSA-layer figure was wrong; the 6-layer
   1.5 GiB fp16 / 1.2 GiB int8 figure above supersedes it.**
+- **Tier-reserve sizing when the split is not yet decided: option (c).** `peer_prompt_bytes` /
+  `pair_prompt_bytes` must price the partner's span before `set_peer` chooses the head split, so the
+  reserve is priced against an unknown. Ruling: reserve the **symmetric 50/50** figure, and have
+  `set_peer` **refuse, naming both numbers** (e.g. "partner took 14/24 heads; the reserve priced 12")
+  when the chosen split needs more — never OOM, never silently under-reserve. The graded measurement
+  pins the ratio explicitly with `qsa_ratio_stage_a|b` at 50/50, which the reserve covers by
+  construction, and grades the +10/+20 gates against this ledger. Widest-case reserving is the
+  fallback, and returns only as a boot-flag change decided **from measurement** if the time model's
+  unpinned choice at the re-priced rates (lead 2.61 vs peer 0.98 us/visit — it may want wider than
+  50/50) turns out to matter. Hoisting the cost model above tier sizing is the right end-state but a
+  reordering of *when the split can change its mind*: not this milestone, not while the flag is
+  default-off.
 - **Ship bar calibration (kimi #5 wording):** the bar is `>= ~20 ms/layer OR a replicated positive
   at matched power`. A measured pipelined net of +15-18 ms that replicates across rule-of-3 boots
   with decode floors intact is a **ship, not a failure**. The +10 ms abort gate is unchanged.
@@ -83,33 +95,9 @@ refuses everywhere else. Ruled:
   orders outside — so q-from-planes fails parity the same class as a stale span. The planes stay
   the expert leg's input only (RUN 19 unchanged). See §2a for the mix that survives this.
 
-## 0a. Landed earlier in the milestone
+## Earlier landings
 
-Commit `b1f9850d`, `tests: the head-split parity gains the prompt attention kernel`:
-
-- Task item **4** (parity): case 6 in `tests/kernels/tp2_head_split_parity.cpp` runs 8 queries
-  through `qsa_prompt_attn_batch` whole (24 heads / 2 KV) and once per card (12 / 1) over each
-  card's KV-head slice, sharing one selection, step and permuted page table. Tolerance stated in
-  the source: relative 2e-3 of the row's largest magnitude, which is the prompt kernel's own bound
-  (`qsa_prompt_attn.hpp` says it is FP32-level, not bitwise). A bitwise run prints `bitwise` and
-  its worst deviation, so drift toward the bound stays visible.
-  GPU-labelled (`basalt_gpu_test`, skip 77 without a card), so the cpu count is unchanged at 68.
-  **Not executed** — the live server holds the cards. It compiles clean under `-j4`; the two
-  `-Wpointer-arith` warnings at lines 430-431 are pre-existing, on untouched lines.
-- Task item **5** (predictions): this file, filed before any measurement.
-
-Gates: `tools/check_platform_boundary.sh` ok, `tools/check_stderr_logging.sh` ok,
-`ctest -L cpu` **67/68** — only the pre-existing `expert_multi_test` (this CPU lacks
-AVX512-VNNI/VBMI). Build used `-j4` per the shared-CPU constraint. `:8000` was never contacted,
-no engine started, no GPU test run while the server holds the cards.
-
-**Not built** — the pipelined variant and the executor behind the gate remain open:
-
-- No peer-side prompt-attention executor exists; `--exp tp_prompt_attn` refuses at
-  `Prefill::set_peer`, and `qhs_peer_item()` (`src/core/verify.cpp`) still returns false as
-  decode's unbuilt window item.
-- The software-pipelined variant (`=2`) is untouched.
-
+Moved to `progress-tp2slice-ledger.md` §5 to keep this file under the project cap.
 ## 2a. The mix, re-filed under the parity invariant
 
 The ruled invariant decides the mix: **the peer's attention must consume the same q/k/v sources as

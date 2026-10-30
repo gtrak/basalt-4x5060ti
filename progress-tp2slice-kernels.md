@@ -180,3 +180,21 @@ or their card were never handed over: importing nothing while reporting the span
 shape this slice keeps hitting, so the run fails instead of degrading. `lead_dev` exists because a peer copy is
 stated as `(dst, dstDev, src, srcDev)` and `QsaState` carries no device of its own — guessing it would make a copy
 read this card's own memory and call it done.
+
+## Two questions per kernel, not one
+
+The audit rule this branch now applies to every shard-facing kernel, from the supervisor after the
+`gate_attn` find: for each kernel a card calls, ask **both** —
+
+1. does it *assume* a head count (a literal 24, a 2-heads-per-page row formula, a 6144 stride)?
+2. does it apply every index argument it takes to every input **consistently**?
+
+`gate_attn_span` passed question 1 cleanly — it took its count as an argument — and failed question 2:
+the offset reached `qf` but not `attn`. A head-count audit alone cleared it. Question 2 is what catches a
+kernel that is told about the split by half its arguments.
+
+Applied so far: `split_q_kernel` (1: yes, fixed), `gate_attn_kernel` (2: yes, fixed by deleting the
+argument), `kv_append_kernel` (1: yes, fixed), the three selection kernels (neither, cleared — they read
+no head field and refuse a bad `idx_*`), and `kv_span_import_kernel`, which is written against both: it
+takes each side's `nkv` and each side's page table explicitly and resolves the row twice, once per card,
+rather than sharing either.
