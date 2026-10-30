@@ -3131,6 +3131,29 @@ int main(int argc, char** argv) {
                                                     o.peer_ram_rows, o.peer_rows_fp32, o.peer_acts_fp32,
                                                     qsa.on ? &qsa : nullptr);
     };
+    // tp2 + `--exp tp_prompt_attn`: what the slice takes on a stage's LEAD card - the pair's staging on this side
+    // of the link and the lead's packed `attn_output` columns.  Both are `set_peer` allocations made after the
+    // stage's expert tier is filled, so the tier has to leave them the room, exactly as it does for the partner's
+    // peer buffers above; without this the boot gets past the tier and dies in the pair bring-up.  Priced at the
+    // pinned symmetric cut, and `set_peer` refuses a split whose lead side exceeds it by naming both figures.
+    auto lead_qsa_mib = [&]() -> int64_t {
+        if (!(o.serve && o.tp_size == 2 && o.peer_prefill_rows != 0 &&
+              basalt::core::exp_flag("tp_prompt_attn", 0.0) != 0))
+            return 0;
+        return (int64_t) ((basalt::prefill::Prefill::lead_qsa_bytes(g, wt, o.prefill_chunk, g.n_head / 2) +
+                           (1ull << 20) - 1) >> 20);
+    }();
+    // Hand a prompt path the QSA states of the card whose cells its partner must be able to import.  The partner's
+    // arm writes its own cells as a prompt runs; what it cannot know first-hand is what the lead appended while it
+    // was out of the loop, and the catch-up reads those out of the lead's states.  Borrowed, as every other
+    // hand-over of another card's memory here is: the Prefill neither owns the states nor the session, which must
+    // therefore outlive every prompt that imports from them.
+    auto hand_peer_qsa_lead = [](basalt::prefill::Prefill& pf, basalt::core::SessionState& ss, int lead_dev) {
+        std::vector<const basalt::core::QsaState*> lead;
+        for (int64_t j = 0; ss.qsa_states != nullptr && j < ss.qsa_alloc; ++j)
+            lead.push_back(&ss.qsa_states[(size_t) ss.qsa_ord0 + j]);
+        pf.set_peer_qsa_lead(std::move(lead), lead_dev);
+    };
     // the GDN mixer split is priced once, before either card sizes its experts: its peer reserve displaces experts
     // only when the cards cannot hold them all
     if (o.peer_device >= 1) {
@@ -3613,8 +3636,9 @@ int main(int argc, char** argv) {
         GpuStage& st = *stp;
         const auto& lay = basalt::kernels::cpu::expert_layout();
         // the drafter and the head are already allocated by now (they load above, before this), so what is left
-        // to hold back is the windows - and `free_b` has already lost the drafter.
-        const int64_t room = stage_room(st.dev, true, 0);
+        // to hold back is the windows - and `free_b` has already lost the drafter.  With the prompt-attention
+        // slice on, the lead's own staging and packed columns are held back here too (see `lead_qsa_mib`).
+        const int64_t room = stage_room(st.dev, true, lead_qsa_mib);
         const basalt::core::OnDevice on(st.dev);
         {
             size_t fb = 0, tb = 0;
@@ -5426,6 +5450,14 @@ int main(int argc, char** argv) {
                         basalt::log::warn("basalt serve", "layer split, CUDA%d prompt peer: %s - its stage's prompt "
                                              "path stays on its lead card", st.dev, err.c_str());
                         err.clear();   // a stage without its prompt peer reads slower; it is not a start failure
+                    } else if (basalt::core::exp_flag("tp_prompt_attn", 0.0) != 0) {
+                        // The partner's span catch-up imports the cells the LEAD appended while the partner was out
+                        // of the loop - a decode window, a reused prefix, a resume - and it can only do that from
+                        // the lead's own QSA states.  The same kind of hand-over `set_ring_remotes` performs for
+                        // blobs another card's cache holds: borrowed pointers, one per QSA layer of the stage in
+                        // layer order, which is the order the partner's states were carved in.  Without it a
+                        // second prompt on a session that decoded would fail rather than guess at its own cache.
+                        hand_peer_qsa_lead(st.sp, st.ss, basalt::program::pair_lead_dev(i, o.tp_size));
                     }
                 }
             }
@@ -5545,6 +5577,8 @@ int main(int argc, char** argv) {
                 basalt::log::warn("basalt serve", "CUDA%d prompt peer: %s - the prompt path stays on the primary GPU",
                              stage0_pair_dev, err.c_str());
                 err.clear();
+            } else if (basalt::core::exp_flag("tp_prompt_attn", 0.0) != 0) {
+                hand_peer_qsa_lead(sp, ss, basalt::program::pair_lead_dev(0, o.tp_size));   // see the stage's site
             }
         }
         // ---- the prompt-time split's stages on the tier cards.  A stage's place, from the end of its tier's slots: the

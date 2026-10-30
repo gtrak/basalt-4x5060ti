@@ -761,6 +761,9 @@ struct PeerPrefill {
         float* q_idx[2] = {};        // in: the lead's indexer q projection (the selection stays the lead's)
         float* idx_raw[2] = {};      // in: the lead's indexer k projection
         uint16_t* part_out[2] = {};  // out: this card's BF16 o_proj partial, on its way to the lead
+        /// The widest chunk `peer_qsa_layout` funded these buffers for.  The publisher checks every copy against
+        /// it: a wider chunk would run off the end of a wire buffer, which is a plausible token, not a fault.
+        int64_t rows_max = 0;
 
         // This card's own per-chunk scratch, ONE set: every buffer here is written and read inside one layer's
         // arm on `s` and is dead once that layer's partial has been pushed.
@@ -799,6 +802,12 @@ struct PeerPrefill {
         cudaStream_t s = nullptr;     // this card's attention stream, behind its expert-row stream
         cudaEvent_t ev_in = nullptr;  // the lead published this layer's rows
         cudaEvent_t ev_out = nullptr; // this card's partial has landed for the lead
+        /// The lead's reduce of a layer has read this card's push out of the LEAD's staging.  The partner's next
+        /// push is issued behind it, which is what keeps a rank from overwriting the peer's staging while the
+        /// peer's add of the previous layer is still reading it (`tp2_collective.hpp` has no back-pressure of
+        /// its own: it counts collectives, it does not credit them back).
+        cudaEvent_t ev_red = nullptr;  // ... recorded on the lead's compute stream
+        int card = -1;                 // the CUDA device this arm runs on (cuBLAS needs it current)
         bool live = false;
 
         // The span this card's pools provably hold, in CELLS: [0, span_valid) is present, for EVERY QSA layer of
@@ -858,6 +867,7 @@ struct PeerPrefill {
         qsa.pair.close();
         if (qsa.ev_in) cudaEventDestroy(qsa.ev_in);
         if (qsa.ev_out) cudaEventDestroy(qsa.ev_out);
+        if (qsa.ev_red) cudaEventDestroy(qsa.ev_red);
         if (qsa.s) cudaStreamDestroy(qsa.s);
         for (cudaEvent_t e : copied) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : used) if (e) cudaEventDestroy(e);
@@ -2260,6 +2270,62 @@ bool peer_qsa_pair_up(PeerPrefill& P, const core::ModelGeometry& g, const core::
     return true;
 }
 
+/// The lead's side of the wire for one QSA layer: the FP16 mixed rows its own `attn_q` read, its indexer q
+/// already normed and rotated, and its raw indexer key, copied from this card into the partner's wire set
+/// `wire`.  With `steps` non-null the chunk's step counts go too - they are a property of the chunk's positions
+/// and the arm holds ONE set, so a chunk ships them once and every layer's arm reads the same bits the lead's own
+/// selection read (`qsa_block_topk` on two cards over different step bits is a different top-k, which is a
+/// different attention input and a different token).
+///
+/// ISSUED ON THE LEAD'S COMPUTE STREAM, which is the protocol rather than a convenience: every source buffer here
+/// is single-set on this card and is rewritten by a later kernel of the same stream (`up_mix` for `mixed_h`, the
+/// next QSA layer's two BF16 projections for the indexer rows), so stream order alone stops a copy reading a
+/// buffer the lead has already overwritten, with no host-side handshake on the inbound leg.  The cost is the
+/// serialized mode's, and the ruled one: the link's bytes sit on the lead's critical path.
+///
+/// `ev_in` is recorded after the copies so the partner's arm waits on the PUBLISH rather than on the lead's whole
+/// queue.  The SECOND wire set is protected by the reduce, not by an event: the lead's publish of layer l+2 into
+/// set 0 is queued on this stream behind layer l's all-reduce, which completes only after the partner pushed its
+/// partial - which the partner enqueued, on its own stream, after it read set 0.  A gate that pipelined without
+/// that reduce in the lead's stream would need a free-ness protocol of its own; that is the pipelined commit's.
+///
+/// The four sizes are the same expressions `peer_qsa_layout` allocates with, written beside it on purpose: a copy
+/// wider than its destination is a plausible token, not a fault.
+bool peer_qsa_publish(PeerPrefill& P, const uint16_t* mixed_h, const float* q_idx, const float* idx_raw,
+                      const int32_t* steps, int64_t wire, int64_t T, cudaStream_t cs, std::string& err) {
+    PeerPrefill::Qsa& qs = P.qsa;
+    const Prefill::PeerQsaSpan& sp = qs.span;
+    if (!qs.live || !sp.on || sp.g == nullptr) { err = "peer QSA: the arm is not live, so there is nothing to publish"; return false; }
+    if (wire < 0 || wire >= Prefill::PeerQsaSpan::kWireSets) { err = "peer QSA: bad wire set"; return false; }
+    if (T <= 0 || T > qs.rows_max) {
+        err = "peer QSA: a " + std::to_string(T) + "-token chunk is wider than the " + std::to_string(qs.rows_max) +
+              " rows the arm's wire was funded for";
+        return false;
+    }
+    if (!P.p2p) { err = "peer QSA: the publish needs peer access between CUDA" + std::to_string(P.prim) + " and CUDA" + std::to_string(P.dev); return false; }
+    if (mixed_h == nullptr || q_idx == nullptr || idx_raw == nullptr || qs.mixed_h[wire] == nullptr ||
+        qs.q_idx[wire] == nullptr || qs.idx_raw[wire] == nullptr) {
+        err = "peer QSA: this layer's wire set is not allocated";
+        return false;
+    }
+    const basalt::kernels::QsaShapes sh = core::qsa_shard_shapes(*sp.g, sp.heads);
+    const uint64_t N = (uint64_t) sp.g->n_embd;
+    auto across = [&](void* dst, const void* src, uint64_t bytes, const char* what) -> bool {
+        if (cudaMemcpyPeerAsync(dst, P.dev, src, P.prim, (size_t) bytes, cs) != cudaSuccess) {
+            err = std::string("peer QSA: the ") + what + " would not cross to CUDA" + std::to_string(P.dev);
+            return false;
+        }
+        return true;
+    };
+    if (!across(qs.mixed_h[wire], mixed_h, N * (uint64_t) T * 2u, "mixed rows")) return false;
+    if (!across(qs.q_idx[wire], q_idx, (uint64_t) T * sh.idx_n_head * sh.idx_dim * 4u, "indexer q")) return false;
+    if (!across(qs.idx_raw[wire], idx_raw, (uint64_t) T * sh.idx_dim * 4u, "indexer k")) return false;
+    if (steps != nullptr &&
+        !across(qs.steps, steps, (uint64_t) T * basalt::kernels::kStepCount * 4u, "step counts")) return false;
+    if (cudaEventRecord(qs.ev_in, cs) != cudaSuccess) { err = "peer QSA: the publish would not be recorded"; return false; }
+    return true;
+}
+
 bool peer_qsa_layer(PeerPrefill::Qsa& qs, int64_t li, int64_t wire, int64_t T, int64_t p0, int64_t active,
                     std::string& err) {
     const Prefill::PeerQsaSpan& sp = qs.span;
@@ -2296,6 +2362,10 @@ bool peer_qsa_layer(PeerPrefill::Qsa& qs, int64_t li, int64_t wire, int64_t T, i
         return false;
     }
     cudaStream_t cs = qs.s;
+    // Wait for the lead's publish of THIS layer's rows, not for the lead's queue: three peer copies on the lead's
+    // compute stream behind the kernels that made them, then this event.  Skipping the wait would let the arm read
+    // a wire set the copies have not filled, which is last layer's rows - a plausible token, not an error.
+    if (cudaStreamWaitEvent(cs, qs.ev_in, 0) != cudaSuccess) { err = "peer QSA: the arm would not wait on the publish"; return false; }
 
     // ---- the projections, from the lead's own mixed rows, on this card's own weights
     // N = the card's output rows, K = n_embd; the same call the lead makes, at the shard's N
@@ -2360,6 +2430,101 @@ bool peer_qsa_layer(PeerPrefill::Qsa& qs, int64_t li, int64_t wire, int64_t T, i
 
     // ---- the gate, over this card's heads.  `attn_h` is what the o_proj product will read.
     gate_attn_span(qs.attn, qs.Qf, qs.attn_h, T, nq, nq * 2 * D, cs);
+    return true;
+}
+
+/// The o_proj half of one sliced QSA layer, both cards, in the one place that can state the pair's ordering.
+///
+/// Each card multiplies its OWN gated rows by its OWN packed `attn_output` columns, and one collective per rank
+/// leaves both holding the sum - the partner's issued on the arm's stream, the lead's on its compute stream,
+/// which is the two-independent-streams rule `tp2_collective.hpp` states (a pair that waits on one stream burns
+/// the whole timeout budget and comes back a half reduce).  `lead_partial` is where the lead's partial is and
+/// where its sum lands, so the residual block that reads it afterwards reads the layer's real o_proj.
+///
+/// THE LEAD'S GATED ROWS ARE THE WHOLE ATTENTION'S, READ AT THEIR PITCH.  Ruling B keeps the lead's pools whole,
+/// and the prompt-attention kernel derives a pool row from the head count it is handed (`row = (page * n_head_kv
+/// + kvh) * page_size + off`), so the lead cannot yet run its own half of the heads against those pools; what the
+/// split removes from the lead today is the MULTIPLY - its columns, `lead_ld` wide rows - while it still computes
+/// every head's attention.  Halving the lead's attention is the funded follow-up, not a silent extra here.
+///
+/// A half reduce is the RUN 17 class - attention summed over one card's heads, presented as the model's own - so
+/// every piece is checked rather than assumed: both cards' columns, present, of the width their shards say, the
+/// two column spans tiling the input axis exactly, and the partial inside the pair's staging.  The pair's
+/// timeout word is read at each collective's entry and at the chunk boundary by the driver.
+bool peer_qsa_finish(PeerPrefill& P, Gemm& lead_gemm, cudaStream_t lead_cs, const uint16_t* lead_gated,
+                     int64_t lead_ld, float* lead_partial, int64_t li, int64_t layer, int64_t wire, int64_t T,
+                     std::string& err) {
+    PeerPrefill::Qsa& qs = P.qsa;
+    const Prefill::PeerQsaSpan& sp = qs.span;
+    if (!qs.live || !sp.on || sp.g == nullptr) { err = "peer QSA: the arm is not live, so the layer cannot be reduced"; return false; }
+    if (wire < 0 || wire >= Prefill::PeerQsaSpan::kWireSets) { err = "peer QSA: bad wire set"; return false; }
+    if (T <= 0 || T > qs.rows_max) { err = "peer QSA: this chunk is wider than the arm was funded for"; return false; }
+    if (sp.o_type < 0) { err = "peer QSA: the pack's attn_output type was never given to the span sizer"; return false; }
+    if (li < 0 || li >= (int64_t) qs.states.size()) { err = "peer QSA: no state for layer index " + std::to_string(li); return false; }
+    if (lead_gated == nullptr || lead_partial == nullptr || qs.attn_h == nullptr || qs.part_f32 == nullptr) {
+        err = "peer QSA: a partial of this layer has nowhere to be written";
+        return false;
+    }
+    const int64_t N = sp.g->n_embd, D = sp.g->head_dim;
+    if (layer < 0 || layer >= (int64_t) qs.lead_cols.o_cols.size() || !qs.lead_cols.o_cols[(size_t) layer].ok ||
+        !qs.peer_cols.o_cols[(size_t) layer].ok) {
+        err = "peer QSA: layer " + std::to_string(layer) + " has no packed attn_output columns on one of the pair's cards";
+        return false;
+    }
+    const core::QsaShardWeight& lc = qs.lead_cols.o_cols[(size_t) layer];
+    const core::QsaShardWeight& pc = qs.peer_cols.o_cols[(size_t) layer];
+    // The two spans must TILE the input axis, and the lead's must be the FIRST `lc.ne0` columns of it - which is
+    // what lets the lead read its half out of the wide `attn_h` at offset 0.  `sp.heads` is the partner's shard,
+    // so this also catches the pair having been prepared for one split and run at another.
+    if (lc.ne0 <= 0 || pc.ne0 <= 0 || lc.ne0 + pc.ne0 != sp.g->n_head * D || lead_ld < lc.ne0 || lc.ne1 != N ||
+        pc.ne1 != N || pc.ne0 != sp.heads.nq() * D || sp.heads.q0() * D != lc.ne0) {
+        err = "peer QSA: the pair's attn_output columns do not tile the input axis (lead " +
+              std::to_string(lc.ne0) + " + partner " + std::to_string(pc.ne0) + " against " +
+              std::to_string(sp.g->n_head * D) + " columns of " + std::to_string(D) + "-wide heads)";
+        return false;
+    }
+    if (!basalt::kernels::tp2_all_reduce_ok(T, N, qs.pair.max_elems())) {
+        err = "peer QSA: a " + std::to_string(T) + " x " + std::to_string(N) +
+              " partial does not fit the pair's staging";
+        return false;
+    }
+    if (!qs.pair.valid()) { err = "peer QSA: the pair is not open, so this layer has no reduce"; return false; }
+
+    // The partner may not push THIS layer's partial into the lead's staging until the lead's add of the previous
+    // one has finished reading it: the collective counts its collectives, it does not credit them back.
+    if (cudaStreamWaitEvent(qs.s, qs.ev_red, 0) != cudaSuccess) { err = "peer QSA: the arm would not wait on the lead's reduce"; return false; }
+
+    // ---- each card's partial, on its own card and its own stream.  cuBLAS wants its handle's card current, which
+    // is why each product is scoped to its card rather than run from the lead's thread as things stand.
+    { const core::OnDevice on(P.dev); qs.gemm.native(qs.attn_h, sp.o_type, pc.native, qs.part_f32, T, N, pc.ne0); }
+    if (const cudaError_t le = cudaGetLastError(); le != cudaSuccess) {
+        err = std::string("peer QSA: the partner's o_proj product did not launch: ") + cudaGetErrorString(le);
+        return false;
+    }
+    { const core::OnDevice on(P.prim); lead_gemm.native(lead_gated, sp.o_type, lc.native, lead_partial, T, N, lc.ne0, 0, 0.0f, lead_ld); }
+    if (const cudaError_t le = cudaGetLastError(); le != cudaSuccess) {
+        err = std::string("prefill: the lead's half o_proj product did not launch: ") + cudaGetErrorString(le);
+        return false;
+    }
+
+    // ---- the collective, once per rank.  A rank whose peer never arrives burns its spin budget, sets its word
+    // and returns WITHOUT adding: `tp2_all_reduce` refuses at entry when either word is already set, and the
+    // driver reads `timed_out()` again at the chunk boundary, after its own stream sync, where the answer is
+    // known.  Half a reduce must fail the run, never be a token.
+    if (!basalt::kernels::tp2_all_reduce(qs.pair, qs.part_f32, T, N, qs.s, P.prim, /*rank*/ 1, err)) {
+        err = "peer QSA: the partner's half of layer " + std::to_string(layer) + ": " + err;
+        return false;
+    }
+    if (!basalt::kernels::tp2_all_reduce(qs.pair, lead_partial, T, N, lead_cs, P.dev, /*rank*/ 0, err)) {
+        err = "prefill: the lead's half of layer " + std::to_string(layer) + ": " + err;
+        return false;
+    }
+    // The two proofs the next layer's publish and push wait on, recorded after the two adds were enqueued.
+    if (cudaEventRecord(qs.ev_out, qs.s) != cudaSuccess || cudaEventRecord(qs.ev_red, lead_cs) != cudaSuccess) {
+        err = "peer QSA: the reduce would not be recorded";
+        return false;
+    }
+    cudaSetDevice(P.prim);   // the driver runs on the lead's thread; `all_reduce` left the peer's card current
     return true;
 }
 
@@ -2468,9 +2633,11 @@ bool peer_qsa_span_catch_up(PeerPrefill& P, int64_t p0, std::string& err) {
 
 static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, int64_t tf, bool rows_fp32,
                       bool acts_fp32, const PeerRamShare* ram,
-                      std::unique_ptr<PeerPrefill>& out, std::string& err) {
+                      std::unique_ptr<PeerPrefill>& out, std::string& err,
+                      const Prefill::PeerQsaSpan* qsa = nullptr) {
     auto pp = std::make_unique<PeerPrefill>();
     pp->peer = peer;
+    if (qsa != nullptr) pp->qsa.span = *qsa;   // the prompt-attention arm, if the gate asked for one
     pp->T_max = std::min<int64_t>(T_max, stream_all_min() - 1);
     pp->T_fp4 = tf;
     // Only the FP4 leg's rows go back as BF16 bits and only its activations go out as planes: the routed leg's
@@ -2528,10 +2695,16 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
     // the prompt-attention arm's buffers, from the SAME walk the tier's reserve was counted from
     if (pp->qsa.span.on) {
         peer_qsa_layout(pp->qsa, Tp, take, nullptr);
+        // The width the wire and the scratch were funded for, and the card cuBLAS needs current for the arm's
+        // products.  The publisher checks every chunk against `rows_max`: the arm runs on chunks the EXPERT share
+        // may not take, so neither `T_max` nor `T_fp4` alone is the bound.
+        pp->qsa.rows_max = Tp;
+        pp->qsa.card = pp->dev;
         if (ok) {
             ok = cudaStreamCreateWithFlags(&pp->qsa.s, cudaStreamNonBlocking) == cudaSuccess &&
                  cudaEventCreateWithFlags(&pp->qsa.ev_in, cudaEventDisableTiming) == cudaSuccess &&
-                 cudaEventCreateWithFlags(&pp->qsa.ev_out, cudaEventDisableTiming) == cudaSuccess;
+                 cudaEventCreateWithFlags(&pp->qsa.ev_out, cudaEventDisableTiming) == cudaSuccess &&
+                 cudaEventCreateWithFlags(&pp->qsa.ev_red, cudaEventDisableTiming) == cudaSuccess;
         }
         if (ok)
             ok = pp->qsa.gemm.init_external(pp->qsa.s, pp->qsa.gscratch, GEMM_SCRATCH, pp->qsa.gws, GEMM_WS, err);
@@ -2824,6 +2997,18 @@ uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_r
     return sum;
 }
 
+uint64_t Prefill::lead_qsa_bytes(const core::ModelGeometry& g, const core::WeightTable& wt, int64_t chunk,
+                                 int64_t lead_heads) {
+    if (chunk <= 0 || g.n_embd <= 0 || g.n_head <= 0 || g.n_head_kv <= 0) return 0;
+    const core::QsaHeadShard lead_sh = core::qsa_pair_shard(g.n_head, g.n_head_kv, lead_heads, /*rank*/ 0);
+    if (!lead_sh.ok()) return 0;   // a split that is not a pair's reserves nothing; `set_peer` is what refuses it
+    // One collective moves `rows x stride` FLOATS through each card's staging, so the lead's side is the same
+    // figure `peer_bytes` books for the partner's - and it is a `Tp2Pair::open` allocation, not the arm's walk,
+    // exactly as the partner's is.
+    const uint64_t staging = ((uint64_t) chunk * (uint64_t) g.n_embd * 4u + 255) & ~uint64_t(255);
+    return staging + core::qsa_pair_bytes(wt, g, lead_sh);
+}
+
 bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_share, bool peer_ram_rows,
                        bool peer_rows_fp32, bool peer_acts_fp32, std::string& err) {
     Impl& m = *impl_;
@@ -2841,15 +3026,17 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
     // everywhere else (RUN 17), so the flag refuses here until all four land.  The gate is the prompt path's only:
     // it never arms the decode head split, whose own refusal lives in verify.cpp's `qhs_peer_item`.
     const double prompt_attn = core::exp_flag("tp_prompt_attn", 0.0);
-    if (prompt_attn != 0) {
-        // Named against what is actually missing, so the line does not go stale as the pieces land: the buffers
-        // (span, wire, scratch, resident projections, the partner's Gemm) ARE sized and allocated now, by the
-        // same walk the tier's reserve is counted from.  What is absent is the compute and the two protocols.
-        err = "prefill peer: --exp tp_prompt_attn=" + std::to_string(static_cast<int>(prompt_attn)) +
-              " is refused: the partner's prompt-attention arm is not built (no per-layer QSA compute on the "
-              "partner, no span_valid catch-up for the cells the lead appended while the partner was out of the "
-              "loop, no o_proj reduce-to-lead, and the tier's call sites do not reserve the span yet); the lead "
-              "runs the whole attention";
+    if (prompt_attn != 0 && prompt_attn != 1) {
+        // Only the SERIALIZED gate is built: the lead's stream waits for the partner's whole layer before the
+        // next publish, which is what makes the two wire sets and the pair's single staging buffer safe.  The
+        // pipelined gate needs a free-ness protocol of its own and is a later commit; a value that is not 1 is
+        // refused rather than run as 1, because the operator would read the resulting number as the pipelined one.
+        err = "prefill peer: --exp tp_prompt_attn=" + std::to_string(prompt_attn) +
+              " is refused: only the serialized gate (1) is built";
+        return false;
+    }
+    if (prompt_attn != 0 && (m.g == nullptr || m.wt == nullptr)) {
+        err = "prefill peer: --exp tp_prompt_attn needs the geometry and the weight table to price the arm";
         return false;
     }
     const int64_t ne = m.g ? m.g->n_expert : basalt::kernels::cpu::expert_layout().n_expert;
@@ -2971,19 +3158,47 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
             return false;
         }
         want_span = want;   // `make_peer` allocates through the same walk that priced these bytes
+
+        // The SAME rule on the LEAD's card, which nothing else prices.  `peer_bytes` books the partner's staging
+        // and columns; `Tp2Pair::open` allocates a staging buffer on EACH card and `qsa_pair_prepare` puts the
+        // lead's packed columns on the lead's card, so a split that hands the lead more than the symmetric half
+        // needs bytes no tier sizing held back.  Refused the way the partner is - both figures named - rather
+        // than becoming an allocation failure inside the bring-up line below.
+        // The width the arm is actually funded for: `make_peer`'s own `Tp`, spelled the same way here so the
+        // reserve, the refusal above and the boot line all describe the buffers that get allocated rather than a
+        // bound that happens to be larger today.
+        const uint64_t arm_T = std::max<int64_t>(std::min<int64_t>(t_routed, stream_all_min() - 1), tf);
+        const uint64_t lead_want = lead_qsa_bytes(*m.g, *m.wt, arm_T, lead_heads);
+        const uint64_t lead_reserve = lead_qsa_bytes(*m.g, *m.wt, arm_T, m.g->n_head / 2);
+        if (lead_want > lead_reserve) {
+            err = "prefill peer: --exp tp_prompt_attn: the lead kept " + std::to_string(lead_heads) + "/" +
+                  std::to_string(heads) + " query heads; the reserve priced " + std::to_string(m.g->n_head / 2) +
+                  ": needs " + std::to_string(lead_want / 1048576) + " MiB on CUDA" + std::to_string(m.device) +
+                  ", its tier left " + std::to_string(lead_reserve / 1048576) +
+                  " MiB. Pin the split with --exp qsa_ratio_stage_a|b to the reserved ratio, or size the lead's "
+                  "tier for the wider one";
+            return false;
+        }
+        basalt::log::info("basalt prefill",
+                          "peer prompt-attention arm, lead card CUDA%d: %llu MiB held back from its expert tier "
+                          "(the pair's staging at %lld tokens, %lld x %lld floats, and the lead's attn_output "
+                          "columns), its half of the heads %d/%d; chunks of up to %lld tokens are sliced",
+                          m.device, (unsigned long long) (lead_reserve / 1048576), (long long) arm_T,
+                          (long long) arm_T, (long long) m.g->n_embd, (int) core::qsa_lead_heads(heads, ratio),
+                          (int) heads, (long long) arm_T);
     }
 
     std::unique_ptr<PeerPrefill> pp;
-    if (prompt_attn != 0) pp->qsa.span = want_span;
-    // `cap_rows` bounds the routed share only: with the FP4 share on, the primary leaves EVERY expert the peer holds
-    // and every band expert the share moves out of its stream (before the routing is known), so the peer has to be
-    // able to take all of those experts' rows - which `peer_layout` guarantees by sizing its row tables for the
-    // whole chunk.
-    bool ok = make_peer(peer, t_routed, cap_rows, tf, peer_rows_fp32, peer_acts_fp32, ram_on ? &prs : nullptr, pp, err);
+    // `make_peer` owns the allocation, so the span goes IN with it: a span assigned to the pointer after it is
+    // made would be written through a null unique_ptr, and one assigned before would not survive `make_peer`
+    // resetting it on the routed-only retry below.
+    bool ok = make_peer(peer, t_routed, cap_rows, tf, peer_rows_fp32, peer_acts_fp32, ram_on ? &prs : nullptr, pp,
+                        err, prompt_attn != 0 ? &want_span : nullptr);
     if (!ok && t_fp4 >= stream_all_min()) {   // the routed-only chunks alone
         pp.reset();
         err.clear();
-        ok = make_peer(peer, t_routed, cap_rows, 0, peer_rows_fp32, peer_acts_fp32, nullptr, pp, err);
+        ok = make_peer(peer, t_routed, cap_rows, 0, peer_rows_fp32, peer_acts_fp32, nullptr, pp, err,
+                       prompt_attn != 0 ? &want_span : nullptr);
     }
     if (!ok) return false;
 
@@ -3300,6 +3515,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
 
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < LB; ++l) (core::is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+        // The chunk's first QSA layer, in the same model-wide ordinal `qsa_index` counts in.  The partner's arm
+        // is indexed by the STAGE's ordinal and the step counts ride with the chunk's first sliced layer, so both
+        // are offsets from here rather than from `ss.qsa_ord0` (which they equal today; the day they do not, a
+        // wrong offset is a layer reading another layer's cache, which is this branch's named failure).
+        const int64_t qsa_first = qsa_index;
+        // Did any layer of this chunk go through the pair?  The chunk's timeout read is only owed by a chunk that
+        // used the collective; a chunk that ran whole owes it nothing and must not pay a sync for it.
+        bool qsa_sliced = false;
         // this chunk's stream - every non-resident expert of every layer, layer by layer in id order (entry
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
@@ -3715,6 +3938,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (st.kv_rot) basalt::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
                     rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
                     rope(m.q_idx, T, 4, 128, 512, p0, basalt::kernels::rope_scaling(), m.cs);
+                    // ---- the prompt-attention slice (--exp tp_prompt_attn): the partner runs this layer's heads
+                    // on its own card and the pair's reduce sums the two o_proj partials.  Decided ONCE here, so
+                    // no layer can half-slice: a chunk wider than the arm's buffers is not sliced at all and the
+                    // lead runs the layer exactly as it did before the slice existed, the same fallback the peer's
+                    // expert share follows.  The lead still computes every head's attention (see `peer_qsa_finish`).
+                    PeerPrefill* sap = m.pp && m.pp->qsa.live && T <= m.pp->qsa.rows_max ? m.pp.get() : nullptr;
+                    const int64_t qsa_ord = qsa_index - qsa_first;
+                    const int64_t wire = sap != nullptr ? qsa_ord % Prefill::PeerQsaSpan::kWireSets : 0;
+                    if (sap != nullptr &&
+                        !peer_qsa_publish(*sap, m.mixed_h, m.q_idx, m.idx_raw,
+                                          qsa_ord == 0 ? m.steps_dev : nullptr, wire, T, m.cs, err))
+                        return false;
                     // the indexer appends, token by token; then scores + selection for many queries at once:
                     // a query reads completed blocks (final once completed) and `dead` for its own tail block
                     const basalt::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
@@ -3756,7 +3991,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     if (st.kv_rot || st.kv_hybrid) basalt::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
-                    if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
+                    if (sap != nullptr) {
+                        // The chunk's widest `n_bid + 1`: the positions rise through a chunk, so the last query's
+                        // is the widest, and the arm takes it as an argument rather than reading a host copy per
+                        // layer.  It is the same figure the selection above used for the chunk's last batch.
+                        const int64_t active = (int64_t) m.steps_host[(size_t) ((T - 1) * basalt::kernels::kStepCount +
+                                                                                basalt::kernels::kStepNBid)] + 1;
+                        // The arm runs on the partner's card and stream, so cuBLAS wants that card current while
+                        // its products are enqueued; `peer_qsa_finish` puts the lead's card back.
+                        bool ok_arm = false;
+                        { const core::OnDevice on_partner(sap->qsa.card); 
+                          ok_arm = peer_qsa_layer(sap->qsa, qsa_ord, wire, T, p0, active, err) &&
+                                   peer_qsa_finish(*sap, m.gemm, m.cs, m.attn_h, ZV, m.bo, qsa_ord, l, wire, T, err); }
+                        if (!ok_arm) return false;
+                        qsa_sliced = true;
+                        // The next publish must not land in the wire set this layer's arm is still reading, nor
+                        // overwrite the partner's staging before its add has run: the lead's stream waits for the
+                        // partner's whole layer before anything of the next one is queued on it.
+                        if (cudaStreamWaitEvent(m.cs, sap->qsa.ev_out, 0) != cudaSuccess) {
+                            err = "prefill: the lead would not wait for the partner's layer";
+                            return false;
+                        }
+                    } else {
+                        if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
+                    }
                     ++qsa_index;
                 } else {
                     // ======================= MoE =======================
@@ -4840,6 +5098,34 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             m.tm.end_layer(tl);
         }
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts
+        // THE CHUNK'S COLLECTIVE VERDICT (`--exp tp_prompt_attn`).  A rank that gave up waiting for its peer's
+        // partial sets its own word and leaves `buf` holding only its own sum, and `tp2_all_reduce` refuses at
+        // ENTRY - so within a chunk, the read that catches it is this one: after both ranks' streams drained and
+        // before any of the chunk's results commit.  CHUNK granularity, as ruled - the spin budget is orders of
+        // magnitude longer than a layer, so a per-layer read right after its own launch would be a check that
+        // always passes, and a per-token one belongs to a path this slice never touches.  A chunk that ran whole
+        // pays neither sync.
+        if (qsa_sliced) {
+            const cudaError_t e0 = cudaStreamSynchronize(m.cs);
+            const cudaError_t e1 = cudaStreamSynchronize(m.pp->qsa.s);
+            if (e0 != cudaSuccess || e1 != cudaSuccess) {
+                err = std::string("prefill: the prompt-attention pair's streams: ") +
+                      cudaGetErrorString(e0 != cudaSuccess ? e0 : e1);
+                return false;
+            }
+            if (m.pp->qsa.pair.timed_out()) {
+                err = "prefill: the prompt-attention pair gave up waiting for a partial this chunk; the layer whose "
+                      "reduce went half would have reached the model as one card's attention, so the run stops here "
+                      "and the pair is not used again";
+                return false;
+            }
+            // The partner appended this chunk's cells into its OWN pools, for every QSA layer of the stage, so
+            // `[., p0 + T)` is now a span it holds first-hand and the proof advances with the prompt.  Without
+            // this the next prompt's catch-up would re-import the whole context it just wrote itself; with it,
+            // the catch-up costs the gap - what decode or another session added - and nothing else.  Only a chunk
+            // whose layers all went through the arm earns it, and only once its reduce was proved whole above.
+            if (p0 + T > m.pp->qsa.span_valid) m.pp->qsa.span_valid = p0 + T;
+        }
         if (issuer.joinable()) {
             issuer.join();
             stats_.ms_experts_host += iss_ms;

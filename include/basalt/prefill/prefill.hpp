@@ -217,6 +217,15 @@ public:
     /// leaves them free when it sizes itself.  `qsa` adds the prompt-attention span above.
     static uint64_t peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_rows, bool peer_rows_fp32,
                                bool peer_acts_fp32, const PeerQsaSpan* qsa = nullptr);
+    /// What the prompt-attention slice takes on the LEAD's own card, which `peer_bytes` does not cover: the pair's
+    /// staging on this side (`Tp2Pair::open` allocates a `chunk x n_embd` FP32 buffer on EACH card, and the peer
+    /// tier only books the partner's) and the lead's packed `attn_output` columns, which `qsa_pair_prepare`
+    /// allocates there because the lead is the card that runs that shard.  Priced at the pinned symmetric cut, as
+    /// the partner's span is, and `set_peer` refuses a split that needs more on EITHER card by name: the lead's
+    /// columns grow as the partner's shrink, so the partner fitting does not prove the lead fits.  Zero with the
+    /// gate closed, which is what leaves a boot that never asked for the slice untouched.
+    static uint64_t lead_qsa_bytes(const core::ModelGeometry& g, const core::WeightTable& wt, int64_t chunk,
+                                   int64_t lead_heads);
     /// --peer-exclusive: experts only `peer` holds have no host copy; the prompt path copies them from its memory
     /// through host staging into the ring.  Independent of set_peer.
     void set_ring_peer(core::PeerExperts* peer);
