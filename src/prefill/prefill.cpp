@@ -3842,9 +3842,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         bool qsa_sliced = false;
         // THE PAIR-AGREEMENT RINGS start zeroed, on the streams that will fill them: a layer that sampled on one
         // card and not the other is then a mismatch at the chunk's end rather than two slots of stale bytes that
-        // happened to agree (and never a pair that had nothing to say agreeing with itself).
-        if (m.pp && m.pp->qsa.live && m.pp->qsa.chk[0] != nullptr && m.pp->qsa.chk[1] != nullptr &&
-            m.pp->qsa.chk_layers > 0) {
+        // happened to agree (and never a pair that had nothing to say agreeing with itself).  THE TEST IS THE ONE
+        // THAT DECIDES SLICING, `sap`'s own: a chunk too wide for the arm's buffers runs whole, samples nothing, and
+        // owes neither memset - the same rule that keeps its collective verdict from costing a sync.  It must stay
+        // AT LEAST as permissive as `sap`, or a sliced chunk could compare rings it never cleared.
+        if (m.pp && m.pp->qsa.live && T <= m.pp->qsa.rows_max && m.pp->qsa.chk[0] != nullptr &&
+            m.pp->qsa.chk[1] != nullptr && m.pp->qsa.chk_layers > 0) {
             const size_t rb = (size_t) m.pp->qsa.chk_layers * basalt::kernels::kTp2Samples * 4;
             { const core::OnDevice on_lead(m.pp->qsa.lead_dev);
               if (cudaMemsetAsync(m.pp->qsa.chk[0], 0, rb, m.cs) != cudaSuccess) {
