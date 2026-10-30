@@ -2591,3 +2591,26 @@ rule and needs the PPL/KLD gate, not just greedy identity.
   O_DIRECT-fed and interleaved with compute. The queue-behind-the-copy-engine result is robust to that; the
   exact 2.4 ms is not a production measurement.
 - `--mode ring`/`all2all` measure simultaneous pushes, which is how a ring AR actually behaves.
+
+**Review #5 verdicts (kimi, post-merge; the morning decision record):**
+1. **Staggered/unstaggered pinned** (my earlier citation was inverted): the win case is a
+   SCHEDULER that keeps only one pair direction hot (3.96 GiB/s) — expert sharding nets
+   -35.4 ms/layer (~23%, -> ~2,540) under it; both-pairs-simultaneous halves each pair to
+   2.00 GiB/s and is a small loss (+6.9). Slice-only nets +8.4 ms/layer unhidden to
+   +28.6 hidden -> ~2,100-2,400. Correction also adopted: the split used ~18 GiB/s of the
+   h2d face, not "all of it"; the true statement is TP=2 does not enlarge that face.
+2. **Decode stays collective-free PERMANENTLY on this fabric** — the AR's best case erases
+   the attention win (save ~2.7, pay 1.9-2.8) and its failure mode under the live adaptive
+   tier is 28-235 ms (two orders). Per-phase transport policy is the architecture: prefill
+   ARs on SM-driven pushes + staggered stage scheduling; decode keeps the zero-collective
+   peer window. Not a stopgap.
+3. **Dual rule for the slice**: +10 ms/layer-pair stays the component ABORT; the SHIP bar is
+   comparative - measured net with transport must beat EP+PP-without-slice on the same boot
+   by >= ~20 ms/layer (10 ms at 171 ms is inside boot-to-boot noise; rule-of-3 if marginal).
+   The span plumbing + ratio flags are kept regardless of the slice's outcome.
+4. **Expert sharding is sequenced behind the slice, not dropped**: +150-200 t/s over
+   slice-only, gated on the down_proj split-K PPL/KLD procedure (a known gate, not a cost).
+5. **Overnight grading correction**: the 1,997/2,000 hold is share-v2's PREDICTED null, not
+   evidence against; share-v2's real grade is the two falsifier reads (peer layer time
+   term-by-term vs peer chunk; the row-rate ratio >= 1.4x) + a blob_mb_ms measurement -
+   1-boot exercises, top of the morning list.
