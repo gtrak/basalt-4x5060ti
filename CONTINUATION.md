@@ -28,10 +28,12 @@
    term. The done-line hid RUN 25's entire decomposition (attn +13-15, peer-wait +50-60).
 8. **OVERNIGHT AUTHORITY**: when the owner grants an overnight window ("do what you can until
    X"), do not stop prematurely; keep working, keep workers fed, keep the server serving.
-9. **WORKER HYGIENE (enforced)**: commit coherent units before any wall clock; progress files
-   are the handoff (context death at 262k is routine); predictions filed before measuring;
-   honest numbers, never tuned to pass; refusals name their cause; CPU gates with the TEST
-   COUNT verified (BUILD_TESTING-off makes ctest pass vacuously).
+9. **WORKER HYGIENE (enforced)**: commit coherent units before any wall clock; **workers
+   COMPACT at context pressure and continue — dying at the context limit is a failure mode,
+   not the plan** (supervisor briefs must not prime death; progress files are insurance, not
+   the primary continuation); predictions filed before measuring; honest numbers, never tuned
+   to pass; refusals name their cause; CPU gates with the TEST COUNT verified
+   (BUILD_TESTING-off makes ctest pass vacuously).
 10. **FORK PUSHES AS CHECKPOINTS** after every accepted unit; the branch of record is tp2pp2.
 
 
