@@ -223,6 +223,7 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/gr.cu
                         src/kernels/cuda/gdn.cu
                         src/kernels/cuda/qsa.cu
+                        src/kernels/cuda/qsa_chain.cu
                         src/kernels/cuda/elementwise.cu
                         src/kernels/cuda/tp2_collective.cu
                         src/kernels/cuda/bf16_gemv.cu
@@ -779,6 +780,11 @@ set_tests_properties(tp2_allreduce_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT
 
 # the prompt-attention arm's per-layer pair protocol at the depth each gate runs it: the publish's rows, both
 # partials and their reduce, two cards, the lead running ahead the way the pipelined gate lets it (two cards)
+add_executable(qsa_chain_parity tests/kernels/qsa_chain_parity.cpp)
+target_include_directories(qsa_chain_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(qsa_chain_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME qsa_chain_parity COMMAND qsa_chain_parity --selftest)
+set_tests_properties(qsa_chain_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 add_executable(tp2_staging_depth tests/kernels/tp2_staging_depth.cu)
 target_include_directories(tp2_staging_depth PRIVATE ${_gpu_include_directories})
 target_link_libraries(tp2_staging_depth PRIVATE kernels ${_gpu_runtime_target})
