@@ -21,6 +21,7 @@
 #include "basalt/core/layer.hpp"
 #include "basalt/core/native_head.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/kernels/qsa_chain.hpp"
 #include "basalt/kernels/qsa_decode_attn.hpp"
 #include "basalt/kernels/qsa_prompt_attn.hpp"
 #include "basalt/kernels/qsa_select.hpp"
@@ -807,6 +808,12 @@ struct PeerPrefill {
         float* chk[2] = {nullptr, nullptr};   // [0] the lead card's ring, [1] the partner's
         int chk_layers = 0;                   // ring length in layers: the stage's QSA layer count
 
+        /// The chain's slots for this stage's layers, when `--exp qsa_dump_chain` is on: [0] the lead card's
+        /// array, [1] the partner's.  The Prefill's `owned` owns both; these are the arm's handles on them,
+        /// written when the chain is armed.  Null means the instrument is off, and recording is then a no-op -
+        /// the arm must never fail because an observer could not be fitted.
+        basalt::kernels::QsaChainFp* chain[2] = {nullptr, nullptr};
+
         Gemm gemm;                    // this card's own (see the header note)
         uint16_t* gscratch = nullptr;
         void* gws = nullptr;
@@ -1010,6 +1017,24 @@ struct Prefill::Impl {
     uint32_t* hist = nullptr;                // routed-entry counts per (layer, expert); see route_hist_reset
     int64_t hist_n = 0, hist_tokens = 0;
     bool hist_on = false;
+    // THE PER-LAYER CHAIN (`--exp qsa_dump_chain=1`): one fingerprint of every component of each QSA layer's data
+    // path, taken as the layer completes, one array per card, both cleared at the chunk's start and read back at
+    // its end.  Three boots of one prompt - slice off, `=1`, `=2` - leave three chains that diff on the CPU, and
+    // the first component whose fingerprint moves says where the modes part company.  The pair-agreement check
+    // cannot see a pair that agrees on a wrong value, which is the shape a wrong INPUT makes; a chain can, which
+    // is why this exists beside it rather than instead of it.  Indexed by MODEL layer, so a line names a layer
+    // the rest of the boot names too.  `owned` frees both, as with `hist`.
+    basalt::kernels::QsaChainFp* chain[2] = {nullptr, nullptr};   // [0] the lead's card, [1] the partner's
+    int64_t chain_n = 0;        // fingerprints per card: n_layers * basalt::kernels::kChainCount
+    int chain_peer_dev = -1;    // whose context the partner's array was allocated in, so release frees it there
+    /// Is a chunk of this Prefill in flight?  The pair's two wire sets, the two collective sets and the chain's
+    /// arrays are all indexed by the QSA layer ordinal of ONE chunk of THIS Prefill, so a second chain driving the
+    /// same arm would alias them - and the pair would still agree with itself, both cards adding the same two wrong
+    /// partials, which is the one disagreement the agreement check cannot see.  Nothing does it today: each slot
+    /// owns its Prefill, and the only thread that enters a run waits for it before its caller returns.  Said out
+    /// loud if that ever stops being true, so the class is settled by a log line rather than by a token stream.
+    bool running = false;
+    bool chain_on = false;      // the flag asked for it and both arrays that were asked for are there
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
     std::vector<void*> owned;
@@ -1186,6 +1211,13 @@ void Prefill::release() {
     for (cudaEvent_t e : {impl_->cpu_ev_in, impl_->cpu_ev_x, impl_->cpu_gev[0], impl_->cpu_gev[1], impl_->ahead_ev})
         if (e) cudaEventDestroy(e);
     if (impl_->guess_host) cudaFreeHost(impl_->guess_host);
+    // The chain's partner array lives on the PARTNER's card, so it goes while that card is current - the same
+    // reason `PeerPrefill`'s close scopes its rings.  It is not in `owned`, which is freed from this card.
+    if (impl_->chain[1] != nullptr) {
+        const core::OnDevice on_partner(impl_->chain_peer_dev);
+        cudaFree(impl_->chain[1]);
+        impl_->chain[1] = nullptr;
+    }
     for (void* p : impl_->owned) cudaFree(p);
 }
 
@@ -2469,6 +2501,47 @@ bool peer_qsa_resident_up(PeerPrefill& P, const core::WeightTable& wt, int lead_
     return true;
 }
 
+// ---- THE PER-LAYER CHAIN (`--exp qsa_dump_chain`) -----------------------------------------------------------
+
+/// One component's fingerprint, into `card`'s array at [layer][slot].  Every call is launched on the CALLER's
+/// stream, after the kernels that produced the component and before any that overwrite it, which is what makes the
+/// fingerprint the thing the layer actually used rather than the thing the buffer happens to hold by the end of
+/// the chunk.  A missing component leaves the slot at `--------`: the chain reads an absence, it does not police
+/// the run, and a run must never fail because an observer could not be fitted.  A record that could not LAUNCH is
+/// a different thing and is logged - a chain with a hole in it is worse than no chain if the hole is silent.  The
+/// caller's card must be current, as everywhere in the arm.
+static void qsa_chain_put(basalt::kernels::QsaChainFp* card, int64_t layer, int slot, const void* base, int64_t rows,
+                          int64_t stride_words, cudaStream_t stream) {
+    if (card == nullptr || layer < 0 || slot < 0 || slot >= basalt::kernels::kChainCount) return;
+    if (base == nullptr || rows <= 0 || stride_words <= 0) return;   // a component this mode never reached
+    std::string e;
+    if (!basalt::kernels::qsa_chain_record(
+            card + (size_t) layer * basalt::kernels::kChainCount + slot, base, rows, stride_words, stream, e))
+        basalt::log::error("basalt", "qsa chain: layer %lld slot %s: %s", (long long) layer,
+                           basalt::kernels::qsa_chain_slot_name(slot), e.c_str());
+}
+
+/// One KV plane as the chain fingerprints it: the FP16 pool when the state keeps one, its INT8 codes when it does
+/// not, its Q4_0 blocks when it keeps neither, and the row's pitch in 4-byte words either way.  The row COUNT comes
+/// from the caller and must be a figure that is the same on every boot: sampling rows out of an allocation would
+/// compare two boots of one prompt at different rows and report the difference as a corruption.
+static const void* qsa_chain_plane(const basalt::kernels::QsaAttnPools& p, bool is_k, int64_t head_dim,
+                                   int64_t& stride_words) {
+    stride_words = 0;
+    const uint16_t* fp16 = is_k ? p.k_pool : p.v_pool;
+    const int8_t* q8 = is_k ? p.k_q : p.v_q;
+    const uint8_t* q4 = is_k ? p.k_q4 : p.v_q4;
+    if (fp16 != nullptr && head_dim % 2 == 0) { stride_words = head_dim / 2; return fp16; }
+    if (q8 != nullptr && head_dim % 4 == 0) { stride_words = head_dim / 4; return q8; }
+    // A Q4_0 row is 18 bytes per 32 values (one FP16 scale per block plus the codes); a row that is not a whole
+    // number of words would fingerprint half a block, so such a shape is simply not fingerprinted.
+    if (q4 != nullptr && head_dim % 32 == 0 && ((head_dim / 32) * 18) % 4 == 0) {
+        stride_words = (head_dim / 32) * 18 / 4;
+        return q4;
+    }
+    return nullptr;
+}
+
 /// The lead's side of the wire for one QSA layer: the FP16 mixed rows its own `attn_q` read, its indexer q
 /// already normed and rotated, its raw indexer key, and the chunk's per-query step counts, copied from this card
 /// into the partner's wire set `wire`.  The step counts travel with every layer rather than once per chunk: they
@@ -2546,7 +2619,7 @@ bool peer_qsa_publish(PeerPrefill& P, const uint16_t* mixed_h, const float* q_id
     return true;
 }
 
-bool peer_qsa_layer(PeerPrefill::Qsa& qs, int64_t li, int64_t wire, int64_t T, int64_t p0, int64_t active,
+bool peer_qsa_layer(PeerPrefill::Qsa& qs, int64_t li, int64_t layer, int64_t wire, int64_t T, int64_t p0, int64_t active,
                     std::string& err) {
     const Prefill::PeerQsaSpan& sp = qs.span;
     if (!qs.live || !sp.on || sp.g == nullptr) { err = "peer QSA: the arm is not live"; return false; }
@@ -2586,6 +2659,18 @@ bool peer_qsa_layer(PeerPrefill::Qsa& qs, int64_t li, int64_t wire, int64_t T, i
     // compute stream behind the kernels that made them, then this event.  Skipping the wait would let the arm read
     // a wire set the copies have not filled, which is last layer's rows - a plausible token, not an error.
     if (cudaStreamWaitEvent(cs, qs.ev_in[qs.pipeline >= 2 ? wire : 0], 0) != cudaSuccess) { err = "peer QSA: the arm would not wait on the publish"; return false; }
+    // THE CHAIN, partner side (`--exp qsa_dump_chain`): what this card was GIVEN, fingerprinted after the wait on
+    // the publish and before anything reads it.  Compared against the lead's own `mix`/`steps` from the same
+    // layer, a difference here is the link or the wire set rather than the arithmetic - the one place in the
+    // pipelined gate where a stale set could reach a layer and look like a plausible attention output.
+    if (qs.chain[1] != nullptr) {
+        qsa_chain_put(qs.chain[1], layer, basalt::kernels::kChainPub, qs.mixed_h[wire], T, N / 2, cs);
+        qsa_chain_put(qs.chain[1], layer, basalt::kernels::kChainStepsR, qs.steps[qs.pipeline >= 2 ? wire : 0], T,
+                      basalt::kernels::kStepCount, cs);
+        qsa_chain_put(qs.chain[1], layer, basalt::kernels::kChainQIdxR, qs.q_idx[wire], T,
+                      (int64_t) sh.idx_n_head * sh.idx_dim, cs);
+        qsa_chain_put(qs.chain[1], layer, basalt::kernels::kChainIdxRaw, qs.idx_raw[wire], T, sh.idx_dim, cs);
+    }
 
     // ---- the projections, from the lead's own mixed rows, on this card's own weights
     // N = the card's output rows, K = n_embd; the same call the lead makes, at the shard's N
@@ -2657,6 +2742,19 @@ bool peer_qsa_layer(PeerPrefill::Qsa& qs, int64_t li, int64_t wire, int64_t T, i
         return false;
     }
     const basalt::kernels::QsaAttnPools pools = core::qsa_attn_pools(st);
+    // The imported span, the Q rows and the selection - the three inputs of the attention, taken before it runs.
+    // `kspan`/`vspan` are the cells this card holds first-hand, imported or appended, which is what makes them the
+    // read on the span protocol: a layer whose span fingerprint moves between two boots of one prompt while its
+    // `pub` did not is an import that landed somewhere other than where the attention looks.
+    if (qs.chain[1] != nullptr) {
+        qsa_chain_put(qs.chain[1], layer, basalt::kernels::kChainSelR, qs.sel_ids, T, cap, cs);
+        qsa_chain_put(qs.chain[1], layer, basalt::kernels::kChainQ, qs.q, T, nq * D, cs);
+        int64_t kw = 0, vw = 0;
+        const void* kp = qsa_chain_plane(pools, true, D, kw);
+        qsa_chain_put(qs.chain[1], layer, basalt::kernels::kChainKSpan, kp, cap, kw, cs);
+        const void* vp = qsa_chain_plane(pools, false, D, vw);
+        qsa_chain_put(qs.chain[1], layer, basalt::kernels::kChainVSpan, vp, cap, vw, cs);
+    }
     if (!basalt::kernels::qsa_prompt_attn_batch(qs.q, pools, qs.sel_ids, qs.steps[qs.pipeline >= 2 ? wire : 0], cap,
                                                sh, qs.attn, T, cs)) {
         err = "peer QSA: the prompt attention refused this geometry";
@@ -2665,6 +2763,10 @@ bool peer_qsa_layer(PeerPrefill::Qsa& qs, int64_t li, int64_t wire, int64_t T, i
 
     // ---- the gate, over this card's heads.  `attn_h` is what the o_proj product will read.
     gate_attn_span(qs.attn, qs.Qf, qs.attn_h, T, nq, nq * 2 * D, cs);
+    if (qs.chain[1] != nullptr) {
+        qsa_chain_put(qs.chain[1], layer, basalt::kernels::kChainAttnP, qs.attn, T, nq * D, cs);
+        qsa_chain_put(qs.chain[1], layer, basalt::kernels::kChainGatedP, qs.attn_h, T, nq * D / 2, cs);
+    }
     return true;
 }
 
@@ -2745,6 +2847,16 @@ bool peer_qsa_finish(PeerPrefill& P, Gemm& lead_gemm, cudaStream_t lead_cs, cons
         err = std::string("prefill: the lead's half o_proj product did not launch: ") + cudaGetErrorString(le);
         return false;
     }
+    // THE CHAIN: both partials as they leave their products and before either card adds.  These are the buffers
+    // the collective reads, so a pair whose `suml`/`sump` agree while a partial moved from one boot to the next was
+    // handed the wrong input rather than losing a sum - the distinction the sampled rings cannot make, because two
+    // cards adding the same wrong value agree perfectly.
+    if (qs.chain[0] != nullptr || qs.chain[1] != nullptr) {
+        { const core::OnDevice on_partner(P.dev);
+          qsa_chain_put(qs.chain[1], layer, basalt::kernels::kChainPartP, qs.part_f32[w], T, N, qs.s); }
+        { const core::OnDevice on_lead(P.prim);
+          qsa_chain_put(qs.chain[0], layer, basalt::kernels::kChainPartL, lead_partial, T, N, lead_cs); }
+    }
 
     // ---- the collective, once per rank.  A rank whose peer never arrives burns its spin budget, sets its word
     // and returns WITHOUT adding: `tp2_all_reduce` refuses at entry when either word is already set, and the
@@ -2772,6 +2884,16 @@ bool peer_qsa_finish(PeerPrefill& P, Gemm& lead_gemm, cudaStream_t lead_cs, cons
             err = "peer QSA: the pair's agreement sample: " + serr;
             return false;
         }
+    }
+    // THE CHAIN, post-reduce: the whole buffer, not the eight elements the rings sample.  `suml` and `sump` are the
+    // agreement check again and stronger - any element differing anywhere shows up, not only a sampled one - and
+    // `bo` on the lead's side is what the model actually went on to read, so the three of them separate "the pair
+    // summed wrong", "the pair summed right from wrong inputs" and "the sum was right and something after it moved".
+    if (qs.chain[0] != nullptr || qs.chain[1] != nullptr) {
+        { const core::OnDevice on_partner(P.dev);
+          qsa_chain_put(qs.chain[1], layer, basalt::kernels::kChainSumP, qs.part_f32[w], T, N, qs.s); }
+        { const core::OnDevice on_lead(P.prim);
+          qsa_chain_put(qs.chain[0], layer, basalt::kernels::kChainSumL, lead_partial, T, N, lead_cs); }
     }
     // The two proofs the next layer's publish and push wait on, recorded after the two adds were enqueued - each
     // on the card whose stream it records into, which is where each event was created (`make_peer`).
@@ -2878,8 +3000,14 @@ bool peer_qsa_span_catch_up(PeerPrefill& P, int64_t p0, std::string& err) {
         peer_to(ps.idx_dead, ls.idx_dead, (size_t) sh.idx_dim * sizeof(float));
         peer_to(ps.idx_block_pos, ls.idx_block_pos, sizeof(int32_t));
     }
-    cudaEventRecord(qs.ev_out[0], qs.s);
-    cudaEventSynchronize(qs.ev_out[0]);
+    // THE IMPORT'S HOST BARRIER.  This borrowed `ev_out[0]` - the arm's end-of-layer proof - to wait on the DMAs it
+    // had just queued, which is one event carrying two unrelated meanings: the shape that made the serialized gate
+    // run half its layers pipelined while its boot line said otherwise.  The proof of an arm's layer belongs to the
+    // arm; a host that wants the DMAs it queued on the arm's stream asks the stream.  Same wait, one fewer meaning.
+    if (cudaStreamSynchronize(qs.s) != cudaSuccess) {
+        err = "peer QSA: the span import would not drain the arm's stream";
+        return false;
+    }
     qs.last_import_ms = ms_since(t0);
     qs.last_import_cells = p0 - c0;
     ++qs.imports;
@@ -3634,6 +3762,18 @@ bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, 
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     err.clear();
     Impl& m = *impl_;
+    // One chain at a time, observed rather than assumed (see `Impl::running`).  Warned, not failed: if the engine
+    // ever does drive one arm from two chains, the fact is worth a log line and a correct answer, and a boot that
+    // died on its own invariant would have taught the hunt nothing.
+    struct Running {
+        bool& f;
+        bool was;
+        explicit Running(bool& x) : f(x), was(x) { f = true; }
+        ~Running() { f = was; }
+    } running(m.running);
+    if (running.was)
+        basalt::log::warn("basalt", "qsa pair: a second chunk entered the same prefill; the pair's sets are indexed "
+                                   "by one chain's layer ordinal, so two chains would share them");
     m.qsa_refused = false;   // a slice that refused an earlier chunk must not speak for this one
     const core::OnDevice on_device(m.device);
     const core::ModelGeometry& g = *m.g;
@@ -3861,6 +4001,57 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                   m.qsa_refused = true;
                   return false;
               } }
+        }
+        // THE CHAIN starts blank (`--exp qsa_dump_chain=1`).  Unlike the agreement rings this is owed by EVERY
+        // chunk, sliced or not: the gate-off boot is the reference the other two diff against, so the instrument
+        // has to run when the arm does not.  The flag takes 0 or 1 and nothing else - a value that would name a
+        // third mode is refused where it is read, rather than rounded into whichever mode the reader guessed.
+        // Allocated once, on the first chunk that asks, and cleared every chunk: a component a layer never
+        // reached must read as absent, never as the previous chunk's bytes.
+        const double chain_want = core::exp_flag("qsa_dump_chain", 0.0);
+        if (chain_want != 0.0 && !m.chain_on) {
+            if (chain_want != 1.0) {
+                err = "prefill: --exp qsa_dump_chain takes 0 or 1, not " + std::to_string(chain_want);
+                return false;
+            }
+            m.chain_n = (int64_t) g.n_layers * basalt::kernels::kChainCount;
+            const size_t cb = (size_t) m.chain_n * sizeof(basalt::kernels::QsaChainFp);
+            if (cudaMalloc((void**) &m.chain[0], cb) != cudaSuccess) {
+                m.chain[0] = nullptr;
+                err = "prefill: the prompt-attention chain's lead array would not allocate";
+                return false;
+            }
+            m.owned.push_back(m.chain[0]);
+            if (m.pp != nullptr && m.pp->qsa.live) {
+                // The partner's half exists only when a layer can actually be sliced.  With the arm off its slots
+                // read `--------`, which is the truth about that boot rather than a hole in the instrument.
+                const core::OnDevice on_partner(m.pp->dev);
+                if (cudaMalloc((void**) &m.chain[1], cb) != cudaSuccess) {
+                    m.chain[1] = nullptr;
+                    err = "prefill: the prompt-attention chain's partner array would not allocate";
+                    return false;
+                }
+                m.chain_peer_dev = m.pp->dev;
+                m.pp->qsa.chain[0] = m.chain[0];   // the arm records into the same device memory; it owns none
+                m.pp->qsa.chain[1] = m.chain[1];
+            }
+            m.chain_on = true;
+            basalt::log::info("basalt", "qsa chain: on, %d components per layer over %d layers",
+                              (int) basalt::kernels::kChainCount, (int) g.n_layers);
+        }
+        if (m.chain_on) {
+            const size_t cb = (size_t) m.chain_n * sizeof(basalt::kernels::QsaChainFp);
+            if (cudaMemsetAsync(m.chain[0], 0xFF, cb, m.cs) != cudaSuccess) {
+                err = "prefill: the prompt-attention chain's lead array would not be cleared";
+                return false;
+            }
+            if (m.chain[1] != nullptr) {
+                const core::OnDevice on_partner(m.chain_peer_dev);
+                if (cudaMemsetAsync(m.chain[1], 0xFF, cb, m.pp->qsa.s) != cudaSuccess) {
+                    err = "prefill: the prompt-attention chain's partner array would not be cleared";
+                    return false;
+                }
+            }
         }
         // this chunk's stream - every non-resident expert of every layer, layer by layer in id order (entry
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
@@ -4337,6 +4528,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (!runs.empty() && runs[0].len >= rep && runs[0].len % rep == 0)
                             lead_groups = runs[0].len / rep;
                     }
+                    // THE CHAIN, lead side (`--exp qsa_dump_chain`): the layer's inputs as the lead holds them,
+                    // fingerprinted here so the figure is the bytes the attention is about to read rather than what
+                    // the buffers hold by the end of the chunk.  The row count is the arm's own `cap`, a figure of
+                    // the geometry rather than of an allocation, so two boots of one prompt sample the same rows
+                    // and a difference between them means the bytes moved.
+                    if (m.chain_on) {
+                        qsa_chain_put(m.chain[0], l, basalt::kernels::kChainMix, m.mixed_h, T, g.n_embd / 2, m.cs);
+                        qsa_chain_put(m.chain[0], l, basalt::kernels::kChainSteps, m.steps_dev, T,
+                                      basalt::kernels::kStepCount, m.cs);
+                        qsa_chain_put(m.chain[0], l, basalt::kernels::kChainSel, m.sel_ids, T, m.cap, m.cs);
+                        int64_t kw = 0, vw = 0;
+                        const void* kp = qsa_chain_plane(pools, true, s.head_dim, kw);
+                        qsa_chain_put(m.chain[0], l, basalt::kernels::kChainKPool, kp, m.cap, kw, m.cs);
+                        const void* vp = qsa_chain_plane(pools, false, s.head_dim, vw);
+                        qsa_chain_put(m.chain[0], l, basalt::kernels::kChainVPool, vp, m.cap, vw, m.cs);
+                    }
                     // the whole chunk on tensor cores, one block per (query, KV head), FP32-level
                     // accuracy but not bitwise (qsa_prompt_attn.hpp). Q4_0 KV (or a shape it does not take): the
                     // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,
@@ -4356,6 +4563,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // never read (and the attention above never wrote them)
                     if (lead_groups > 0) gate_attn_span(m.attn, m.Qf, m.attn_h, T, lead_groups * rep, ZV, m.cs);
                     else gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
+                    // The attention output and the gated rows, the two the `o_proj` product is built from.  Under
+                    // the slice the lead's rows past its own run are never written, so what is fingerprinted here
+                    // is what this mode put there and nothing else.
+                    if (m.chain_on) {
+                        qsa_chain_put(m.chain[0], l, basalt::kernels::kChainAttn, m.attn, T, ZV, m.cs);
+                        qsa_chain_put(m.chain[0], l, basalt::kernels::kChainGated, m.attn_h, T, ZV / 2, m.cs);
+                    }
                     if (sap != nullptr) {
                         // The chunk's widest `n_bid + 1`: the positions rise through a chunk, so the last query's
                         // is the widest, and the arm takes it as an argument rather than reading a host copy per
@@ -4366,7 +4580,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // its products are enqueued; `peer_qsa_finish` puts the lead's card back.
                         bool ok_arm = false;
                         { const core::OnDevice on_partner(sap->qsa.card); 
-                          ok_arm = peer_qsa_layer(sap->qsa, qsa_ord, wire, T, p0, active, err) &&
+                          ok_arm = peer_qsa_layer(sap->qsa, qsa_ord, l, wire, T, p0, active, err) &&
                                    peer_qsa_finish(*sap, m.gemm, m.cs, m.attn_h, ZV, m.bo, qsa_ord, l, wire, T, err); }
                         if (!ok_arm) { m.qsa_refused = true; return false; }
                         qsa_sliced = true;
@@ -4398,6 +4612,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     } else {
                         if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
                     }
+                    // The summed `o_proj` exactly as the model reads it, sliced or whole: the one component all
+                    // three boots must agree on, which is what makes a gate-off chain the reference for the other
+                    // two rather than a fourth opinion.
+                    if (m.chain_on)
+                        qsa_chain_put(m.chain[0], l, basalt::kernels::kChainBo, m.bo, T, ZV, m.cs);
                     ++qsa_index;
                 } else {
                     // ======================= MoE =======================
@@ -5544,6 +5763,47 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             // the catch-up costs the gap - what decode or another session added - and nothing else.  Only a chunk
             // whose layers all went through the arm earns it, and only once its reduce was proved whole above.
             if (p0 + T > m.pp->qsa.span_valid) m.pp->qsa.span_valid = p0 + T;
+        }
+        // THE CHAIN is read where the chunk's other verdicts are read (`--exp qsa_dump_chain`).  Both cards' arrays
+        // come back after their streams drained, then every QSA layer the chunk touched prints one line per card -
+        // which is what the three boots of one prompt are diffed on, by grep or by eye, with no second tool to
+        // trust.  A chain that would not come back is logged and the run goes on: an instrument is not the model,
+        // and a boot that died because its instrumentation failed would leave the hunt with no boot at all.
+        if (m.chain_on) {
+            const size_t cb = (size_t) m.chain_n * sizeof(basalt::kernels::QsaChainFp);
+            std::vector<basalt::kernels::QsaChainFp> lh((size_t) m.chain_n), ph;
+            cudaError_t c0 = cudaSuccess, c1 = cudaSuccess;
+            if (cudaStreamSynchronize(m.cs) != cudaSuccess) c0 = cudaGetLastError();
+            if (c0 == cudaSuccess) c0 = cudaMemcpy(lh.data(), m.chain[0], cb, cudaMemcpyDeviceToHost);
+            if (m.chain[1] != nullptr) {
+                ph.assign((size_t) m.chain_n, basalt::kernels::QsaChainFp{});
+                if (cudaStreamSynchronize(m.pp->qsa.s) != cudaSuccess) c1 = cudaGetLastError();
+                if (c1 == cudaSuccess) {
+                    const core::OnDevice on_partner(m.chain_peer_dev);
+                    c1 = cudaMemcpy(ph.data(), m.chain[1], cb, cudaMemcpyDeviceToHost);
+                }
+            }
+            if (c0 != cudaSuccess || c1 != cudaSuccess)
+                basalt::log::error("basalt", "qsa chain: the chunk's fingerprints would not come back: %s / %s",
+                                   cudaGetErrorString(c0), cudaGetErrorString(c1));
+            for (int64_t l = 0; l < g.n_layers; ++l) {
+                if (!core::is_qsa_layer(g, l)) continue;
+                for (int card = 0; card < 2; ++card) {
+                    const std::vector<basalt::kernels::QsaChainFp>& h = card == 0 ? lh : ph;
+                    if (h.empty()) continue;   // no partner array: this mode sliced no layer, so it has no peer line
+                    std::string line;
+                    for (int slot = 0; slot < basalt::kernels::kChainCount; ++slot) {
+                        const basalt::kernels::QsaChainFp& fp =
+                            h[(size_t) l * basalt::kernels::kChainCount + slot];
+                        if (fp.hash == basalt::kernels::kChainUnrecorded) continue;   // a component it never reached
+                        if (!line.empty()) line += ' ';
+                        line += basalt::kernels::qsa_chain_field(slot, fp);
+                    }
+                    if (line.empty()) continue;   // a layer this chunk never touched prints nothing
+                    basalt::log::info("basalt", "qsa chain: %s chunk %lld layer %lld %s", card == 0 ? "lead" : "peer",
+                                      (long long) p0, (long long) l, line.c_str());
+                }
+            }
         }
         if (issuer.joinable()) {
             issuer.join();
