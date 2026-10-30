@@ -1,10 +1,11 @@
-# RUN 25 — the prompt-attention slice: byte ledger and filed predictions (BEFORE any measurement)
+# RUN 25 — the prompt-attention slice: byte ledger, filed predictions, and what measured
 
 ## Supervisor rulings on record (this run)
 
 See **`progress-tp2slice-rulings.md`** - Ruling B (the lead's pools stay whole, option (a) the funded contingency), the
-decode-window-end ruling and the invariant it rests on, the tier-reserve option (c), and the ship-bar wording.
-
+decode-window-end ruling and its invariant, the tier-reserve option (c), the ship-bar wording, the **retracted**
+whole-width-partner-pools ruling (premise measured false; the head-width invariant stands from it), the `=1`
+serialization fix, the tripwire, and the finding that moved the ship decision to the owner.
 
 ## Status of this milestone
 
@@ -52,10 +53,9 @@ like: nothing logs that a chunk was sliced.
 partner's card current for its products; `peer_qsa_finish()` multiplies each card's gated rows by its OWN packed
 columns and issues one `tp2_all_reduce()` per rank. A chunk wider than the arm's buffers is not sliced at all,
 decided once per layer so no layer can half-slice.
-Funding: `Prefill::lead_qsa_bytes()` prices what the slice takes on the LEAD's card (its side of the pair's
-staging, its packed columns), `generate.cpp` holds it back from each stage lead's tier, and `set_peer` refuses a
-split whose lead side exceeds the pinned symmetric cut by naming both figures. `fits_within` still guards the
-partner's side.
+Funding: `Prefill::lead_qsa_bytes()` prices the slice's LEAD-card take (its pair staging, its packed columns),
+`generate.cpp` holds it back from the stage lead's tier, and `set_peer` refuses a split whose lead side exceeds the
+pinned symmetric cut, naming both figures; `fits_within` still guards the partner's side.
 
 **Two events, because the collective has no back-pressure.** `Tp2Pair` counts its collectives, it does not credit
 the staging back, so a rank a layer ahead can overwrite the peer's staging — or republish a wire set — while the

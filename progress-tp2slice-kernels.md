@@ -138,7 +138,12 @@ token with the acceptance at 100%. Now it fails the request and names the QSA la
 eight floats a layer a card, allocated and priced with the pair rather than through the tier's 68-allocation walk,
 and zeroed at each chunk's start on the streams that fill them - so "sampled on one card only" fails the same way
 rather than agreeing by silence. `tp2_staging_depth`'s last case is its falsifier: one layer summed on one card only
-must be reported, or the whole check is decoration. The
+must be reported, or the whole check is decoration.
+
+What it reads like when it fires (the string to grep a window log for): `the prompt-attention pair disagreed about
+what it summed at QSA layer N, sample K`. It refuses the request and disarms the pair for the next prompt, like the
+chunk's other collective verdicts; a run that says this has localized the corruption to the pair, and a `=2` run that
+emits tokens without saying it has not. The
   arm therefore has **no caller yet** - it is wired by the `span_valid` and reduce-to-lead steps, not before.
 
 The attention has no decode fallback, unlike the lead's: that fallback exists for shapes this arm already refused

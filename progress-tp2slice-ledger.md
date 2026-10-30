@@ -2,7 +2,7 @@
 
 The status, rulings and open items live in `progress-tp2slice.md`; this file is the arithmetic. Every figure here
 is either derived from a sizer a test pins (`tests/cuda/peer_qsa_span_test.cpp`) or labelled as an estimate
-awaiting the GPU window. No number here was measured on hardware.
+awaiting the GPU window — except a line that reads **MEASURED**, which is the maintainer's own window figure.
 
 ## 1. Corrections to the ledger I was handed
 
@@ -112,12 +112,14 @@ The tier figure, one honest number, int8 shipped boot (`--kv int8`, 262144 cells
     weights  0.08 GiB   resident projections, Q6_K rows - the pack's own figures, re-read in §2k
     gemm     0.09 GiB   the partner's own dequant scratch + cuBLAS workspace
     TOTAL    2.01 GiB   ~12.7% of the 15.8 GiB half-depth carve
-    =2 adds  0.08 GiB   a SECOND `o_proj` staging set (rows x n_embd x FP32, 83.9 MiB) - the pipelined gate's price
+    =2 adds  0.08 GiB   a SECOND `o_proj` staging set (rows x n_embd x FP32, 83.9 MiB) + a second shipped step-count
+                        set (128 KiB), both by `staging_sets` - the pipelined gate's price; the pair's agreement
+                        ring adds 8 floats a QSA layer a card, priced with the pair rather than in this walk
 
 1.77 GiB is the figure with the projections unpriced (the test's default, pack not consulted), so the boot prints
 the total: the projection term is the only one that depends on the quantization type (§2k). The second staging is
-pinned by allocation COUNT as well as bytes, because an arm allocating what the tier did not price is an allocation
-failure at the first gated prompt rather than a slower boot.
+pinned by allocation COUNT as well as bytes: an arm allocating what the tier did not price is an allocation failure
+at the first gated prompt, not a slower boot.
 
 **The return leg, both options priced** (8192-token chunk, the 3.96 GiB/s staggered face the run-25 numbers use):
 
@@ -157,7 +159,6 @@ Found before the compute existed, which is the only reason it was cheap.
 selection kernels were read and cleared as not applicable. The rule those sections established: a split is only real
 where writer and reader agree, so head-split audits cover writers.
 
-
 ## 2i. The o_proj funding gap, and the types the products need
 
 Two things the arm cannot run without, both found by trying to write it and both pre-existing holes in the
@@ -187,24 +188,37 @@ test the arithmetic, which is why it reports MiB.
 
 ## 3. Predictions, filed before measuring
 
-Graded against the task's dual rule on the same boot, vs EP+PP without the slice.
-
+Graded against the task's dual rule on the same boot, vs EP+PP without the slice. **§3a supersedes this section's
+mechanism; the filed figures stay as the record of what was filed, and when.**
 **Commit 1 — serialized (`=1`) — MEASURED, TP2PP2-NOTES run 25: 1,833 t/s against the 2,004 baseline, -8.5%**
-(≈ -15 ms a layer-pair, against the `-2/-4` filed here). The filed figure was optimistic in the way this file had
-already warned about: Ruling B left the lead's attention whole (no compute removed) and the return leg is FP32, so
-the mode paid full wire for nothing. The machinery it validated is the reason it was built.
+(≈ -15 ms a layer-pair, against the `-2/-4` filed here). Optimistic as this file had warned: Ruling B left the lead's
+attention whole and the return leg is FP32, so the mode paid full wire for nothing. **And it was not the mode it
+names**: `=1` waited on `ev_out[wire]` while the arm recorded `ev_out[0]`, so every odd QSA layer ran pipelined
+(fixed in `9512e0d2`); the -8.5% is a blend of the two gates and both modes need re-measuring.
 
 **Commit 2 — pipelined (`=2`), re-filed on run 25's own decomposition** (peer-wait 67.7-80.3 ms, lead attn +13-15
 ms over its ~26 ms, 6 QSA layers a stage): the lead's attention halves (the kernel's own microbench: 2.00x for one
 of two groups) and the peer-wait collapses toward the wire the publisher leaves on the lead's stream — ~47 ms a
 layer of FP32 wire, ~24 with a BF16 return. The inbound legs move under layer l's ~92.6 ms of MoE, which is where
-the hiding was always supposed to happen.
+the hiding was always supposed to happen. **This last clause is the one that was wrong** — see §3a.
 
     predicted net, stage A: +18 ms/layer-pair   (90% CI roughly [+6, +26])   no-extra-eviction case: an UPPER BOUND
     predicted net, stage B: +15 ms/layer-pair
 
 **Prediction: `=2` clears +10 ms but does not reach +20** — the residual is the peer's own attention kernel, which
 the ledger relocates rather than removes, plus the reduce the pipeline cannot hide at the last layer of a chunk.
+**Measured: it does not clear +10; it does not clear 0** - the STOP below was met, but as the structural one in §3a,
+not the eviction-shaped one this paragraph anticipated.
+
+**3a. MEASURED, and the mechanism was impossible** (maintainer's windows; `progress-tp2slice-verdict.md` owns the
+full account). `=1` ~1,833 t/s, `=2` ~1,826 t/s — the same to within the spread — and the `=2` per-layer peer-wait
+stayed at 52-66 ms. The reason the inbound leg never hides is that it is not inbound traffic waiting for a gap: the
+partner's attention of layer l+1 consumes `mixed_h(l+1)`, which the LEAD produces in its own MoE of layer l, so the
+publish of l+1 cannot be issued before that MoE completes — the bytes do not exist until the leg's own turn. The
+filed terms then land on the measurement: partner attention ~27 ms + reduce ~40 ms - the lead's halved attention
+~23 ms, over 6 QSA layers of a 24-layer stage ⇒ ~ **-8.7%**, the rendezvous price, not an unhidden corner. Nothing in
+this file's wire or tier arithmetic moves it; only removing the lead/partner asymmetry can (full TP=2 sharding,
+where the MoE halves too).
 
 The bound's condition is the tier, not the wire: the slice's ~2.09 GiB of partner residency (§2e, §2k) pushes
 experts out of its tier, streamed rows rise, and the partner's per-row rate — the quantity the gain is
