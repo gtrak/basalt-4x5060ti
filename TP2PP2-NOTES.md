@@ -1777,6 +1777,19 @@ Falsifiers, to be read off one boot each:
 5. Watch for the failure modes named above, and for the peer's issuer thread stalling (`wait_pissued` spinning:
    a layer whose `comp` rises while its `rows` falls is that signature).
 
+### Risks, since none of this ran on a pair
+
+- The larger share of the risk is change 2's host-relay branch (`P.x_out` -> `P.hx` -> `P.mixed` with `ev_hx` /
+  `ev_hx_free`), because run 18's boot line puts this pair on `/host`: that branch is the live path, and it is the
+  one whose issue order moved relative to the lead's `cudaStreamSynchronize`. The chain is acyclic by layer (each
+  layer's D2H waits only its own `ev_act` and the previous layer's `ev_hx_free`, and the lead's next `up_mix` waits
+  that layer's `ev_res`), but a mis-ordering would show as `act` growing without bound or a layer that never
+  finishes - either is a reason to revert `079c8c25` rather than to tune it.
+- Change 1's risk is pacing, not correctness: if the peer's issuer thread cannot keep the ring ahead of a
+  front-loaded band, `comp` grows where it used to be spread. Revert `2769e354`; do not re-band by hand.
+- Neither commit touches the pricing, the wire, the reserve or the flags, so the boot line should come out byte-for-
+  byte as run 18's. If it does not, something else moved and the measurement is not comparable.
+
 ### Not taken, for the maintainer to decide
 
 `act` is 21.3 ms to move 84 MiB of FP32 activations a layer, and the peer then quantizes them to FP4 - while the
