@@ -2137,10 +2137,11 @@ here. Consequences of the group rule, tested: an uneven-but-whole-group cut (24 
 the lead and 5 to the partner) is runnable and splits the KV bytes 3/5; a straddling cut (16/8 at 24 over 2) holds
 3 KV heads of pool for a 2-head cache, and the carve prices it (`session_head_shard_test`).
 
-The ratio reaches the engine at one place, the decode side: `Verifier::qhs_init` builds the lead's shard from
+The ratio reaches a SHARD at one place, the decode side: `Verifier::qhs_init` builds the lead's shard from
 `--exp qsa_ratio_stage_a` (the stage that holds layer 0) or `--exp qsa_ratio_stage_b`, default 0.5 - the symmetric
-half RUN 17 armed. A ratio that cuts a group is refused at boot, naming the granularity. The prefill side does NOT
-read the ratio, because it runs no split (below).
+half RUN 17 armed. A ratio that cuts a group is refused at boot, naming the granularity. Prefill reads the same
+flag but builds no shard with it - it runs no split - and carries it only into the boot line below, which is why
+that line says the heads are *priced*, not run.
 
 ### 2. share-v2: the band's share is struck on the two cards' LAYER TIMES
 
