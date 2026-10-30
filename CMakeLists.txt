@@ -766,7 +766,7 @@ basalt_gpu_test(NAME s_gemv_parity COMMAND s_gemv_parity --selftest)
 # the head split at kernel level: each card's shard of the QSA decode attention, bitwise
 add_executable(tp2_head_split_parity tests/kernels/tp2_head_split_parity.cpp)
 target_include_directories(tp2_head_split_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(tp2_head_split_parity PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(tp2_head_split_parity PRIVATE kernels prefill ${_gpu_runtime_target})
 basalt_gpu_test(NAME tp2_head_split_parity COMMAND tp2_head_split_parity)
 set_tests_properties(tp2_head_split_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 

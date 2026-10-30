@@ -553,18 +553,26 @@ __global__ void rope_kernel(float* __restrict__ x, int64_t heads, int64_t dim, i
     p[pair] = a * c - b * s;
     p[pair + 32] = a * s + b * c;
 }
-__global__ void split_q_kernel(const float* __restrict__ qf, float* __restrict__ q, int64_t T) {
+// The two elementwise QSA helpers around the prompt attention, over ONE card's query-head run.
+//
+// `qf` is [T, qf_heads, 512]: per head the query in [0,256) and its gate in [256,512).  `h0`/`nh` select a
+// contiguous run of query heads and `ld` is `qf`'s float stride per token, which is `qf_heads * 512` - NOT
+// `nh * 512` when the run is a slice of a wider matrix.  Those two are why this is a span rather than a second
+// kernel: the whole-layer case is exactly `h0 = 0, nh = 24, ld = 24 * 512`, so the lead's path and a card's
+// shard differ only in arguments and cannot drift apart.  The outputs are [T, nh, 256] contiguous.
+__global__ void split_q_kernel(const float* __restrict__ qf, float* __restrict__ q, int64_t T, int64_t nh,
+                               int64_t h0, int64_t ld) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= T * 24 * 256) return;
-    const int64_t t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
-    q[i] = qf[t * 24 * 512 + h * 512 + d];
+    if (i >= T * nh * 256) return;
+    const int64_t t = i / (nh * 256), h = (i / 256) % nh, d = i % 256;
+    q[i] = qf[t * ld + (h0 + h) * 512 + d];
 }
 __global__ void gate_attn_kernel(const float* __restrict__ a, const float* __restrict__ qf, uint16_t* __restrict__ o16,
-                                 int64_t T) {
+                                 int64_t T, int64_t nh, int64_t h0, int64_t ld) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= T * 24 * 256) return;
-    const int64_t t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
-    o16[i] = hf(a[i] * (1.0f / (1.0f + expf(-qf[t * 24 * 512 + h * 512 + 256 + d]))));
+    if (i >= T * nh * 256) return;
+    const int64_t t = i / (nh * 256), h = (i / 256) % nh, d = i % 256;
+    o16[i] = hf(a[i] * (1.0f / (1.0f + expf(-qf[t * ld + (h0 + h) * 512 + 256 + d]))));
 }
 
 // one block per (token, kv head, 64-value group); 64 threads. KV streaming: the pool page only if the block is
@@ -826,13 +834,28 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
             basalt::kernels::mrope_table(), rt);
     check("rope");
 }
+// The whole-layer entry points are the span with the whole run, so the prompt path's arithmetic is unchanged by
+// the pair's existence.  The head count and the stride come from `qsa_real_shapes()` - the one place the
+// artifact's QSA geometry is written down - rather than a literal repeated here, which is how the 24 stayed
+// invisible in these two kernels while everything around it took its counts as arguments.
 void split_q(const float* q_full, float* q, int64_t T, void* stream) {
-    split_q_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(q_full, q, T);
-    check("split_q");
+    const basalt::kernels::QsaShapes s = basalt::kernels::qsa_real_shapes();
+    split_q_span(q_full, q, T, 0, s.n_head, s.n_head * 2 * s.head_dim, stream);
 }
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream) {
-    gate_attn_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(attn, q_full, out16, T);
-    check("gate_attn");
+    const basalt::kernels::QsaShapes s = basalt::kernels::qsa_real_shapes();
+    gate_attn_span(attn, q_full, out16, T, 0, s.n_head, s.n_head * 2 * s.head_dim, stream);
+}
+void split_q_span(const float* qf, float* q, int64_t T, int64_t h0, int64_t nh, int64_t ld, void* stream) {
+    if (nh <= 0) return;
+    split_q_kernel<<<blocks_for(T * nh * 256), 256, 0, (cudaStream_t) stream>>>(qf, q, T, nh, h0, ld);
+    check("split_q_span");
+}
+void gate_attn_span(const float* attn, const float* qf, uint16_t* out16, int64_t T, int64_t h0, int64_t nh, int64_t ld,
+                    void* stream) {
+    if (nh <= 0) return;
+    gate_attn_kernel<<<blocks_for(T * nh * 256), 256, 0, (cudaStream_t) stream>>>(attn, qf, out16, T, nh, h0, ld);
+    check("gate_attn_span");
 }
 
 }  // namespace basalt::prefill

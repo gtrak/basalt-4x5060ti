@@ -16,6 +16,7 @@
 // the step are shared, because the indexer does not split (core/qsa_head_split.hpp).
 //   tp2_head_split_parity [max_cells]
 #include "basalt/core/qsa_head_split.hpp"
+#include "basalt/prefill/kernels.hpp"
 #include "basalt/core/tp2_shard_weights.hpp"
 #include "basalt/kernels/native_qsa.hpp"
 #include "basalt/kernels/qsa.hpp"
@@ -38,6 +39,7 @@
 #include <vector>
 
 namespace k = basalt::kernels;
+namespace pr = basalt::prefill;
 using basalt::core::QsaHeadShard;
 
 namespace {
@@ -737,6 +739,98 @@ int main(int argc, char** argv) {
         }
         cudaFree(pids_d); cudaFree(pstep_d); cudaFree(pqf_d); cudaFree(pq0_d); cudaFree(pq1_d);
         cudaFree(pattn_f); cudaFree(pattn0); cudaFree(pattn1);
+    }
+
+    // ---- 7. split_q and gate_attn, split vs whole: the two kernels the prompt-attention arm needed widened
+    //
+    // These two were the head split's blind spot: every other entry point here takes its counts as arguments,
+    // but these hardcoded 24 query heads and a 24-head q_full stride, so a card running 12 heads would have
+    // read heads 12..23 of the lead's rows and produced plausible tokens silently.  They are now one span
+    // kernel with the whole layer as its h0=0 case, so the pair's shard and the lead's layer share a body.
+    //
+    // BITWISE, not a tolerance: both sides run the same body over the same inputs, and neither forms a sum -
+    // split_q is a copy and gate_attn is one elementwise product per output.  Anything but identical bits means
+    // the span's indexing disagrees with the whole layer's, which is not a precision question but a wrong read.
+    // Random inputs, real geometry, and the shards the engine actually runs.
+    {
+        const int64_t T7 = 37;   // not a multiple of anything: a stride error shows up at the row edges
+        const int64_t nq7 = 2 * 256;   // q_full's per-head float stride (query | gate)
+        std::vector<float> qf((size_t) T7 * NH * nq7);
+        for (auto& x : qf) x = nd(rng);
+        std::vector<float> attn((size_t) T7 * NH * D);
+        for (auto& x : attn) x = nd(rng);
+        float* qf_d = dalloc<float>((size_t) T7 * NH * nq7);
+        float* at_d = dalloc<float>((size_t) T7 * NH * D);
+        up(qf_d, qf); up(at_d, attn);
+
+        float* qf_whole = dalloc<float>((size_t) T7 * NH * D);
+        uint16_t* g_whole = dalloc<uint16_t>((size_t) T7 * NH * D);
+        pr::split_q(qf_d, qf_whole, T7, nullptr);
+        pr::gate_attn(at_d, qf_d, g_whole, T7, nullptr);
+        const std::vector<float> qw = down(qf_whole, (size_t) T7 * NH * D);
+        const std::vector<uint16_t> gw = down(g_whole, (size_t) T7 * NH * D);
+
+        bool bitwise = true;
+        for (const QsaHeadShard* r : {&r0, &r1}) {
+            const int64_t nh = r->nq();
+            float* qs_d = dalloc<float>((size_t) T7 * nh * D);
+            uint16_t* gs_d = dalloc<uint16_t>((size_t) T7 * nh * D);
+            pr::split_q_span(qf_d, qs_d, T7, r->q0(), nh, NH * nq7, nullptr);
+            pr::gate_attn_span(at_d, qf_d, gs_d, T7, r->q0(), nh, NH * nq7, nullptr);
+            const std::vector<float> gq = down(qs_d, (size_t) T7 * nh * D);
+            const std::vector<uint16_t> gg = down(gs_d, (size_t) T7 * nh * D);
+            int reported = 0;
+            for (int64_t t = 0; t < T7; ++t)
+                for (int64_t h = 0; h < nh && reported < 3; ++h)
+                    for (int64_t d = 0; d < D && reported < 3; ++d) {
+                        const size_t w = (size_t) t * NH * D + (r->q0() + h) * D + d;
+                        const size_t g = (size_t) t * nh * D + h * D + d;
+                        if (gq[g] == qw[w] && gg[g] == gw[w]) continue;
+                        bitwise = false;
+                        std::printf("FAIL split span rank %d t %lld head %lld dim %lld: %.9g/%u vs %.9g/%u\n",
+                                r->rank, (long long) t, (long long) (r->q0() + h), (long long) d,
+                                (double) gq[g], (unsigned) gg[g], (double) qw[w], (unsigned) gw[w]);
+                        ++g_fail;
+                        ++reported;
+                    }
+            cudaFree(qs_d); cudaFree(gs_d);
+        }
+        std::printf("[split/gate span] T %lld x %lld heads over shards %lld/%lld: %s\n", (long long) T7,
+                (long long) NH, (long long) r0.nq(), (long long) r1.nq(),
+                bitwise ? "bitwise vs the whole run" : "NOT bitwise");
+
+        // microbench line (AGENTS.md: every new kernel gets one).  The span is the same work per element, so
+        // this exists to catch a shard costing more than the whole layer it replaces, not to claim a win.
+        {
+            const int reps = 50;
+            cudaEvent_t e0, e1;
+            cudaEventCreate(&e0); cudaEventCreate(&e1);
+            float* qs_d = dalloc<float>((size_t) T7 * r0.nq() * D);
+            uint16_t* gs_d = dalloc<uint16_t>((size_t) T7 * r0.nq() * D);
+            for (int i = 0; i < 5; ++i) {   // warm up: the first launch pays module load and clock ramp
+                pr::split_q(qf_d, qf_whole, T7, nullptr);
+                pr::gate_attn(at_d, qf_d, g_whole, T7, nullptr);
+                pr::split_q_span(qf_d, qs_d, T7, r0.q0(), r0.nq(), NH * nq7, nullptr);
+                pr::gate_attn_span(at_d, qf_d, gs_d, T7, r0.q0(), r0.nq(), NH * nq7, nullptr);
+            }
+            cudaEventRecord(e0);
+            for (int i = 0; i < reps; ++i) { pr::split_q(qf_d, qf_whole, T7, nullptr);
+                                             pr::gate_attn(at_d, qf_d, g_whole, T7, nullptr); }
+            cudaEventRecord(e1); cudaEventSynchronize(e1);
+            float whole_ms = 0; cudaEventElapsedTime(&whole_ms, e0, e1);
+            cudaEventRecord(e0);
+            for (int i = 0; i < reps; ++i) { pr::split_q_span(qf_d, qs_d, T7, r0.q0(), r0.nq(), NH * nq7, nullptr);
+                                             pr::gate_attn_span(at_d, qf_d, gs_d, T7, r0.q0(), r0.nq(), NH * nq7, nullptr); }
+            cudaEventRecord(e1); cudaEventSynchronize(e1);
+            float span_ms = 0; cudaEventElapsedTime(&span_ms, e0, e1);
+            std::printf("[split/gate span] microbench over %d reps: whole %.3f us a launch-pair, shard %.3f us "
+                        "(%.2fx, %lld of %lld heads)\n", reps, whole_ms * 1000 / reps, span_ms * 1000 / reps,
+                    whole_ms > 0 ? span_ms / whole_ms : 0.0, (long long) r0.nq(), (long long) NH);
+            CHECK(span_ms <= whole_ms * 1.25f);   // half the elements must not cost more than the whole
+            cudaEventDestroy(e0); cudaEventDestroy(e1);
+            cudaFree(qs_d); cudaFree(gs_d);
+        }
+        cudaFree(qf_d); cudaFree(at_d); cudaFree(qf_whole); cudaFree(g_whole);
     }
 
     std::printf("\ntp2 head split parity: %d failures\n", g_fail);

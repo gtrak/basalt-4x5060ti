@@ -93,10 +93,17 @@ void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, 
 /// scaling (rope_scaling.hpp) rides in as the process config - none is today's arithmetic exactly.
 void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
           const basalt::kernels::RopeScaling& scaling, void* stream);
-/// q_full [T, 24, 512] (q | gate per head) -> q [T, 24, 256]
+/// q_full [T, n_head, 512] (q | gate per head) -> q [T, n_head, 256], the whole layer's heads.
 void split_q(const float* q_full, float* q, int64_t T, void* stream);
-/// attn[t, h, d] *= sigmoid(q_full[t, h, 256 + d]) -> out16 (fp16 bits: the o-projection is quantized)
+/// attn[t, h, d] *= sigmoid(q_full[t, h, 256 + d]) -> out16 (fp16 bits: the o-projection is quantized), whole.
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream);
+/// The same two over ONE card's query-head run [h0, h0+nh) of `qf`, whose per-token float stride is `ld`
+/// (`heads_in_qf * 512`, not `nh * 512`, when the run is a slice of a wider matrix).  Outputs are
+/// [T, nh, 256] contiguous.  The whole-layer pair above is these with the whole run, so the pair's shard and the
+/// lead's layer share one kernel body and cannot drift (`qsa_head_split.hpp`; the pair's own arm calls these).
+void split_q_span(const float* qf, float* q, int64_t T, int64_t h0, int64_t nh, int64_t ld, void* stream);
+void gate_attn_span(const float* attn, const float* qf, uint16_t* out16, int64_t T, int64_t h0, int64_t nh,
+                    int64_t ld, void* stream);
 
 /// K and V of T consecutive cells (positions pos0..pos0+T-1; K normed and rotated) into the paged pools: FP16
 /// (`k_pool`/`v_pool`) or INT8 codes + FP16 scale per 64 (`k_q`...), the decode append's arithmetic.
