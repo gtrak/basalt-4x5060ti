@@ -21,6 +21,7 @@
 #include "basalt/kernels/qsa.hpp"
 #include "basalt/kernels/qsa_dec_attn.hpp"
 #include "basalt/kernels/qsa_decode_attn.hpp"
+#include "basalt/kernels/qsa_prompt_attn.hpp"
 #include "basalt/kernels/quantize_act.hpp"
 #include "basalt/kernels/s_gemv.hpp"
 #include "basalt/kernels/tp2_collective.hpp"
@@ -28,6 +29,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -648,6 +650,93 @@ int main(int argc, char** argv) {
         cudaFree(xk_f); cudaFree(xk_a); cudaFree(xk_b);
         cudaFree(y_f); cudaFree(y_a); cudaFree(y_b);
         cudaFree(cw);
+    }
+
+    // ---- 6. the PROMPT attention, split vs whole: the case the prompt-attention slice runs
+    //
+    // `qsa_prompt_attn_batch` is the tensor-core prompt kernel (qsa_prompt_attn.hpp), the one prefill calls once a
+    // QSA layer with the whole n_head.  The slice's claim is that a card running its own query-head run over its
+    // own KV-head slice reproduces THAT card's rows of the whole run, so the o_proj column split sums two partials
+    // that are already correct.  Several queries, because the kernel is a batch one block per (query, KV head) and
+    // a single query would leave its per-query indexing untested.
+    //
+    // TOLERANCE, and why it is not the bitwise compare the decode cases above use: the prompt kernel is FP32-level
+    // but NOT bitwise equal to the decode kernel it replaces (qsa_prompt_attn.hpp says so, and
+    // `qsa_prompt_attn_parity` bounds the difference).  Both sides of THIS compare run the same kernel, and a
+    // head's sum touches only its own KV head and its own head dimension, so the sums are expected to be identical
+    // and are reported as such; the accepted bound is the prompt kernel's own: relative 2e-3 of the row's largest
+    // magnitude, the same shape as the combine check below.  A bitwise run prints `bitwise`; a run inside the
+    // bound prints its worst deviation, so a regression towards the bound is visible and not silently allowed.
+    {
+        const int64_t n_q = 8;
+        std::vector<int32_t> p_ids((size_t) n_q * cap), p_steps((size_t) n_q * k::kStepCount);
+        for (int64_t i = 0; i < n_q; ++i) {
+            const int64_t nkv_i = std::max<int64_t>(1, n_kv - 1 - 16 * i);   // a different selection per query
+            k::qsa_step_fill(p_steps.data() + (size_t) i * k::kStepCount, nkv_i, full);
+            for (int64_t j = 0; j < cap; ++j) p_ids[(size_t) i * cap + j] = (int32_t) j;
+        }
+        std::vector<float> pqf((size_t) n_q * NH * D);
+        for (auto& x : pqf) x = nd(rng);
+
+        int32_t *pids_d = dalloc<int32_t>((size_t) n_q * cap), *pstep_d = dalloc<int32_t>((size_t) n_q * k::kStepCount);
+        float *pqf_d = dalloc<float>((size_t) n_q * NH * D);
+        float *pq0_d = dalloc<float>((size_t) n_q * s0.n_head * D), *pq1_d = dalloc<float>((size_t) n_q * s0.n_head * D);
+        float *pattn_f = dalloc<float>((size_t) n_q * NH * D);
+        float *pattn0 = dalloc<float>((size_t) n_q * s0.n_head * D), *pattn1 = dalloc<float>((size_t) n_q * s0.n_head * D);
+        up(pids_d, p_ids); up(pstep_d, p_steps); up(pqf_d, pqf);
+        {
+            std::vector<float> qa((size_t) n_q * s0.n_head * D), qb((size_t) n_q * s0.n_head * D);
+            for (int64_t i = 0; i < n_q; ++i)
+                for (int64_t h = 0; h < s0.n_head; ++h) {
+                    for (int64_t d = 0; d < D; ++d)   // rank 0 runs heads [0, nq), rank 1 the rest
+                        qa[(size_t) i * s0.n_head * D + h * D + d] = pqf[(size_t) i * NH * D + r0.q0() * D + h * D + d];
+                    for (int64_t d = 0; d < D; ++d)
+                        qb[(size_t) i * s0.n_head * D + h * D + d] = pqf[(size_t) i * NH * D + r1.q0() * D + h * D + d];
+                }
+            up(pq0_d, qa); up(pq1_d, qb);
+        }
+        const k::QsaAttnPools pools_full{kf_d, vf_d, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, table_d};
+        const k::QsaAttnPools pools0{k0_d, v0_d, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, table_d};
+        const k::QsaAttnPools pools1{k1_d, v1_d, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, table_d};
+        const bool took_f = k::qsa_prompt_attn_batch(pqf_d, pools_full, pids_d, pstep_d, cap, full, pattn_f, n_q, nullptr);
+        const bool took_0 = k::qsa_prompt_attn_batch(pq0_d, pools0, pids_d, pstep_d, cap, s0, pattn0, n_q, nullptr);
+        const bool took_1 = k::qsa_prompt_attn_batch(pq1_d, pools1, pids_d, pstep_d, cap, s1, pattn1, n_q, nullptr);
+        if (!took_f || !took_0 || !took_1) {
+            std::printf("[prompt attn] skipped: the tensor-core prompt kernel refused the geometry "
+                        "(whole %d, rank0 %d, rank1 %d)\n", (int) took_f, (int) took_0, (int) took_1);
+        } else {
+            const std::vector<float> wf = down(pattn_f, (size_t) n_q * NH * D);
+            double worst = 0.0;   bool bitwise = true;
+            for (const QsaHeadShard* r : {&r0, &r1}) {
+                const std::vector<float> got = down(r == &r0 ? pattn0 : pattn1, (size_t) n_q * s0.n_head * D);
+                for (int64_t i = 0; i < n_q; ++i) {
+                    double m = 0.0;
+                    for (int64_t h = 0; h < NH; ++h)
+                        for (int64_t d = 0; d < D; ++d)
+                            m = std::max(m, (double) std::fabs(wf[(size_t) i * NH * D + (r->q0() + h) * D + d]));
+                    CHECK(m > 1e-3);   // a row of nothing would make the comparison vacuous
+                    for (int64_t h = 0; h < r->nq(); ++h)
+                        for (int64_t d = 0; d < D; ++d) {
+                            const double a = got[(size_t) i * r->nq() * D + h * D + d];
+                            const double b = wf[(size_t) i * NH * D + (r->q0() + h) * D + d];
+                            const double dd = std::fabs(a - b);
+                            if (dd != 0.0) bitwise = false;
+                            if (dd > worst) worst = dd;
+                            if (dd <= 2e-3 * std::max(1.0, m)) continue;
+                            std::printf("FAIL prompt attn rank %d query %lld head %lld dim %lld: %.9g vs %.9g\n",
+                                    r->rank, (long long) i, (long long) (r->q0() + h), (long long) d, a, b);
+                            ++g_fail;
+                            h = r->nq();   // one report per query is enough to localise it
+                            break;
+                        }
+                }
+            }
+            std::printf("[prompt attn] %lld queries x %lld heads: %s, worst deviation %.3g\n", (long long) n_q,
+                    (long long) NH, bitwise ? "bitwise vs the whole run" : "inside the prompt kernel's 2e-3 relative bound",
+                    worst);
+        }
+        cudaFree(pids_d); cudaFree(pstep_d); cudaFree(pqf_d); cudaFree(pq0_d); cudaFree(pq1_d);
+        cudaFree(pattn_f); cudaFree(pattn0); cudaFree(pattn1);
     }
 
     std::printf("\ntp2 head split parity: %d failures\n", g_fail);
