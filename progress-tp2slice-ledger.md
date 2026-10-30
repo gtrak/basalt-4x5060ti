@@ -199,6 +199,37 @@ each: `native_qsa_indexer_append_batch`, `qsa_block_scores_tc`, `qsa_block_topk`
 The last two take their counts as arguments, so the arm must pass **its own head count and its own `Qf` stride**
 rather than the lead's `24`/`6144` — the same class, in the caller this time.
 
+## 2h. The audit's other three: the selection kernels need no parameterization
+
+The rule says audits cover writers, so the three the arm still passes through were read line by line rather than
+assumed safe. **Result: none of them hardcodes anything on the split axis, and none needs a head-count argument.**
+
+| kernel | what it reads of `QsaShapes` | on a geometry mismatch |
+|---|---|---|
+| `native_qsa_indexer_append_batch` | `idx_dim`, `idx_block`, `n_rot` | **throws** `std::invalid_argument` |
+| `qsa_block_scores_tc` | `idx_dim`, `idx_n_head`, `idx_block` | **returns false**; caller keeps the warp kernel |
+| `qsa_block_topk` | `idx_block`, and `cap` vs `qsa_selection_width` | **exits** with the geometry named |
+
+None names `n_head`, `n_head_kv` or `head_dim` — not in the wrapper and not in any kernel it launches
+(`block_scores_tc`, `block_scores_tail`, `block_topk_reg`, `block_topk_wide`, `block_topk_cluster`, the ref and seg
+variants). The reason is structural, not lucky: **the indexer does not split**, because two of four indexer heads
+would pick a different top-k, so both cards compute the same selection redundantly and every one of these shapes
+stays whole on the partner. `qsa_shard_shapes` narrows `n_head`/`n_head_kv` and nothing else.
+
+So the arm passes `core::qsa_shard_shapes(g, heads)` to all three unchanged, and the failure mode if that claim
+were ever broken is loud in each case — a throw, a refusal that falls back, or an exit naming the geometry. That
+is the property the other three kernels lacked: `kv_append` and friends were silently wrong where these are loud.
+
+The claim these three's safety rests on — the shard shapes keep the indexer whole — is pinned by
+`the_indexer_stays_whole()` in `tests/core/qsa_head_split_test.cpp`, which now also pins `head_dim` and `n_rot`
+staying whole, because the arm hands both straight to `rope` and `rms_rows` where a narrowed value is a wrong
+rotation rather than a crash.
+
+**Audit closed.** Hardcoded-head sites found and fixed: `split_q_kernel`, `gate_attn_kernel`, `kv_append_kernel`.
+Found and cleared as not-applicable: the three above. The remaining exposure is not hidden constants but the
+caller's own arguments: `rope` and `rms_rows` take head count and strides as parameters, so the arm must pass its
+**own** `nq`/`nkv` and its own `Qf` stride (`nq * 2 * head_dim`), never the lead's `24` and `6144`.
+
 ## 3. Predictions, filed before measuring
 
 Graded against the task's dual rule on the same boot, vs EP+PP without the slice.

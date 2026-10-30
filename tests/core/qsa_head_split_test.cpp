@@ -82,6 +82,9 @@ void the_indexer_stays_whole() {
         CHECK(x.idx_dim == s.idx_dim);
         CHECK(x.idx_block == s.idx_block);
         CHECK(x.idx_top_k == s.idx_top_k);
+        // head_dim and n_rot are per-head, not per-card, so nothing should narrow them - but the partner's arm
+        // hands both straight to rope and rms_rows, where a narrowed value is a wrong rotation, not a crash
+        CHECK(x.head_dim == s.head_dim && x.n_rot == s.n_rot);
         CHECK(x.n_head == 12 && x.n_head_kv == 1);
     }
     // an unusable shard leaves the shapes alone rather than narrowing them
