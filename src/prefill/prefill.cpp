@@ -2814,7 +2814,14 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
                       const Prefill::PeerQsaSpan* qsa = nullptr) {
     auto pp = std::make_unique<PeerPrefill>();
     pp->peer = peer;
-    if (qsa != nullptr) pp->qsa.span = *qsa;   // the prompt-attention arm, if the gate asked for one
+    if (qsa != nullptr) {
+        pp->qsa.span = *qsa;   // the prompt-attention arm, if the gate asked for one
+        // ONE decision, read two ways: the same `staging_sets` that funded the `o_proj` staging sets selects the
+        // free-ness protocol that makes running with two of them safe. Set here, where the span lands on the arm,
+        // so the arm cannot run the serialized waits against a tier that paid for two sets - or, the other way,
+        // push a second partial into a set nobody funded.
+        pp->qsa.pipeline = qsa->staging_sets >= 2 ? 2 : 1;
+    }
     pp->T_max = std::min<int64_t>(T_max, stream_all_min() - 1);
     pp->T_fp4 = tf;
     // Only the FP4 leg's rows go back as BF16 bits and only its activations go out as planes: the routed leg's
