@@ -1,5 +1,36 @@
 # Continuation — the tp2 campaign on 4x RTX 5060 Ti
 
+## 0. PROCESS RULES (owner-mandated 2026-10-30; these supersede anything below and must survive compaction)
+
+1. **SLOTS**: 1 desktop worker (a different box, fully isolated) + 2 local workers. The LOCAL
+   box hosts the RUNNING basalt instance whose code the workers are changing.
+2. **LOCAL WORKERS ARE CPU-ONLY BY DEFAULT**: builds, CPU tests, code, docs — freely, in
+   parallel. Anything that could conflict with the running basalt — GPU tests, timing
+   measurements, boots, memory pressure — YIELDS TO THE SUPERVISOR, who sequences it in a
+   window against the server's known traffic state. A worker may never assume the server is
+   idle; only the supervisor knows (the ring-probe alongside-run was luck, not precedent).
+3. **SERVER-DOWN PROTOCOL**: merge everything pending on the feature branch FIRST, then take
+   the server down, run the full battery (build, CPU, GPU, boot, bench), then BRING THE SERVER
+   BACK UP before any next dispatch. Batch tests; no piecemeal boots per merge.
+4. **ALL WORKERS DONE BEFORE THE SERVER GOES DOWN.** No window while any worker is in flight,
+   regardless of what has merged. (Violated once; the worker's ctest aborted mid-suite.)
+5. **LONG WORKER TIMEOUTS**: pass explicit timeoutMs (3h) on dispatches and resumes. The 30-min
+   default fragmented a whole night into ~12 resume cycles.
+6. **DELEGATION LOSES LONG BRIEFS**: dispatches routinely arrive with an empty Task field.
+   Expect the empty-task supervisor request; answer it AND steer the full brief (both channels).
+   Never let a worker pick its own task from the production tree's docs.
+7. **PER-LAYER METRICS ARE MANDATORY AT EVERY GRADING**: never grade from done-line t/s alone —
+   read the per-layer/per-stage breakdowns (peer chunk, decode profile, layer time) term by
+   term. The done-line hid RUN 25's entire decomposition (attn +13-15, peer-wait +50-60).
+8. **OVERNIGHT AUTHORITY**: when the owner grants an overnight window ("do what you can until
+   X"), do not stop prematurely; keep working, keep workers fed, keep the server serving.
+9. **WORKER HYGIENE (enforced)**: commit coherent units before any wall clock; progress files
+   are the handoff (context death at 262k is routine); predictions filed before measuring;
+   honest numbers, never tuned to pass; refusals name their cause; CPU gates with the TEST
+   COUNT verified (BUILD_TESTING-off makes ctest pass vacuously).
+10. **FORK PUSHES AS CHECKPOINTS** after every accepted unit; the branch of record is tp2pp2.
+
+
 State as of `293ca647` (2026-10-30 ~01:30 UTC). Written as compaction insurance: a future
 session should be able to resume from this file plus TP2PP2-NOTES.md without archaeology.
 Facts, measured numbers, decisions, and the gated roadmap. Interpretations are labeled.
