@@ -1671,9 +1671,10 @@ BF16 + per-stage re-pricing (`89190c7e` + `0a941f88`), merged with the decode he
 
 ## RUN 19 — the peer's window, phase-separated: RAM band first, activations when they are written (unmeasured)
 
-Targets run 18's remaining wall, the per-layer peer straggler (18.0 ms stage A, 40.1 ms stage B). Two commits,
-each one lever, each revertable on its own. Nothing here was measured: this worktree has no pair, so every number
-below is a prediction for the reviewer to confirm or kill.
+Targets run 18's remaining wall, the per-layer peer straggler (18.0 ms stage A, 40.1 ms stage B). Two levers, each
+revertable on its own - `2769e354` with its correction `f642f30e`, and `079c8c25` with its guard `6dd3f23e`. Nothing
+here was measured: this worktree has no pair, so every number below is a prediction for the reviewer to confirm or
+kill.
 
 ### What the code actually did (read before changing it)
 
@@ -1692,7 +1693,7 @@ below is a prediction for the reviewer to confirm or kill.
   expert, the `cudaStreamSynchronize` that reads the routing back, the counts/offsets/slot/src loops and the lead's
   own activation quantize. The acts themselves are produced earlier, by `up_mix` at the top of the FFN half.
 
-### Change 1 (`2769e354`) - the peer runs its RAM band first, its tier-resident experts after
+### Change 1 (`2769e354`, corrected by `f642f30e`) - the peer runs its RAM band first, its tier-resident experts after
 
 `order_peer` is put RAM-band-first (`peer_reads_it_from_ram`, one predicate now shared by the split, the order and
 the ring walk) and the peer's rows in `Dm` are laid out in that order, so each group's rows stay contiguous. The
@@ -1707,13 +1708,20 @@ lead's own `order` is untouched. Invariants that had to survive:
   layer's blobs during this layer's tier-resident phase.
 - with the band off (`--peer-ram-rows`, or a placement with no band) every peer expert is tier-resident, the sort is
   a no-op, and the order is the id order it has always been.
+- **how the order was checked** (no pair needed): a throwaway harness replayed the plan - `order_peer`'s
+  construction, the sort, the `m.off` assignment - over randomised placements (512 experts, ~50 % peer-held, band
+  one in 8, a few experts on the CPU, a quarter of the trials with the band off) and asserted the invariants above:
+  both halves ascending, no band expert behind a tier-resident one, the peer's `Dm` block contiguous in walk order,
+  the CPU block starting where the peer's ends, every row written exactly once, the lead's block still id-ordered,
+  plain id order with the band off. It caught the comparator being written the wrong way round in `2769e354`
+  (fixed in `f642f30e`), and fails when `m.off` is assigned in id order while the walk is banded.
 - **bitwise neutral**: which experts share a `fp4::run_experts` run changes `max_rows`, the grid shape and the tile
   padding, but a row's codes and its down-product chain over K are its own (`quantize_kernel` is one warp per row;
   `plan_kernel` only moves where a row is stored, and the down product reads it back through the same `tile_off`),
   and the combine still sums a token's rows in `k` order. Same bits; only the physical row order inside the peer's
   block of `Dm` changes, and every reader derives it from `m.off`.
 
-### Change 2 (`079c8c25`) - the activations cross when they are written, not after the split
+### Change 2 (`079c8c25`, guarded by `6dd3f23e`) - the activations cross when they are written, not after the split
 
 New event `PeerPrefill::ev_act`, recorded on the lead's stream immediately after `up_mix` writes the FFN half's
 mixed rows; the peer's act copy (both the P2P and the host-relay form) and the peer's `fp4::quantize_tokens` of them
@@ -1734,6 +1742,10 @@ are still ordered after the copy.
 - `peer_holds` (per layer: the peer holds one of its experts, or the band leaves one to it) gates the copy, so a
   layer the peer computes nothing of ships no activations - the copy is never issued for a layer that will not
   consume it, except the vanishing case where the routing gives every peer-held expert of a layer zero rows.
+  The gate has to agree with the split's decision of who computes an expert, because the peer's products read the
+  plane the copy writes: both follow `peer->has()` and `ram_take`, the only two ways an expert reaches the peer, and
+  each is set where `peer_holds` is set (`6dd3f23e` turns a disagreement into an error rather than into products of
+  whatever an earlier layer left in `P.mixed`).
 - The routed (sub-streaming-floor) MMQ peer leg is untouched: it keeps its own `ev_in` copy at its own site, and the
   RAM band never rides it. The FP4 leg's fields keep their meaning, with one shift worth knowing when reading the
   chunk line: the `P.src`/`P.f_rel` uploads used to sit inside `quant` and now sit inside `comp`.
@@ -1755,17 +1767,17 @@ Baseline: run 18, BF16 return, per-stage pricing, chunk 8192; stage A `act 21.3 
 Falsifiers, to be read off one boot each:
 
 - change 1 hurts if `peer-wait` **rises** at either stage (the ring cannot keep ahead of a front-loaded band), or
-  if `comp` rises at stage B while `rows` is flat. Revert `2769e354`.
+  if `comp` rises at stage B while `rows` is flat. Revert `2769e354` together with `f642f30e`.
 - change 2 hurts if `act` roughly doubles (the copy then fights the previous layer's row return for the link and the
   queue got deeper for nothing) or if `peer-wait` does not move at all (the host's split was not on the peer's
-  critical path). Revert `079c8c25`.
+  critical path). Revert `079c8c25` together with `6dd3f23e`.
 - both together help if `peer-wait` at stage A lands under ~12 and at stage B under ~30 with `rows` no worse than 56.
 
 ### Reviewer checklist
 
 1. Fresh boot, run 18's geometry (same packs, tiers pinned, `--peer-ram-rows` on, BF16 wire, chunk 8192; both
    stages). Quote the chunk line's `act`/`quant`/`comp`/`rows` and `peer-wait` per stage, plus t/s, and the boot
-   line's band clause (share unchanged - neither commit touches the pricing).
+   line's band clause (share unchanged - none of these commits touches the pricing).
 2. Engagement: `exp_peer` and `exp_peer_ram` non-zero in the chunk summary (if `exp_peer_ram` is 0 the band is off
    and change 1 is a no-op - say so rather than reporting it as neutral).
 3. Numerics: this is a bitwise-neutral reordering, so the gate is the **greedy-identity check**, not a PPL/KLD run -
@@ -1776,6 +1788,9 @@ Falsifiers, to be read off one boot each:
    value-neutral); peer absent = no change at all.
 5. Watch for the failure modes named above, and for the peer's issuer thread stalling (`wait_pissued` spinning:
    a layer whose `comp` rises while its `rows` falls is that signature).
+6. If a run stops with `prefill: the peer was given a layer whose activations were not sent`, change 2's
+   `peer_holds` gate disagreed with the row split. That is the guard doing its job - report it and revert
+   `079c8c25` with `6dd3f23e`, rather than working around it by sending the activations unconditionally.
 
 ### Risks, since none of this ran on a pair
 
@@ -1784,11 +1799,11 @@ Falsifiers, to be read off one boot each:
   one whose issue order moved relative to the lead's `cudaStreamSynchronize`. The chain is acyclic by layer (each
   layer's D2H waits only its own `ev_act` and the previous layer's `ev_hx_free`, and the lead's next `up_mix` waits
   that layer's `ev_res`), but a mis-ordering would show as `act` growing without bound or a layer that never
-  finishes - either is a reason to revert `079c8c25` rather than to tune it.
+  finishes - either is a reason to revert `079c8c25` and its guard rather than to tune it.
 - Change 1's risk is pacing, not correctness: if the peer's issuer thread cannot keep the ring ahead of a
-  front-loaded band, `comp` grows where it used to be spread. Revert `2769e354`; do not re-band by hand.
-- Neither commit touches the pricing, the wire, the reserve or the flags, so the boot line should come out byte-for-
-  byte as run 18's. If it does not, something else moved and the measurement is not comparable.
+  front-loaded band, `comp` grows where it used to be spread. Revert `2769e354` together with `f642f30e`; do not re-band by hand.
+- None of the four commits touches the pricing, the wire, the reserve or the flags, so the boot line should come out
+  byte-for-byte as run 18's. If it does not, something else moved and the measurement is not comparable.
 
 ### Not taken, for the maintainer to decide
 
