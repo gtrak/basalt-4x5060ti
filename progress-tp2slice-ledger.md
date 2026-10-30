@@ -151,6 +151,29 @@ rotated — the exact bits it fed its own block scores — so the selection is t
 by two cards repeating a computation and hoping. The indexer **k** norm stays resident, because the partner's
 append normalizes each cell's raw key by it into a pooled table of its own.
 
+## 2f. A funding bug the single walk did not prevent, and what now prevents it
+
+Writing the compute surfaced it: the walk **counted** `nl` copies of every resident projection but **allocated**
+one pointer per tensor (`qs.wq = take(...)` with a single member, while `tmp.weights` summed over `nl` layers).
+The tier would have been shrunk by the full amount — so the published 1.89 GiB was right — while the arm would
+have run all six QSA layers against **layer 0's** `attn_q`, `attn_k`, `attn_v` and norms. Plausible tokens, no
+error, no failed allocation: precisely the failure class this branch exists to catch, sitting in code whose
+stated purpose was to make drift impossible.
+
+Why the single walk did not catch it: sharing a walk makes the *sizing* and the *allocation* agree only if the
+allocation and the counted figure are the **same expression**. They were not — the counting loop was written
+separately, right next to the takes, and drifted.
+
+What now prevents it, in order of strength:
+1. **Counting happens inside the `take`** (`wt()` / `one_scratch()` accumulate as they allocate), so a figure
+   cannot exist without its allocation. The weight pointers are `std::vector`s sized by the walk itself.
+2. **The walk reports how many allocations it made** (`PeerQsaParts::takes`, read by `last_takes()`), and
+   `peer_qsa_span_test` pins it to the structural count — 6 states + 4 per wire set + 10 scratch + 7 per layer +
+   2 for the partner's Gemm = **68**. The buggy version made 33, so the byte figure staying correct while the
+   count halves is exactly what the assertion catches. Bytes alone never would have.
+
+Found before the compute existed, which is the only reason it was cheap.
+
 ## 3. Predictions, filed before measuring
 
 Graded against the task's dual rule on the same boot, vs EP+PP without the slice.

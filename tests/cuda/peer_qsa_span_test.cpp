@@ -192,6 +192,14 @@ void test_resident_projections_are_priced() {
     const uint64_t per_layer = (6144ull * qrow) + 2ull * (256ull * kvrow)
                              + 2ull * 256ull * 4ull + 2ull * 128ull * 4ull;
     CHECK(part(s, 3) == 6ull * per_layer);
+    // the allocation COUNT, not just the bytes: span 6 + wire 4x2 + scratch 8 + weights 7x6 + gemm 2.  A tensor
+    // taken once instead of once a layer keeps the byte figure correct and this number wrong.
+    s.bytes(T, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    // one QSA state a layer, four wire buffers a set, ten scratch buffers, seven tensors a layer, two for the
+    // partner's own Gemm
+    const int expect_takes = 6 /*states*/ + 4 * Prefill::PeerQsaSpan::kWireSets + 10 /*scratch*/ + 7 * 6 + 2;
+    std::printf("the walk made %d allocations, as counted\n", s.last_takes());
+    CHECK(s.last_takes() == expect_takes);
     std::printf("resident projections: %.3f GiB over 6 QSA layers (attn_q rows 6144, attn_k/v rows 256)\n",
                 (double) part(s, 3) / GiB);
     // half the heads is half the attn_q residency, but the norms are not halved away

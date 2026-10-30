@@ -773,9 +773,12 @@ struct PeerPrefill {
 
         // The projections this card owns: its shard's rows of attn_q, its KV head's rows of attn_k/attn_v, and
         // the two RMS norms those projections are normalized by.  Boot-time copies, no per-layer traffic.
-        void *wq = nullptr, *wk = nullptr, *wv = nullptr;
-        float *wqn = nullptr, *wkn = nullptr;
-        float *wiqn = nullptr, *wikn = nullptr;   // the indexer's q/k norms (the k norm the append normalizes by)
+        // ONE of each PER QSA LAYER of the stage: every layer has its own attn_q, attn_k, attn_v and norms, so
+        // a single set would have all six layers reading layer 0's weights - plausible tokens, no error.  The
+        // vectors are sized by the walk that also counts them, so the count and the allocation are one
+        // expression and cannot drift.
+        std::vector<void*> wq, wk, wv;
+        std::vector<float*> wqn, wkn, wiqn, wikn;
 
         Gemm gemm;                    // this card's own (see the header note)
         uint16_t* gscratch = nullptr;
@@ -1938,6 +1941,10 @@ static void peer_layout(PeerPrefill& pp, int64_t Tp, int64_t tf, const MmqPlan& 
 /// cannot pass sizing and then fail here.  `parts`, when given, gets the per-group figures for the boot line.
 struct PeerQsaParts {
     uint64_t span = 0, wire = 0, scratch = 0, weights = 0, gemm = 0;
+    /// How many separate allocations the walk made.  The test pins it to the expected count, because the bytes
+    /// alone do not catch a tensor taken once where it should be taken once a QSA layer: the first version of
+    /// this priced six copies and allocated one, and the figure looked right.
+    int takes = 0;
 };
 
 template <typename Take>
@@ -2017,25 +2024,31 @@ void peer_qsa_layout(PeerPrefill::Qsa& qs, int64_t T, Take&& take, PeerQsaParts*
     if (sp.q_row_bytes > 0 && sp.kv_row_bytes > 0) {
         const core::QsaHeadRun qr = core::qsa_q_rows(sp.heads, sh.head_dim);
         const core::QsaHeadRun kr = core::qsa_kv_rows(sp.heads, sh.head_dim);
-        qs.wq = take((size_t) qr.len * sp.q_row_bytes);
-        qs.wk = take((size_t) kr.len * sp.kv_row_bytes);
-        qs.wv = take((size_t) kr.len * sp.kv_row_bytes);
-        qs.wqn = (float*) take((size_t) sh.head_dim * 4);
-        qs.wkn = (float*) take((size_t) sh.head_dim * 4);
-        // The indexer's k norm is not the attention's: `native_qsa_indexer_append_batch` normalizes each cell's
-        // raw key by it before pooling, and the partner appends into a pooled table of its own, so it needs the
-        // tensor.  The q norm is NOT taken: the lead ships q_idx already normalized and rotated, the exact bits
-        // it fed its own block scores, which keeps the selection the lead's by construction rather than by
-        // two cards repeating a computation and hoping.  Priced anyway so the row that holds it is allocated
-        // either way and the figure does not move if that choice is revisited.
-        qs.wiqn = (float*) take((size_t) sh.idx_dim * 4);
-        qs.wikn = (float*) take((size_t) sh.idx_dim * 4);
+        qs.wq.assign((size_t) nl, nullptr); qs.wk.assign((size_t) nl, nullptr);
+        qs.wv.assign((size_t) nl, nullptr);
+        qs.wqn.assign((size_t) nl, nullptr); qs.wkn.assign((size_t) nl, nullptr);
+        qs.wiqn.assign((size_t) nl, nullptr); qs.wikn.assign((size_t) nl, nullptr);
+        // Every figure below is accumulated by the `take` that makes the allocation, never by a separate loop
+        // over the sizes: the first version of this counted `nl` copies while taking ONE pointer per tensor,
+        // which the tier would have funded and the arm would have silently shared layer 0's weights across all
+        // six layers.  Counting inside the take makes that class of mistake unrepresentable rather than tested.
         uint64_t w = 0;
-        for (int64_t i = 0; i < nl; ++i)
-            for (uint64_t x : {(uint64_t) qr.len * sp.q_row_bytes, (uint64_t) kr.len * sp.kv_row_bytes,
-                               (uint64_t) kr.len * sp.kv_row_bytes, (uint64_t) sh.head_dim * 4,
-                               (uint64_t) sh.head_dim * 4, (uint64_t) sh.idx_dim * 4, (uint64_t) sh.idx_dim * 4})
-                w += (x + 255) & ~uint64_t(255);
+        auto wt = [&](size_t bytes) -> void* { w += (bytes + 255) & ~size_t(255); return take(bytes); };
+        for (int64_t i = 0; i < nl; ++i) {
+            qs.wq[(size_t) i] = wt((size_t) qr.len * sp.q_row_bytes);
+            qs.wk[(size_t) i] = wt((size_t) kr.len * sp.kv_row_bytes);
+            qs.wv[(size_t) i] = wt((size_t) kr.len * sp.kv_row_bytes);
+            qs.wqn[(size_t) i] = (float*) wt((size_t) sh.head_dim * 4);
+            qs.wkn[(size_t) i] = (float*) wt((size_t) sh.head_dim * 4);
+            // The indexer's k norm is not the attention's: `native_qsa_indexer_append_batch` normalizes each
+            // cell's raw key by it before pooling, and the partner appends into a pooled table of its own.  The
+            // q norm is NOT read: the lead ships q_idx already normalized and rotated, the exact bits it fed its
+            // own block scores, which keeps the selection the lead's by construction rather than by two cards
+            // repeating a computation and hoping.  Allocated anyway, so the figure does not move if that choice
+            // is revisited.
+            qs.wiqn[(size_t) i] = (float*) wt((size_t) sh.idx_dim * 4);
+            qs.wikn[(size_t) i] = (float*) wt((size_t) sh.idx_dim * 4);
+        }
         tmp.weights = w;
     }
 
@@ -2258,14 +2271,17 @@ void Prefill::PeerQsaSpan::bytes(int64_t T, uint64_t* span, uint64_t* wire, uint
     PeerPrefill pp;
     pp.qsa.span = *this;
     PeerQsaParts p;
-    auto count = [&](size_t bytes) -> void* { return nullptr; };
+    int takes = 0;
+    auto count = [&](size_t) -> void* { ++takes; return nullptr; };
     peer_qsa_layout(pp.qsa, T, count, on ? &p : nullptr);
+    p.takes = takes;
     if (span) *span = p.span;
     if (wire) *wire = p.wire;
     if (scratch) *scratch = p.scratch;
     if (weights) *weights = p.weights;
     if (gemm) *gemm = p.gemm;
     if (total) *total = p.span + p.wire + p.scratch + p.weights + p.gemm;
+    m_takes_ = p.takes;   // diagnostics; independent of which out-params the caller asked for
 }
 
 

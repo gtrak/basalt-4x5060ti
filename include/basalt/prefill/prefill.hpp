@@ -163,6 +163,10 @@ public:
         /// geometry only, and the block geometry is the pack's, so the figures come from the caller: zero means the
         /// pack was never consulted, and `bytes` prices NO weights rather than inventing a quantization table.
         int64_t q_row_bytes = 0, kv_row_bytes = 0;
+        /// How many allocations the last `bytes()` call walked.  Diagnostics for the sizing test, which pins it:
+        /// the byte figures alone do not catch a tensor taken once where it should be taken once a QSA layer.
+        mutable int m_takes_ = 0;
+        int last_takes() const { return m_takes_; }
         /// QSA layers of this stage: `qsa_interval` over [lb, le).
         int64_t n_qsa_layers() const;
         /// How many resident sets of the wire's staging.  Two: the pipelined gate puts layer l+1's inbound on the
