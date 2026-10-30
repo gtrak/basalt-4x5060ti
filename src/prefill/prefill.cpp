@@ -2275,13 +2275,19 @@ bool peer_qsa_layer(PeerPrefill::Qsa& qs, int64_t li, int64_t wire, int64_t T, i
 /// follows its own decode on the same session only when nothing invalidated it - and the cheap case worth
 /// making cheap, because the alternative is moving the context every prompt.
 ///
-/// A decode window needs NO invalidation, and that is deliberate rather than an omission: decode only ever
+/// A decode window needs NO invalidation, and that is a ruled invariant rather than an omission: decode only ever
 /// APPENDS cells at positions past everything a prompt attended over, so cells [0, span_valid) are still the
 /// lead's afterwards and the proof still holds.  The gap this function imports then covers exactly what decode
 /// added.  Dropping the span at the end of a window instead would be safe but would re-import the whole context
 /// on every prompt after a decode - which, in a server, is nearly every prompt - to protect a claim that was
-/// never broken.  What DOES break it is a state arriving from elsewhere (a session swap, a prefix copy, a
-/// restored snapshot), and those are the sites that call `invalidate_peer_qsa_span`.
+/// never broken.
+///
+/// THE INVARIANT: cells below `span_valid` are never rewritten or dropped.  Anything that breaks it must call
+/// `invalidate_peer_qsa_span` at the site that does the rewriting.  Named so the guard is not rediscovered the
+/// hard way: KV compaction (repacks rows), context shift (relabels which cell holds which token, leaving the
+/// partner holding a plausible wrong something), and sliding-window or attention-sink eviction (the partner keeps
+/// cells the lead no longer has - the mirror image of the stale span this protocol exists to prevent).  Today
+/// nothing rewrites below the span; only state arriving from elsewhere does, which is what the copy sites catch.
 bool peer_qsa_span_catch_up(PeerPrefill& P, int64_t p0, std::string& err) {
     PeerPrefill::Qsa& qs = P.qsa;
     if (!qs.live || !qs.span.on) return true;

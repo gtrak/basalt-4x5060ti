@@ -163,12 +163,27 @@ session; the state copied *back*. **The parked-conversation restore** is the one
 `conversation_snapshot_restore` writes K/V directly into a session and goes through neither copy, so the copy
 sites above cannot see it.
 
-**Site that deliberately does not: the end of a decode window.** Decode only ever *appends* cells past everything
-a prompt attended over, so `[0, span_valid)` still holds the lead's bits afterwards and the proof survives; the
-catch-up then imports exactly what decode added. Dropping the span at every window's end would be *safe*, and
-would re-import the whole context on nearly every prompt a server reads, to defend a claim that was never broken.
-If a future change lets decode overwrite rather than append — a rollback in place, a ring that reuses cells — this
-reasoning stops holding and that site becomes necessary.
+**Site that deliberately does not: the end of a decode window.** Ruled, not tolerated. Decode only ever *appends*
+cells past everything a prompt attended over, so `[0, span_valid)` still holds the lead's bits afterwards and the
+proof survives; the catch-up then imports exactly what decode added. Dropping the span at every window's end would
+be *safe*, and would re-import the whole context on nearly every prompt a server reads, to defend a claim that was
+never broken.
+
+**The invariant this rests on: cells below `span_valid` are never rewritten or dropped.** Decode append satisfies it
+because decode only ever writes at positions past everything a prompt attended over. It is the guard, not a
+footnote — any feature that rewrites, shifts or evicts below `span_valid` must invalidate there, and the obvious
+candidates are named so nobody has to rediscover the list:
+
+- **KV compaction** — repacking or moving cells to reclaim pages rewrites rows by definition;
+- **context shift** — prefix removal, prompt trimming or a position re-anchor relabels which cell holds which token,
+  so the partner's rows still contain *something* and it is the wrong something;
+- **sliding-window / attention-sink eviction** — dropping old cells leaves the partner holding cells the lead no
+  longer has, which is the mirror image of the stale-span case this whole protocol exists to prevent.
+
+Each of those would need its own `invalidate_peer_qsa_span("<feature>")` at the site that does the rewriting, not
+a new rule here: the protocol is already "anything that can change the lead's cells without the partner appending
+them drops the proof". What would change is that such a feature *can* now occur, where today only state arriving
+from elsewhere can.
 
 **The catch-up runs once a turn**, before the first chunk, not once a layer: the gap is a property of the
 sequence, and pricing it per layer would charge for the same bytes six times.

@@ -12,6 +12,15 @@
   funded only if the slice clears its ship bar, and dies with the slice if it does not.
 - **Erratum to the delegating brief: the 0.6 GB / 3-QSA-layer figure was wrong; the 6-layer
   1.5 GiB fp16 / 1.2 GiB int8 figure above supersedes it.**
+- **Decode-window end does NOT invalidate the span — ruled, with the invariant it rests on.** Decode appends
+  monotonically past everything a prompt attended over, so `[0, span_valid)` provably still holds the lead's bits
+  and the catch-up imports exactly the appended cells; invalidating at every window's end would re-import the
+  whole context on nearly every server prompt to defend a claim that was never broken. **The proof's assumption
+  is that cells below `span_valid` are never rewritten or dropped.** Any feature that rewrites, shifts or evicts
+  below the span must call `invalidate_peer_qsa_span` at the site that does it — named candidates: **KV
+  compaction**, **context shift** (prefix removal / trimming / re-anchoring), and **sliding-window or
+  attention-sink eviction**. Recorded as a documented invariant, not a tolerated gap.
+
 - **Tier-reserve sizing when the split is not yet decided: option (c).** `peer_prompt_bytes` /
   `pair_prompt_bytes` must price the partner's span before `set_peer` chooses the head split, so the
   reserve is priced against an unknown. Ruling: reserve the **symmetric 50/50** figure, and have
