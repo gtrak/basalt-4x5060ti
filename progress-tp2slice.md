@@ -36,20 +36,26 @@
 qhs_peer_item()` for the prompt gate. That predicate is decode's and stays false. The prompt gate
 lives entirely in the prefill path, and its refusal is in `Prefill::set_peer`.
 
-Gates at this step: build green under `-j4`; `ctest -L cpu` **67/68** — only the pre-existing
+Gates, current: build green under `-j4`; `ctest -L cpu` **68/69** — only the pre-existing
 `expert_multi_test` (this CPU lacks AVX512-VNNI/VBMI); `tools/check_platform_boundary.sh` ok;
-`tools/check_stderr_logging.sh` ok. `:8000` never contacted, no engine started, no GPU run while
-the server holds the cards. GPU numbers below stay **TODO-for-the-window**.
+`tools/check_stderr_logging.sh` ok. `:8000` never contacted, no engine started. GPU numbers below
+stay **TODO-for-the-window**.
 
-**Still not built** — task items 1, 2 and commit 2:
+**Built since that step** — see `progress-tp2slice-kernels.md` for the detail: the arm's container
+and its sizing walk, the resident projections and the partner's own `Gemm`, the shard-width
+kernels (`split_q_span`, `gate_attn_span`) and the shard-aware cache writer (`kv_append_nkv`), the
+packed `attn_output` column funding and the pack's GGUF types, and **`peer_qsa_layer()`** — the
+partner's QSA block, through the gate. It has no caller yet.
 
-- No peer-side QSA arm beside the lead's (`src/prefill/prefill.cpp:2844-2939` is the model), no
-  `--exp tp_prompt_attn` behaviour behind the refusal, no AR call site.
-- No change to the peer's expert tier carve to fund the span (ruling B) — that lands with the arm,
-  through `Prefill::peer_bytes` so `pair_prompt_bytes` / `stage_room` leave the room free.
-- The software-pipelined variant (commit 2, `=2`) is untouched.
+**Still not built**: `span_valid` with its per-turn catch-up copy and its invalidation sites; the
+o_proj reduce-to-lead (`qsa_pair_prepare` + `Tp2Pair` push); the `generate.cpp` tier call sites
+that would make `stage_room` leave the room; the gate unstick; and the pipelined `=2` variant.
 
 ## 0. Rulings taken mid-run (the supervisor's, applied to this file)
+**Branch doctrine (supervisor):** *cases unrun are cases that have not passed.* A GPU-labelled test that
+has never executed is not evidence. Adopted after the first execution of `tp2_head_split_parity`
+invalidated a kernel the head-split audit had explicitly cleared — one run, one real bug.
+
 
 The peer keeps its own KV span, so it can be stale: it only ever sees the chunks it is handed.
 Every cell the LEAD appends while the peer is out of the loop — decode's appends (decode stays
@@ -248,6 +254,20 @@ o_proj product goes with the reduce because both need `qsa_pair_prepare`'s packe
 selection-equality claim in `tests/kernels/tp2_head_split_parity.cpp`. The head-split audit is closed:
 `split_q`, `gate_attn`, `kv_append` fixed; the three selection kernels cleared as not applicable. Details in
 **`progress-tp2slice-kernels.md`**.
+
+## Building this tree after a reboot
+
+A fresh `cmake` configure does **not** reproduce the working build: `BUILD_TESTING` defaults off, so
+`ctest -L cpu` finds **zero** tests and reports no failures, and `nvcc` is not on a non-login shell's
+`PATH`. Both fail silently. Configure with:
+
+    cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 \
+          -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DBUILD_TESTING=ON
+    cmake --build build -j4
+    ctest -L cpu --test-dir build          # 68/69; expert_multi_test is the known failure
+
+**Before trusting a green `ctest`, check the count:** `ctest -L cpu --test-dir build -N` must report
+**69**. A suite of zero passes exactly as well as a suite of sixty-nine.
 
 ## Where the arithmetic lives
 
