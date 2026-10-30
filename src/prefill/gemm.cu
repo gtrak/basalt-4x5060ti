@@ -165,18 +165,20 @@ const uint16_t* Gemm::bf16_rows(const uint16_t* W, int64_t N, int64_t K) {
 }
 
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
-               float beta) {
+               float beta, int64_t ldx) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
     const float alpha = 1.0f;
+    // X's pitch is its own: a card of a pair multiplies a span of the input axis out of rows wider than the span,
+    // and reading them packed would multiply the wrong values without ever faulting.
     ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
-                    CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
+                    CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) (ldx > 0 ? ldx : K), &beta, Y, CUDA_R_32F, (int) ldy,
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
        "cublasGemmEx f16");
 }
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
-                  int64_t ldy, float beta) {
+                  int64_t ldy, float beta, int64_t ldx) {
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.
         const int64_t rows = scratch_elems_ / K;
@@ -185,12 +187,12 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;
             basalt::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
-            f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
+            f16(X, scratch_, Y + r0, T, n, K, ldy, beta, ldx);
         }
         return;
     }
     basalt::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
-    f16(X, scratch_, Y, T, N, K, ldy, beta);
+    f16(X, scratch_, Y, T, N, K, ldy, beta, ldx);
 }
 
 }  // namespace basalt::prefill

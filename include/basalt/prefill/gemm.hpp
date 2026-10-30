@@ -43,13 +43,16 @@ public:
     /// scratch cannot hold the N rows at once.
     const uint16_t* bf16_rows(const uint16_t* W, int64_t N, int64_t K);
 
-    /// Y = X . W^T with both in FP16 (bits).
+    /// Y = X . W^T with both in FP16 (bits).  `ldx`, when positive, is X's row pitch: X is then a window of a wider
+    /// row-major matrix, which is what a pair's card needs to multiply its OWN span of `attn_output`'s input axis
+    /// out of the gated rows the whole attention wrote (`0`, the default, means the rows are packed at `K`).
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
-             float beta = 0.0f);
+             float beta = 0.0f, int64_t ldx = 0);
 
-    /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.
+    /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.  `ldx` as in
+    /// `f16`; it changes only how X is walked, never the values multiplied or their order.
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
-                int64_t ldy = 0, float beta = 0.0f);
+                int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0);
 
     /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).
     void rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);
