@@ -4304,8 +4304,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // rendezvous the mode keeps. It cannot deadlock: the lead's add of layer l was queued
                         // before this point, so the partner's add of l - what the publish's wait waits on - can
                         // always run.
+                        //
+                        // THE EVENT'S INDEX IS THE STAGING SET, NOT THE WIRE SET, on both sides of this wait.
+                        // Under the serialized gate the arm records its end-of-layer proof on `ev_out[0]` for every
+                        // layer - one staging set, so one proof - so waiting here on `ev_out[wire]` made every ODD
+                        // layer wait on an event nothing had ever recorded, which CUDA answers immediately: half the
+                        // mode ran pipelined while its boot line, its documentation and its own measurement said
+                        // `serialized`.  One figure, one spelling: `peer_qsa_finish`'s `w`.
                         if (sap->qsa.pipeline < 2 &&
-                            cudaStreamWaitEvent(m.cs, sap->qsa.ev_out[wire], 0) != cudaSuccess) {
+                            cudaStreamWaitEvent(m.cs, sap->qsa.ev_out[sap->qsa.pipeline >= 2 ? wire : 0], 0) !=
+                                cudaSuccess) {
                             err = "prefill: the lead would not wait for the partner's layer";
                             m.qsa_refused = true;
                             return false;
