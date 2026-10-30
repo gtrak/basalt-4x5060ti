@@ -83,20 +83,37 @@ inline uint64_t qsa_weight_native_block_bytes(const WeightRef& w, uint64_t nativ
     return qsa_plane_block_bytes(native_row_bytes, w.ne1, w.ne0 / be);
 }
 
+/// Does the arena hold this tensor's CANONICAL planes at all?  A pack may serve a projection entirely from its
+/// native GGUF image (`weights.hpp`: `resident` false, `data` null, every plane 0 bytes - the loader keeps the
+/// metadata and leaves the bytes out), which is what the shipped artifact does for the attention projections.
+/// Such a tensor is not un-cuttable: it has ONE form instead of two, and the column cut follows the native
+/// image's block width alone.  Checked rather than assumed, because the two forms are cut on DIFFERENT widths.
+inline bool qsa_weight_has_planes(const WeightRef& w) {
+    return w.resident && w.data != nullptr && w.codes_bytes != 0 && w.scales_bytes != 0;
+}
+
 /// True when the whole card's span of the input axis is legal to cut: on this form's blocks, for both the
 /// canonical planes and the native image.  `head_dim` times a whole number of heads is what the shard's
 /// `qsa_out_cols()` produces, so for the artifact this is a tautology - and a tautology checked is cheaper than
 /// a wrong product.
 inline bool qsa_weight_cols_fits(const WeightRef& w, int64_t col0, int64_t cols, uint64_t native_row_bytes) {
-    if (!w.quantized() || cols <= 0 || col0 < 0 || col0 + cols > w.ne0 || w.ne1 <= 0 || w.group_elems <= 0)
-        return false;
-    if (col0 % w.group_elems != 0 || cols % w.group_elems != 0) return false;
-    const int64_t blocks = w.ne0 / w.group_elems;
-    if (blocks <= 0) return false;
-    if (qsa_plane_block_bytes(w.codes_bytes, w.ne1, blocks) == 0) return false;
-    if (qsa_plane_block_bytes(w.scales_bytes, w.ne1, blocks) == 0) return false;
-    if (w.offset_bytes && qsa_plane_block_bytes(w.offset_bytes, w.ne1, blocks) == 0) return false;
-    if (w.has_offset != (w.offset_bytes != 0)) return false;
+    if (cols <= 0 || col0 < 0 || col0 + cols > w.ne0 || w.ne1 <= 0) return false;
+    const bool planes = qsa_weight_has_planes(w);
+    // A tensor the pack carries in NEITHER form has no bytes to cut; one carried in only the native image is
+    // cut on the native block width, and the canonical checks below simply do not apply to it.
+    if (!planes && !w.native_data) return false;
+    if (planes) {
+        if (!w.quantized() || w.group_elems <= 0) return false;
+        if (col0 % w.group_elems != 0 || cols % w.group_elems != 0) return false;
+        const int64_t blocks = w.ne0 / w.group_elems;
+        if (blocks <= 0) return false;
+        if (qsa_plane_block_bytes(w.codes_bytes, w.ne1, blocks) == 0) return false;
+        if (qsa_plane_block_bytes(w.scales_bytes, w.ne1, blocks) == 0) return false;
+        if (w.offset_bytes && qsa_plane_block_bytes(w.offset_bytes, w.ne1, blocks) == 0) return false;
+        if (w.has_offset != (w.offset_bytes != 0)) return false;
+    } else if (w.has_offset || w.offset_bytes != 0) {
+        return false;   // an offset plane claimed but not carried: the form is not what it says
+    }
     if (w.native_data && qsa_weight_native_block_bytes(w, native_row_bytes) == 0) return false;
     if (w.native_data) {
         const int64_t be = qsa_native_block_elems(w.native_type);
@@ -130,13 +147,16 @@ inline uint64_t qsa_weight_native_bytes_from_block(const WeightRef& w, uint64_t 
 /// to `qsa_pack_weight_cols`.
 inline uint64_t qsa_weight_cols_bytes(const WeightRef& w, int64_t col0, int64_t cols, uint64_t native_row_bytes) {
     if (!qsa_weight_cols_fits(w, col0, cols, native_row_bytes)) return 0;
-    const int64_t blocks = w.ne0 / w.group_elems;
-    const int64_t take = cols / w.group_elems;
-    uint64_t n = (qsa_plane_block_bytes(w.codes_bytes, w.ne1, blocks) +
-                  qsa_plane_block_bytes(w.scales_bytes, w.ne1, blocks)) *
-                 (uint64_t) take * (uint64_t) w.ne1;
-    if (w.offset_bytes)
-        n += qsa_plane_block_bytes(w.offset_bytes, w.ne1, blocks) * (uint64_t) take * (uint64_t) w.ne1;
+    uint64_t n = 0;
+    if (qsa_weight_has_planes(w)) {   // a native-only pack contributes no canonical plane
+        const int64_t blocks = w.ne0 / w.group_elems;
+        const int64_t take = cols / w.group_elems;
+        n = (qsa_plane_block_bytes(w.codes_bytes, w.ne1, blocks) +
+             qsa_plane_block_bytes(w.scales_bytes, w.ne1, blocks)) *
+            (uint64_t) take * (uint64_t) w.ne1;
+        if (w.offset_bytes)
+            n += qsa_plane_block_bytes(w.offset_bytes, w.ne1, blocks) * (uint64_t) take * (uint64_t) w.ne1;
+    }
     n += qsa_weight_native_cols_bytes(w, cols, native_row_bytes, w.ne1);
     return n;
 }
@@ -165,8 +185,12 @@ inline QsaShardWeight qsa_pack_weight_cols(const WeightRef& w, int64_t col0, int
     // block width itself (the way the GDN split calls it), which is the one place a doubled division hides
     const std::vector<GdnRun> run{{col0, cols}};
     if (out) {
-        gdn_gather_cols(base, rows, w.ne0, w.group_elems, codes_block, run, out);
-        gdn_gather_cols(base + w.codes_bytes, rows, w.ne0, w.group_elems, scales_block, run, out + v.codes_bytes);
+        // A pack that serves the tensor natively carries no canonical plane: gathering one would read from a
+        // null `data`, and `memcpy` of 0 bytes from null is not a thing to rely on.
+        if (codes_block)
+            gdn_gather_cols(base, rows, w.ne0, w.group_elems, codes_block, run, out);
+        if (scales_block)
+            gdn_gather_cols(base + w.codes_bytes, rows, w.ne0, w.group_elems, scales_block, run, out + v.codes_bytes);
         if (offset_block)
             gdn_gather_cols(base + w.codes_bytes + w.scales_bytes, rows, w.ne0, w.group_elems, offset_block, run,
                             out + v.codes_bytes + v.scales_bytes);
@@ -177,8 +201,8 @@ inline QsaShardWeight qsa_pack_weight_cols(const WeightRef& w, int64_t col0, int
                             {{col0, cols}},
                             out + v.codes_bytes + v.scales_bytes + v.offset_bytes);
     }
-    v.codes = (const uint8_t*) dst;
-    v.scales = (const float*) ((uint8_t*) dst + v.codes_bytes);
+    v.codes = codes_block ? (const uint8_t*) dst : nullptr;
+    v.scales = scales_block ? (const float*) ((uint8_t*) dst + v.codes_bytes) : nullptr;
     v.offset = offset_block ? (const float*) ((uint8_t*) dst + v.codes_bytes + v.scales_bytes) : nullptr;
     if (w.native_data) {
         // the native image trails the canonical planes in the same buffer

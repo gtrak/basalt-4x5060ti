@@ -466,6 +466,107 @@ void an_uneven_cut_of_the_artifacts_o_proj() {
 
 }  // namespace
 
+/// The shipped artifact's attention projections as the pack actually keeps them: served from its GGUF section,
+/// so the loader records the shape and NO canonical bytes (`resident` false, `data` null, `bytes` 0, every plane
+/// 0) and the tensor exists only as its native image.  The pair's packed `attn_output` columns are then the
+/// native span alone - and a sizer that priced the arena figures would price them at nothing, which is the
+/// refusal a boot hit.  Pinned here because nothing but a pack that ships this way catches it.
+void a_native_only_pack_cuts_too() {
+    FakeWeight o;   // the artifact's attn_output: input axis the heads, native Q6_K (a 256-value block form)
+    o.ne0 = 24 * 256;
+    o.ne1 = 2560;
+    o.group = 32;
+    o.native_type = 14;      // Q6_K
+    o.native_row = 24 * 192; // one row of that form: 24 blocks of 192 B
+    o.build();
+    // strip the canonical form, exactly as the loader does for a tensor served from the GGUF
+    o.w.resident = false;
+    o.w.data = nullptr;
+    o.w.bytes = 0;
+    o.w.codes_bytes = 0;
+    o.w.scales_bytes = 0;
+    o.w.offset_bytes = 0;
+    o.w.has_offset = false;
+    const int64_t half = 12 * 256;
+    CHECK(!qsa_weight_has_planes(o.w));
+    CHECK(qsa_weight_cols_fits(o.w, half, half, o.native_all()));
+    const uint64_t each = qsa_weight_cols_bytes(o.w, half, half, o.native_all());
+    CHECK(each > 0);
+    CHECK(each == qsa_weight_native_cols_bytes(o.w, half, o.native_all(), o.ne1));   // native span, nothing else
+    std::vector<uint8_t> dst(each);
+    const QsaShardWeight v = qsa_pack_weight_cols(o.w, half, half, o.native_all(), dst.data());
+    CHECK(v.ok);
+    CHECK(v.codes == nullptr && v.scales == nullptr && v.offset == nullptr);   // no canonical plane to point at
+    CHECK(v.native != nullptr);
+    CHECK(v.codes_bytes + v.scales_bytes + v.offset_bytes + v.native_bytes == each);
+    CHECK(v.ne0 == half && v.ne1 == o.ne1);
+    // and the packed span is the bytes the whole native image holds for those columns, byte for byte
+    const size_t row = (size_t) o.native_row;
+    const size_t take = (size_t) (half / 256) * (row / (size_t) (o.ne0 / 256));
+    bool same = true;
+    for (int64_t r = 0; r < o.ne1 && same; ++r)
+        if (std::memcmp((const uint8_t*) v.native + (size_t) r * take,
+                        o.native.data() + (size_t) r * row + take, take) != 0)
+            same = false;
+    CHECK(same);
+    // the two halves still tile the input axis, and a native type whose width cannot cut it still refuses
+    CHECK(qsa_weight_cols_bytes(o.w, 0, half, o.native_all()) == each);
+    FakeWeight bad;   // a fresh one: `FakeWeight`'s WeightRef points into its own vectors
+    bad.ne0 = o.ne0;
+    bad.ne1 = o.ne1;
+    bad.group = o.group;
+    bad.native_type = 14;
+    bad.native_row = o.native_row;
+    bad.build();
+    bad.w.resident = false;
+    bad.w.data = nullptr;
+    bad.w.bytes = bad.w.codes_bytes = bad.w.scales_bytes = bad.w.offset_bytes = 0;
+    bad.w.has_offset = false;
+    bad.w.native_type = 99;   // a type the mirror table does not know: its columns cannot be cut at all
+    CHECK(bad.w.native_data != nullptr);
+    CHECK(!qsa_weight_cols_fits(bad.w, half, half, bad.native_all()));
+    CHECK(qsa_weight_cols_bytes(bad.w, half, half, bad.native_all()) == 0);
+    // and a tensor with NEITHER form is nothing to cut
+    FakeWeight none;
+    none.ne0 = o.ne0;
+    none.ne1 = o.ne1;
+    none.group = o.group;
+    none.build();
+    none.w.native_data = nullptr;
+    none.w.native_type = -1;
+    none.w.resident = false;
+    none.w.data = nullptr;
+    none.w.bytes = none.w.codes_bytes = none.w.scales_bytes = none.w.offset_bytes = 0;
+    CHECK(!qsa_weight_cols_fits(none.w, half, half, 0));
+}
+
+/// The artifact's OWN `attn_output` as its pack keeps it (Q6_K, the input axis the 24 heads, the output axis
+/// n_embd), so the figure the partner's tier is shrunk by is pinned by its real value and not by a round number.
+/// Q6_K is 210 B per 256 values (6.5625 bits a value), which is what makes the whole image 12 902 400 B - the
+/// byte count the pack's own metadata carries, so this test and the pack agree by construction.
+void the_artifacts_native_o_proj_prices_what_the_tier_holds() {
+    constexpr int64_t NE0 = 24 * 256, NE1 = 2560, ROW = 210 * 24;
+    FakeWeight o;
+    o.ne0 = NE0;
+    o.ne1 = NE1;
+    o.group = 32;
+    o.native_type = 14;   // Q6_K
+    o.native_row = ROW;
+    o.build();
+    o.w.resident = false;
+    o.w.data = nullptr;
+    o.w.bytes = o.w.codes_bytes = o.w.scales_bytes = o.w.offset_bytes = 0;
+    o.w.has_offset = false;
+    CHECK((uint64_t) ROW * NE1 == 12902400ull);   // the pack's own `attn_output` byte count
+    const QsaHeadShard partner = qsa_pair_shard(24, 2, 12, 1);
+    const QsaHeadRun cols = qsa_out_cols(partner, 256);
+    CHECK(cols.start == 12 * 256 && cols.len == 12 * 256);
+    const uint64_t one_layer = qsa_weight_cols_bytes(o.w, cols.start, cols.len, (uint64_t) ROW * NE1);
+    CHECK(one_layer == 6451200ull);   // half the native image, and nothing else
+    std::printf("the pack's attn_output: %llu B whole, one card's columns %llu B a QSA layer\n",
+                (unsigned long long) (ROW * NE1), (unsigned long long) one_layer);
+}
+
 int main() {
     the_column_view_is_the_wholes_bytes();
     the_two_halves_are_the_whole_row();
@@ -476,6 +577,8 @@ int main() {
     the_sizes_agree_with_the_packer();
     the_artifacts_geometry_cuts_cleanly();
     an_uneven_cut_of_the_artifacts_o_proj();
+    a_native_only_pack_cuts_too();
+    the_artifacts_native_o_proj_prices_what_the_tier_holds();
     if (g_fail != 0) { std::printf("tp2 shard weights test failed: %d\n", g_fail); return 1; }
     std::printf("tp2 shard weights test ok\n");
     return 0;

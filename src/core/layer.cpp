@@ -629,7 +629,9 @@ static bool qsa_prepare_one(QsaPair& p, const WeightRef& w, const std::string& n
     std::vector<uint8_t> whole((size_t) (w.bytes + nb)), packed((size_t) want);
     {
         const OnDevice on(dev);
-        if (cudaMemcpy(whole.data(), w.data, (size_t) w.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        // A pack that serves this tensor from its GGUF section keeps no canonical bytes at all (`data` null,
+        // `bytes` 0): a 0-byte copy from a null pointer is not a no-op, it is an error return.
+        if (w.bytes != 0 && cudaMemcpy(whole.data(), w.data, (size_t) w.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
             err = name + ": the planes did not come down";
             return false;
         }
@@ -666,8 +668,8 @@ static bool qsa_prepare_one(QsaPair& p, const WeightRef& w, const std::string& n
     }
     // re-describe the view over the DEVICE copy: the sizes are the packer's, the pointers are the card's
     const uint8_t* base = (const uint8_t*) d;
-    view.codes = base;
-    view.scales = (const float*) (base + view.codes_bytes);
+    view.codes = view.codes_bytes ? base : nullptr;
+    view.scales = view.scales_bytes ? (const float*) (base + view.codes_bytes) : nullptr;
     view.offset = view.offset_bytes ? (const float*) (base + view.codes_bytes + view.scales_bytes) : nullptr;
     view.native = nb ? (const void*) (base + view.codes_bytes + view.scales_bytes + view.offset_bytes) : nullptr;
     p.owned.push_back(d);
