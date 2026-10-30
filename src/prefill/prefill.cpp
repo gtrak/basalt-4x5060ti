@@ -4165,12 +4165,33 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     const basalt::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
                                                                        : core::qsa_attn_pools(st);
+                    // THE LEAD'S ATTENTION, HALVED (`--exp tp_prompt_attn`).  The partner computes the complement's
+                    // heads on its own card, so the lead computes only the heads whose COLUMNS it packed: the
+                    // KV-group window of the prompt-attention kernel runs whole KV groups against these same whole
+                    // pools (Ruling B keeps them whole - the pools are not narrowed, which is also why narrowing
+                    // them, the funded option (a), was not needed).  The group index moves the KV rows and the
+                    // heads that read them together, so the lead's 12 heads read KV head 0 of the whole pools and
+                    // the partner's 12 read KV head 1 of its own.
+                    //
+                    // Only a run of WHOLE groups can be halved: a straddle would leave the MMA's group rows half
+                    // populated, and the kernel refuses one anyway.  Then `lead_groups` stays 0 - every group -
+                    // which is the launch from before this existed, byte for byte, and the layer is still correct
+                    // because a card's columns are a subset of what it computed.  A chunk the arm does not take
+                    // (`sap` null) is the same launch.
+                    const int64_t rep = s.n_head_kv > 0 ? s.n_head / s.n_head_kv : 0;   // query heads per KV group
+                    int64_t lead_groups = 0;   // 0: every group
+                    if (sap != nullptr && rep > 0) {
+                        const std::vector<core::QsaHeadRun> runs = core::qsa_head_runs(sap->qsa.span.heads);
+                        if (!runs.empty() && runs[0].len >= rep && runs[0].len % rep == 0)
+                            lead_groups = runs[0].len / rep;
+                    }
                     // the whole chunk on tensor cores, one block per (query, KV head), FP32-level
                     // accuracy but not bitwise (qsa_prompt_attn.hpp). Q4_0 KV (or a shape it does not take): the
                     // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,
-                    // V dequantized from its q4_0 blocks to fp16 at gather)
+                    // V dequantized from its q4_0 blocks to fp16 at gather).  The fallback computes every head:
+                    // correct, just not halved, and its extra rows are columns the lead never reads.
                     if (!basalt::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
-                                                                            m.attn, T, m.cs))
+                                                                            m.attn, T, m.cs, /*kvh0*/ 0, lead_groups))
                         for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
                             const int64_t nb = std::min(m.attn_batch, T - t0);
                             basalt::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
@@ -4178,7 +4199,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                    s, s.n_head_kv, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
                         }
                     if (st.kv_rot || st.kv_hybrid) basalt::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
-                    gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
+                    // the gate over the heads this card owns, at the whole row pitch: the partner's half of the
+                    // `attn_output` columns is what their card multiplies, so the lead's rows beyond its run are
+                    // never read (and the attention above never wrote them)
+                    if (lead_groups > 0) gate_attn_span(m.attn, m.Qf, m.attn_h, T, lead_groups * rep, ZV, m.cs);
+                    else gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
                     if (sap != nullptr) {
                         // The chunk's widest `n_bid + 1`: the positions rise through a chunk, so the last query's
                         // is the widest, and the arm takes it as an argument rather than reading a host copy per

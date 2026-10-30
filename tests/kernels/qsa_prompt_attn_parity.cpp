@@ -245,16 +245,76 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     }
     const bool ok1 = fmt == 1 ? err_new <= 1.5e-3 * ref_scale : err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale);
     const bool ok2 = (fmt == 1 ? diff <= 2e-3 * scale : diff <= 1e-4 * scale) && same;
+    // 4. THE KV-GROUP WINDOW.  A card's half of the heads, run against the WHOLE pools, must be the whole run's
+    //    rows for exactly those heads - bit for bit, same kernel and same math with fewer blocks.  This is the
+    //    claim `--exp tp_prompt_attn` runs the lead's halved attention on (12 query heads reading KV head 0 of
+    //    pools that were never narrowed, Ruling B), so it is checked two ways: the group's own rows equal the
+    //    whole run's, and the OTHER groups' rows are exactly as they were left - a card that wrote its partner's
+    //    heads would still pass the first half and corrupt the sum.
+    bool same_window = true;
+    float win_ms = 0;
+    {
+        const int64_t rep_h = NH / NKV;   // the query heads of one KV group
+        std::vector<float> w((size_t) nq * NH * HD);
+        cudaEvent_t w0, w1;
+        cudaEventCreate(&w0);
+        cudaEventCreate(&w1);
+        for (int64_t g = 0; g < NKV && same_window; ++g) {
+            float* d_w = nullptr;
+            ck(cudaMalloc(&d_w, (size_t) nq * NH * HD * 4), "malloc");
+            ck(cudaMemset(d_w, 0xFF, (size_t) nq * NH * HD * 4), "memset");   // NaN bits: "nobody wrote here"
+            if (!k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_w, nq, nullptr, g, 1)) {
+                std::fprintf(stderr, "the KV-group window (%lld,1) was refused\n", (long long) g);
+                std::exit(2);
+            }
+            ck(cudaMemcpy(w.data(), d_w, w.size() * 4, cudaMemcpyDeviceToHost), "down");
+            for (int64_t i = 0; i < nq && same_window; ++i)
+                for (int64_t h = 0; h < NH; ++h) {
+                    const size_t at = (size_t) (i * NH + h) * HD;
+                    if (h < g * rep_h || h >= (g + 1) * rep_h) {
+                        for (int64_t d = 0; d < HD; ++d)
+                            if (!std::isnan(w[at + d])) {   // any non-NaN is a write outside its group
+                                std::printf("  window group %lld wrote head %lld of query %lld\n", (long long) g,
+                                            (long long) h, (long long) i);
+                                same_window = false;
+                                break;
+                            }
+                        continue;
+                    }
+                    if (std::memcmp(&w[at], &nw[at], HD * 4) != 0) {
+                        std::printf("  window group %lld differs from the whole run at query %lld head %lld\n",
+                                    (long long) g, (long long) i, (long long) h);
+                        same_window = false;
+                        break;
+                    }
+                }
+            if (g == 0) {   // the microbench: the lead's half of the attention should cost about half
+                cudaEventRecord(w0);
+                for (int r = 0; r < reps; ++r)
+                    k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_w, nq, nullptr, 0, 1);
+                cudaEventRecord(w1);
+                ck(cudaEventSynchronize(w1), "time");
+                cudaEventElapsedTime(&win_ms, w0, w1);
+            }
+            cudaFree(d_w);
+        }
+        cudaEventDestroy(w0);
+        cudaEventDestroy(w1);
+    }
     std::printf("%s %s ctx %lld, %lld queries: vs FP64 old %.3g new %.3g (output scale %.3g); new vs old %.3g (%.2g of "
                 "scale); batch-independent %s; %.3f -> %.3f ms per chunk (%.2fx)\n",
                 ok1 && ok2 ? "PASS" : "FAIL", fmt == 2 ? "q4_0" : fmt == 1 ? "int8" : "fp16", (long long) ctx, (long long) nq, err_old,
                 err_new, ref_scale, diff, diff / scale, same ? "yes" : "NO", ms_old / reps, ms_new / reps, ms_old / ms_new);
+    std::printf("  KV-group window: one of %lld groups bitwise the whole run's rows for its heads and no row outside "
+                "them: %s; %.3f ms per chunk vs %.3f whole (%.2fx, the lead's half of the attention)\n",
+                (long long) NKV, same_window ? "yes" : "NO", win_ms / reps, ms_new / reps,
+                ms_new > 0 ? (ms_new / reps) / (win_ms / reps) : 0.0);
     cudaFree((void*) d_ids); cudaFree((void*) d_steps); cudaFree((void*) d_q); cudaFree(d_old); cudaFree(d_new);
     cudaFree(scratch);
     cudaFree((void*) pl.k_q); cudaFree((void*) pl.v_q); cudaFree((void*) pl.k_scale); cudaFree((void*) pl.v_scale);
     cudaFree((void*) pl.k_pool); cudaFree((void*) pl.v_pool); cudaFree((void*) pl.page_table);
     cudaFree((void*) pl.k_q4); cudaFree((void*) pl.v_q4);
-    return ok1 && ok2 ? 0 : 1;
+    return ok1 && ok2 && same_window ? 0 : 1;
 }
 }  // namespace
 

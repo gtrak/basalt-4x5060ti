@@ -82,11 +82,15 @@ template <int KV_MODE>
 __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __restrict__ q, QsaAttnPools p,
                                                               const int32_t* __restrict__ ids,
                                                               const int32_t* __restrict__ steps, int n_kv_heads,
-                                                              int page_size, float scale_log2, float* __restrict__ attn,
-                                                              int cap) {
+                                                              int kvh0, int page_size, float scale_log2,
+                                                              float* __restrict__ attn, int cap) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     Smem<KV_MODE>& S = *reinterpret_cast<Smem<KV_MODE>*>(smem_raw);
-    const int qi = blockIdx.x, kvh = blockIdx.y;
+    // `kvh` is the WHOLE-geometry KV head: the pools are the model's (n_kv_heads per page) and `kvh0` says which
+    // group this launch owns.  It indexes both the KV rows it reads and the query heads that read them - a group
+    // is never split, which is what `G` rows of the MMA assume - so one offset moves the pools and the heads
+    // together and a card running part of the groups runs exactly the heads whose columns it packed.
+    const int qi = blockIdx.x, kvh = kvh0 + blockIdx.y;
     const int n_head = n_kv_heads * G;
     q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
     attn += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
@@ -497,11 +501,11 @@ __device__ __forceinline__ void decode_v_pair(uint32_t codes, __half2 scales, ui
 __global__ void __launch_bounds__(THREADS, 2) prompt_attn_i8_kernel(const float* __restrict__ q, QsaAttnPools p,
                                                                  const int32_t* __restrict__ ids,
                                                                  const int32_t* __restrict__ steps, int n_kv_heads,
-                                                                 int page_size, float scale_log2,
+                                                                 int kvh0, int page_size, float scale_log2,
                                                                  float* __restrict__ attn, int cap) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     Smem3& S = *reinterpret_cast<Smem3*>(smem_raw);
-    const int qi = blockIdx.x, kvh = blockIdx.y;
+    const int qi = blockIdx.x, kvh = kvh0 + blockIdx.y;   // the whole-geometry group, as above
     const int n_head = n_kv_heads * G;
     q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
     attn += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
@@ -768,7 +772,7 @@ __global__ void __launch_bounds__(THREADS, 2) prompt_attn_i8_kernel(const float*
 }
 
 bool launch_i8(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-               const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
+               const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st, int64_t kvh0, int64_t groups) {
     static std::atomic<bool> attr[64];   // the shared-memory opt-in is per device (a layer split runs this on several)
     int dev = 0;
     cudaGetDevice(&dev);
@@ -785,9 +789,9 @@ bool launch_i8(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
     const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
     for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
         const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
-        prompt_attn_i8_kernel<<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, bytes, st>>>(
+        prompt_attn_i8_kernel<<<dim3((unsigned) nb, (unsigned) groups), THREADS, bytes, st>>>(
             q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
-            (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
+            (int) kvh0, (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -799,7 +803,7 @@ bool launch_i8(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
 
 template <int KV_MODE>
 bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-            const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
+            const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st, int64_t kvh0, int64_t groups) {
     static std::atomic<bool> attr[64];   // per device, as above
     int dev = 0;
     cudaGetDevice(&dev);
@@ -816,9 +820,9 @@ bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const
     const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
     for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
         const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
-        prompt_attn_kernel<KV_MODE><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, bytes, st>>>(
+        prompt_attn_kernel<KV_MODE><<<dim3((unsigned) nb, (unsigned) groups), THREADS, bytes, st>>>(
             q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
-            (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
+            (int) kvh0, (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -832,25 +836,31 @@ bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const
 }  // namespace
 
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
-                           int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
+                           int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream,
+                           int64_t kvh0, int64_t groups) {
     if (n_q <= 0) return true;
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)
         return false;
+    // The KV-group window: 0/all is every group, which is what every caller but the prompt-attention slice's
+    // lead passes, and what it passes when the slice declines.  A window must be whole groups of the geometry
+    // `s` states - never a part of one, which would leave the MMA's `G` rows half-populated - and inside it.
+    if (groups <= 0) groups = s.n_head_kv;
+    if (kvh0 < 0 || groups <= 0 || kvh0 + groups > s.n_head_kv) return false;
     cudaStream_t st = (cudaStream_t) stream;
     if (pools.k_q4 != nullptr) {   // Q4_0 K and V (--kv q4_0): mode 4
         if (pools.v_q4 == nullptr) return false;
-        return launch<4>(q, pools, ids, steps, cap, s, attn, n_q, st);
+        return launch<4>(q, pools, ids, steps, cap, s, attn, n_q, st, kvh0, groups);
     }
     if (pools.k_q != nullptr && pools.v_q4 != nullptr) {   // hybrid K8V4: int8 K + dequantized-q4 V
         if (!pools.k_scale) return false;
-        return launch<3>(q, pools, ids, steps, cap, s, attn, n_q, st);
+        return launch<3>(q, pools, ids, steps, cap, s, attn, n_q, st, kvh0, groups);
     }
     if (pools.k_q != nullptr) {
         if (!pools.v_q || !pools.k_scale || !pools.v_scale) return false;
-        return launch_i8(q, pools, ids, steps, cap, s, attn, n_q, st);
+        return launch_i8(q, pools, ids, steps, cap, s, attn, n_q, st, kvh0, groups);
     }
     if (!pools.k_pool || !pools.v_pool) return false;
-    return launch<0>(q, pools, ids, steps, cap, s, attn, n_q, st);
+    return launch<0>(q, pools, ids, steps, cap, s, attn, n_q, st, kvh0, groups);
 }
 
 }  // namespace basalt::kernels

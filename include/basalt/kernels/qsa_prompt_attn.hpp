@@ -29,7 +29,16 @@ namespace basalt::kernels {
 
 /// Same arguments and output as `qsa_decode_attn_batch` minus the scratch. Returns false (nothing launched) when the
 /// geometry is not 24 heads / 2 KV heads / 256: the caller then uses the old kernel.
+///
+/// `kvh0`/`groups` run a KV-GROUP WINDOW rather than the whole axis: `groups` whole groups of the geometry `s`
+/// states, starting at group `kvh0`, with the pools and the `q`/`attn` pitch still the WHOLE model's. That is how
+/// one card of a pair runs its half of the heads against pools that were never narrowed: the KV head whose rows
+/// it reads and the `n_head / n_head_kv` query heads that read it move together, so a launch never populates the
+/// MMA's group rows half. `0, 0` is every group - what every caller passed before the window existed and what
+/// the prompt path passes when the slice declines, byte for byte the same launch.
+/// A window that is not whole groups of `s`, or runs off its end, returns false without launching.
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
-                           int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream);
+                           int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream,
+                           int64_t kvh0 = 0, int64_t groups = 0);
 
 }  // namespace basalt::kernels
