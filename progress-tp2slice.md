@@ -18,11 +18,36 @@
 
 ## Status of this milestone
 
-**No engine code was written.** `qhs_peer_item()` still returns false, no `--exp tp_prompt_attn`
-flag exists, no AR call site was added to `src/prefill/prefill.cpp`, and the parity suite was not
-extended. The two supervisor rulings arrived after the ledger work; the implementation is therefore
-not started, and no commit exists on `tp2pp2` for this task. The working tree is unchanged except
-for this file.
+**Landed** — commit `b1f9850d`, `tests: the head-split parity gains the prompt attention kernel`:
+
+- Task item **4** (parity): case 6 in `tests/kernels/tp2_head_split_parity.cpp` runs 8 queries
+  through `qsa_prompt_attn_batch` whole (24 heads / 2 KV) and once per card (12 / 1) over each
+  card's KV-head slice, sharing one selection, step and permuted page table. Tolerance stated in
+  the source: relative 2e-3 of the row's largest magnitude, which is the prompt kernel's own bound
+  (`qsa_prompt_attn.hpp` says it is FP32-level, not bitwise). A bitwise run prints `bitwise` and
+  its worst deviation, so drift toward the bound stays visible.
+  GPU-labelled (`basalt_gpu_test`, skip 77 without a card), so the cpu count is unchanged at 68.
+  **Not executed** — the live server holds the cards. It compiles clean under `-j4`; the two
+  `-Wpointer-arith` warnings at lines 430-431 are pre-existing, on untouched lines.
+- Task item **5** (predictions): this file, filed before any measurement.
+
+Gates: `tools/check_platform_boundary.sh` ok, `tools/check_stderr_logging.sh` ok,
+`ctest -L cpu` **67/68** — only the pre-existing `expert_multi_test` (this CPU lacks
+AVX512-VNNI/VBMI). Build used `-j4` per the shared-CPU constraint. `:8000` was never contacted,
+no engine started, no GPU test run while the server holds the cards.
+
+**Not built** — task items 1, 2, 3 and commit 2 remain open:
+
+- `qhs_peer_item()` still returns false (`src/core/verify.cpp:598`); no peer-side prompt-attention
+  executor exists, and the init refusal still stands.
+- No `--exp tp_prompt_attn` flag, no AR call site in `src/prefill/prefill.cpp`.
+- No change to the peer's expert tier carve to fund the 1.2 GiB span (ruling B).
+- The software-pipelined variant (commit 2, `=2`) is untouched.
+
+Unverified assumption that must be settled first, because the whole inbound mix depends on it:
+whether the peer can consume the **FP4 act planes** it already receives (RUN 19) as the attention
+input, and what plane consumption does to attention parity. If the tolerance above cannot cover
+it, the table in section 2 (BF16 mixed rows) is the fallback and is what is priced.
 
 ## 1. Corrections to the ledger I was handed
 
