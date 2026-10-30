@@ -2103,3 +2103,111 @@ wait 0.0):
 4. `--exp l2warm_force=1` boot: expect no change vs the default (no extra line).
 5. Build green `-j4`; `ctest -L cpu` 67/68 (`expert_multi_test` pre-existing);
    `tools/check_platform_boundary.sh` + `tools/check_stderr_logging.sh` ok.
+
+## RUN 23 — the suffix drafter's long-generation decay: the index already had the tail; the gate was throwing it away (kimi review #2, P2-4)
+
+### The measured problem
+
+Real traffic: a 70k-token single generation ran ~40 t/s while short turns ran 51-78 t/s on the same
+binary. The decode profile showed healthy windows (27-29 ms, 3 rows) but the long generation kept only
+~1.1 tokens/window vs ~3.0 on short turns; short-turn draft acceptance was 68-78%, the long generation's
+windows implied ~35-40% effective. P2-4 parked this as the highest-EV decode item: ~1.9x on a real
+workload class, independent of the topology work.
+
+### Root cause — hypothesis (a) is refuted; the gate was the problem
+
+The brief's leading hypothesis was that the drafter's index never sees generated tokens. It does: all
+three decode paths append every committed token (`generate.cpp` solo loop `sfx.append(outv[i])` after
+each commit; batch slots `sl.sfx->append(outb[...])` per kept token; CLI loop likewise), and the index
+grows from the prompt through the whole generation. Replaying the real `SuffixDrafter` on 70k-token
+synthetic streams (70k class: prompt 4k + 66k generation, code/JSON/reasoning blocks, K=7) confirms the
+tail is found — on verbatim structure the drafter gets 5.3 tok/step at 61% acceptance, and a late
+re-quote of earlier code runs 4-8 tok/step. Self-indexing works.
+
+What the replays actually reproduce is the gate. Two regimes:
+
+| stream (70k) | min_match | propose% | acc/proposal | tok/step |
+|---|---|---|---|---|
+| noisy parameterized repetition (30% unique content) | 8 | 5% | 1.7/7 (25%) | **1.09** |
+| same, reseeded | 8 | 41% | 2.5/7 (35%) | **2.03** |
+| same | 3 | 41% | 2.5/7 (35%) | 2.05 |
+| clean verbatim code | 8 | 6-10% | 1.8/7 | 1.1-1.2 |
+| same, reseeded | 8 | 38-64% | 2.5/7 | 2.5-2.7 |
+| same | 3 | 61% | 2.9/7 | 2.76 |
+| long-range re-quote | 8 | 1.6-100% | 2.9-7.0/7 | 1.1-4.1 |
+| same, reseeded | 8 | 19-100% | 2.9-7.0/7 | 1.9-5.3 |
+
+The measured launch ran `--suffix-draft 8` (min_match 8). On a non-verbatim tail, 8+-token matches are
+~5% of windows and even those accept at ~25%: the drafter is effectively dormant, the policy gives up
+on lookup, and the weak MTP windows commit ~1.1 tokens/window — the measured number, the 3-row profile,
+the 27-29 ms windows. Even at min_match 3 the drafter's ceiling on noisy tails is ~35-40% acceptance
+(n-grams cannot predict genuinely new content), so the policy mostly bypasses it; that ceiling is a
+property of the tail's content, not of the index.
+
+### The change — `--exp draft_reseed=1` (default off, byte-identical)
+
+The missing piece is the *reliability rule*, not the index: a repeat of prompt material needs a long
+match to be trustworthy, but a repeat the model just made in its own output is trustworthy at trigram
+length — the current phase's structure is the evidence. So in reseed mode a match of 3-7 tokens
+qualifies when its source lies in the generated tail (`mark_history` splits prompt from tail at request
+start); prompt-sourced short matches still need `min_match`.
+
+- `include/basalt/spec/suffix_drafter.hpp` / `src/spec/suffix_drafter.cpp`: `set_reseed(bool)`,
+  `mark_history()`; `propose` admits a tail-sourced candidate at `kReseedMin = 3`. `reset()` clears the
+  mark. Off by default: with reseed off the candidate filter reduces to the old one and the output is
+  byte-identical (verified by the unit tests).
+- `src/program/generate.cpp`: the three drafter owners enable the mode from `exp_flag("draft_reseed")`
+  right after seeding the prompt — solo serve loop (after the `ids` seed), batch slot admission (after
+  the `live` seed, before the first generated token `x`), CLI loop (after `o.tokens`, before the
+  resumed `produced`).
+- Deliberately NOT done: capping the proposal at match length + slack (measured net-negative on every
+  stream: 2.10→1.94 tok/step continue, 6.45→5.76 copy — it truncates correct verbatim continuations,
+  and `DraftPolicy` already sizes the window from measured acceptance), and WAYS 4→16 (no change: the
+  trigram's source occurrence of a repeated block is always local to the repeat).
+
+### Amortization and memory bounds
+
+- Host cost: the append is O(1) per token (one probe, a 4-position shift) and was already done at commit
+  time; reseed adds one comparison per candidate in `propose` (≤4 candidates) and nothing to appends.
+  Measured append cost: 0.03 µs/token over 262k tokens. Expected draft-phase delta: ≈ 0 ms/window,
+  well inside the +0.5 budget.
+- Memory: no new allocation in reseed mode. Per 10k generated tokens: +40 KB of history, and up to 10k
+  newly filled table slots (32 B each, ≤320 KB) inside the table pre-allocated at request start as
+  2×(max_context+4096) slots. Once the table's distinct-trigram capacity is reached, inserts are dropped
+  (existing behavior); matches for indexed trigrams keep working.
+
+### Predictions (graded at the reviewer's boot)
+
+1. Long-generation replay (70k class) with the boot's `--suffix-draft 8` + `--exp draft_reseed=1`:
+   dl 1.1 → 1.9-2.5 tok/window (replays: 1.09→2.03 noisy, 1.1→2.7 clean, 1.1-4.1→1.9-5.3 re-quote);
+   the drafter's propose rate rises 5% → 30-45% of windows and the policy keeps taking short lookup
+   windows. Meets the dl ≥ 2.2 target on any tail that is more than half verbatim; on a fully noisy
+   tail it lands ~2.0 — near, not above, the target.
+2. Short-turn acc: unchanged within noise. Prompt-sourced matches there are ≥8 tokens (the floor never
+   fires); the only new proposals are 3-7-token repeats the turn itself just made, which the policy
+   prices from its first few windows (decay 0.97) and drops if they underperform.
+3. Draft-phase host ms: within +0.5 of baseline (expected ≈ 0; the index work was already amortized).
+4. Index memory: bounded as above — +40 KB history per 10k generated tokens, no table growth.
+5. KILL CRITERION (P2-4): if the reseeded acceptance recovers < 55% of fresh-session acceptance
+   (< ~37-43%), the tail distribution resists re-seeding — report and stop, no iteration.
+6. Known null case: if the measured boot actually ran the DEFAULT `--suffix-draft 3`, the floor is
+   already active and reseed is near-inert by design — expect dl ~1.1-1.3, i.e. no change, which is the
+   tail-content ceiling (new content is not n-gram-predictable) and trips the kill criterion. The
+   reviewer should read the boot's `--suffix-draft` value before grading.
+
+### Reviewer checklist
+
+1. Build green `-j4`; `ctest -L cpu` 67-68/68 unchanged (`expert_multi_test` pre-existing);
+   `tools/check_platform_boundary.sh` + `tools/check_stderr_logging.sh` ok.
+2. Long-generation replay (the P2-4 workload): boot the A/B binary (this branch) and the baseline
+   (branch head `293ca647`) with the same launch flags; replay the same 70k-class generation (same
+   prompt, greedy, same `--suffix-draft` as the measured boot) on each; `--draft-log` on both.
+   Compare per-window lines: the `W <T> <a> <from_sfx>` mix (expect `from_sfx=1` windows to appear in
+   the long generation under reseed where the baseline ran 3-row MTP windows) and the committed
+   tokens/window curve over progress. The DONE line's draft counters (`drafts accepted/offered`) and
+   the `suffix drafts ... windows` info line give the request-level acc.
+3. Short-turn A/B: the edit/refactor turns that measured 68-78% acc — acc within noise, t/s unchanged.
+4. Default-path identity: no `--exp draft_reseed` → `suffix_drafter_test` unit tests pass and a greedy
+   run is token-identical to the baseline binary (the mode is a no-op off).
+5. Kill criterion check: if reseeded acc < 55% of fresh-session acc, close P2-4 as "tail distribution
+   resists re-seeding" — do not iterate.
