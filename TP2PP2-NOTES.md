@@ -2845,3 +2845,70 @@ generations on the target class. The split's CONCURRENT decode was never measure
 74-90 only) — a missing baseline for the topology decision; if the split degrades under
 concurrency the way its prefill slots do, tp2's concurrent aggregate may already exceed it.
 
+
+## RUN 25 — the partial merge: the peer returns one summed vector a layer (`--exp peer_partial_merge`, default off)
+
+The flagship prefill lever RUN 24 named. The pair's return leg used to carry one row per routing the partner holds;
+under the flag the partner folds its weighted rows into a `T x 2560` partial of its own and ships THAT once a layer,
+and the lead's combine skips those rows and adds the partial. The MoE sum's reduction order is what changes, so the
+arithmetic lives in one header (`include/basalt/prefill/moe_part.hpp`) that the device kernels and the CPU test both
+call, and the page that covers it is `docs/precision/moe-partial-merge.md`.
+
+**What was built** (`moe_part.hpp`; `kernels.cu`: `moe_combine_partial_kernel`, `peer_part_fold_kernel`,
+`peer_part_pack_kernel`; `prefill.cpp`: `peer_part_bytes`, `peer_fold_bytes`, `peer_partial_merge`,
+`PeerPrefill::{part,part16,fold_*,ev_part,ev_back,ev_fwd,part_live}`, `peer_fold_tables`, the fold call in the FP4
+group loop, the single return leg after it, and `moe_combine_partial` in the combine):
+
+- The fold is per expert group, ONE thread per (token, dimension) of that group's token list, so no atomics and the
+  order is the list's. A token's rows are sorted into k order — the order the single-card combine uses — and groups
+  are chained in launch order.
+- The peer has no router, so the lead reads `m.w` back beside `m.ids` (only under the flag) and the fold's weights
+  and k-indices travel with the group's other tables.
+- The accumulator is zeroed once a layer, after the previous layer's copy has drained (`ev_back`); the pack to BF16
+  runs after the group loop, so the fold's cells stay fp32 and the partial is rounded ONCE.
+- `--peer-rows-fp32` keeps its meaning: the partial crosses in the format the rows would have crossed in.
+- Refused, not ignored, when asked for and unrunnable: a bad value is an error, and a boot whose FP4 leg is shut
+  warns with the gate's own reason. Nothing allocates, reads back or prints with the flag off.
+
+**CPU gate** (`tests/kernels/moe_part_parity.cpp`, `ctest -L cpu`, 71 tests; the one failure is the pre-existing
+`expert_multi_test`, which refuses this CPU for want of AVX-512): flag-off identity is bitwise (0 of 3,880 outputs
+differ), the FP32 wire costs one fp32 ulp, the BF16 wire lands inside half a bf16 ulp OF THE PARTIAL (3.6-3.8e-3 of
+it), grouped and single-chain folds are bitwise equal, and the fold's list equals the routing table exactly. Build
+is warning-clean (the two remaining `prefill.cpp` warnings are the ones HEAD already had).
+
+**The share model moved with it** (`peer_layer_time`, `peer_link`, `peer_fp4_ceiling` all take `partial_merge`): the
+return leg became `chunk * row_bytes` plus 8 B of fold tables a row, the peer's marginal cost became
+`peer_row_us + qsa_peer_fold_us` (default `n_embd * 10 / 400000` = 0.064 us, derived, not measured —
+`--exp qsa_peer_fold_us` re-prices it and the boot line prints the figure). `peer_bytes` sizes the tier's reserve
+with the same widths, so a boot cannot fund one mode and run the other.
+
+**MODEL PREDICTIONS, nothing here measured** (the shipped defaults: 2.26/1.09 us a row-visit, 4.2 MB/ms of link,
+54.4 ms of lead attention, chunk 8,192, 512 experts of 2,548,736 B, BF16 rows, FP4 planes; the `r` the model picks
+is clamped to `min(band, n_expert/2 - held)`). Lead/peer are milliseconds a layer:
+
+| held/band a layer | share | r | lead ms | peer, rows back | peer, partial back | critical side |
+|---|---|---|---|---|---|---|
+| 128 / 256 | 25% | 0 | 348.6 | 50.1 | 36.5 | lead (298 off, 312 on) |
+| 128 / 256 | 42% | 87 | 264.4 | 82.2 | 52.6 | lead (182 off, 212 on) |
+| 128 / 256 | 50% | 128 (cap) | 224.6 | 97.4 | 60.1 | lead (127 off, 165 on) |
+| 128 / 256 | 60% | — | — | — | — | **unreachable**: `r` clamps at 50% of the chunk's rows |
+
+The one finding the table forces: **at this geometry the pair is lead-critical at the clamp either way**, so the
+flag alone does not move the predicted wall — it makes the already-idle peer more idle. Its value is in the two
+places the row wire was the limiter: the peer's back leg drops from 49.9 ms to 10.1 ms at a 50% share (209.7 MB to
+42.3 MB a layer), and the share where the two cards MEET moves out (69% -> 78% of the chunk's rows at 128/256;
+56% -> 63% at 128/112). Converting the lever into wall needs the half-the-rows cap and the lead's attention/blob
+terms treated as the limits they are, or a measured configuration where the peer is the critical side. The boot A/B
+below is what decides, not the model.
+
+**Boot A/B for the window** (same recipe as the running server, CONTINUATION §7; both legs need
+`--peer-ram-rows --prefill 8192 --tp-size 2` and the FP4 leg open — check the start line for
+`peer fp4 crossover` before grading). Add to the candidate only:
+
+    --exp peer_partial_merge=1
+
+Read per layer: `grep "peer partial merge"` (the return leg it priced and the fold's rate),
+`grep "peer layer time"` (both cards' terms and the critical side — the peer's `back` term should stop tracking the
+share), `grep "peer chunk"` (the peer's per-op breakdown, where the rows leg and the partial leg are separated),
+and the decode profile as usual. Then the quality gate: `basalt-bench --quality` for PPL/KLD against the Q8_0
+reference. The mode is OFF by default and the flag-off path is the unchanged one.
