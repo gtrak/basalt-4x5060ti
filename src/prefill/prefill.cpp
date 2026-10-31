@@ -660,6 +660,16 @@ static uint64_t peer_fold_bytes() { return 2 * sizeof(int32_t); }
 /// boot cannot fund the buffers for one mode and run the other.  Only ever active with the FP4 leg.
 static bool peer_partial_merge() { return core::exp_flag("peer_partial_merge", 0.0) != 0.0; }
 
+/// `--exp peer_charge_partial=1`: price the partial's buffers in the partner card's tier reserve on a boot that
+/// runs the row wire.  The partner's expert tier is what its card has free beyond `Prefill::peer_bytes`, so a flag
+/// that adds buffers to that walk moves the tier's placement by the width of its own buffers - and the quality
+/// gate's two arms are only comparable while they hold the SAME experts (docs/precision/moe-partial-merge.md).
+/// Charging the arm that does not fold what the arm that does allocates makes the two rooms equal in the currency
+/// `peer_bytes` already prices in, with no MiB figure to re-measure whenever the chunk changes.  Read by the sizing
+/// walk ALONE: `make_peer` still follows `peer_partial_merge`, so the boot over-reserves and runs the row wire,
+/// which is the ruled direction - it costs the partner a few tier slots, which the boot line reports.
+static bool peer_charge_partial() { return core::exp_flag("peer_charge_partial", 0.0) != 0.0; }
+
 struct PeerPrefill {
     core::PeerExperts* peer = nullptr;
     int dev = -1;
@@ -3573,7 +3583,11 @@ uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_r
     const int64_t Tp = std::max(pp.T_max, tf);
     pp.rows_bf16 = tf > 0 && rows_bf16;   // the same rules `make_peer` follows, so no wire ever outgrows the reserve
     pp.acts_planes = tf > 0 && acts_planes;
-    pp.partial_merge = tf > 0 && peer_partial_merge();
+    // The BUFFER SET the tier leaves room for, which `--exp peer_charge_partial` widens; the MODE is
+    // `peer_partial_merge`'s alone (`make_peer` reads it again for the fold, its events and the combine).  The
+    // ceiling above is deliberately the mode's, not the priced one: `Tp` has to be the figure `make_peer` will
+    // allocate against, or the reserve would be priced for a wider share than the walk ever takes.
+    pp.partial_merge = tf > 0 && (peer_partial_merge() || peer_charge_partial());
     // the same reserve rule for the band's ring: with the flag on and the share able to open, the tier leaves the
     // ring's slots free whether or not this run's placement ends up reading it - under-reserving would fail the
     // allocation, over-reserving only costs the partner a few tier slots the boot line reports
@@ -3581,6 +3595,20 @@ uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_r
     uint64_t sum = 0;
     auto count = [&](size_t bytes) -> void* { sum += (bytes + 255) & ~size_t(255); return nullptr; };
     peer_layout(pp, Tp, tf, mmq_plan(), count);
+    uint64_t charged = 0;
+    if (pp.partial_merge && !peer_partial_merge()) {
+        // charging a fold this boot does not run: the same walk without the partial's block, so the line below names
+        // the bytes the charge costs the partner's tier rather than a figure transcribed from the walk it just ran
+        uint64_t bare = 0;
+        auto bare_count = [&](size_t bytes) -> void* { bare += (bytes + 255) & ~size_t(255); return nullptr; };
+        PeerPrefill row_wire;
+        row_wire.T_max = pp.T_max;      // `partial_merge` stays false: this is the buffer set the rows need
+        row_wire.rows_bf16 = pp.rows_bf16;
+        row_wire.acts_planes = pp.acts_planes;
+        row_wire.ram_rows = pp.ram_rows;
+        peer_layout(row_wire, Tp, tf, mmq_plan(), bare_count);
+        charged = sum - bare;
+    }
     // the prompt-attention span the partner holds resident for its half of the attention (RUN 25).  Counted
     // through the SAME walk `make_peer` allocates with, so the reserve cannot disagree with the allocation;
     // null, or the gate closed, adds nothing and the partner's tier is what it was before the slice existed.
@@ -3602,6 +3630,10 @@ uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_r
             sum += (uint64_t) ((qsa->n_qsa_layers() * basalt::kernels::kTp2Samples * 4 + 255) & ~size_t(255));
         }
     }
+    if (charged != 0)
+        basalt::log::info("basalt prefill", "peer tier: --exp peer_charge_partial holds back %llu of the %llu MiB "
+                                            "priced for the partner's prompt buffers, unused",
+                          (unsigned long long) (charged >> 20), (unsigned long long) (sum >> 20));
     return sum;
 }
 
