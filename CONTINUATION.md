@@ -102,9 +102,11 @@ THE MORNING'S TRACK (kimi #9's, in order):
 2. **THE RECONCILIATION BOOT** — solo, pump vs unpiped, matched dl: three incompatible
    window figures exist (19.4 / 25.3-25.9 / 40.8-44.7); UNTIL IT RUNS, quote NO tp2
    decode-latency advantage (the gate on any topology sentence).
-3. **THE MISS-SERVING COUPLED LEVER** (the GPU-reach wait + the CPU pool as ONE unit):
+3. **SLOTS ARE FROZEN AT 2 — OWNER DIRECTIVE 10-31: "we're not changing slots."** The
+   slots 2->4 lever is STRUCK (do not re-propose, do not boot slot-count variants).
+4. **THE MISS-SERVING COUPLED LEVER**3. **THE MISS-SERVING COUPLED LEVER** (the GPU-reach wait + the CPU pool as ONE unit):
    L2-cover + adaptive boundary re-ranked up; then slots 2->4 (#3).
-4. Then re-state tp2 vs split with honest decode numbers; TP=4 shelved on measurement
+5. Then re-state tp2 vs split with honest decode numbers; TP=4 shelved on measurement
    (the banked positives: 42 us/round 4-rank coordination, the straggler refutation).
 
 ## 2b. THE DECODE CAMPAIGN (kimi #7, the current phase — supersedes §6's topology sequence)
