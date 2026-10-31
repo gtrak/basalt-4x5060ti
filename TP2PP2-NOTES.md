@@ -3099,3 +3099,68 @@ having no AVX-512 at all and has no dependency on any file here; `nvcc -c -genco
 on `moe_fp4.cu` clean; `prefill.cpp` syntax-clean; `tools/check_platform_boundary.sh` and
 `tools/check_stderr_logging.sh` ok; `tools/test_quality_gate.py` OK (31). `tools/test_quality_fixture.py` cannot
 run here — `tools/tokenizer.py` imports `regex`, which is not installed; it fails identically on a clean tree.
+
+## RUN 27 addendum — the room algebra: why `--base-args '--peer-reserve-mib 723'` changed nothing, and the knob that does
+
+**The re-gate pinning knob was the wrong knob.** `open_partner` (`src/program/generate.cpp`) sizes a tp2 partner
+card's expert tier as
+
+```
+room = free(partner) - ( vram_reserve_mib + split_pf_mib + kWindowMib + (pipe ? kPairMibLater : 0)
+                         + ceil(Prefill::peer_bytes(chunk, ...) / 1 MiB) )
+```
+
+That is `stage_room(pair_dev, /*later=*/true, peer_pf_mib)`. `o.peer_reserve_mib` — what `--peer-reserve-mib`
+sets — is **not in it**: it prices an EXPERT TIER (`peer_expert_room`, `open_peer`), and both are gated on
+`o.peer_device >= 1`, which a `--tp-size 2` boot never reaches (its log says `peer GPU 0.0 GiB (0%)`). So the
+reference boot at 723 filled 13.98 GiB exactly as it had at 600. `--vram-reserve-mib` IS in the formula but is
+shared with the stage's LEAD card, so raising it moves the lead's tier too and trades one confound for another.
+
+**The gap itself is legitimate, not a stale charge.** `peer_bytes` is one counting walk of `peer_layout`, and the
+partial merge's entry in it is additive:
+
+| term | bytes | at chunk 8192 |
+|---|---|---|
+| `part` (FP32 partial) | `Tp * N * 4` | 83,886,080 (80 MiB) |
+| `part16` (BF16 wire) | `Tp * N * 2` | 41,943,040 (40 MiB) |
+| `fold_tok/off/rel/w` | `~4 * G * 4`, `G = T_max` | 98,304 (0.09 MiB) |
+| **total** | | **125,927,424 = 120.09 MiB → 121 MiB of room** |
+
+Three independent checks agree with the boot line's 13.98 against 13.86 GiB: `Tp = max(T_max, t_fp4)` is 8192 in
+BOTH arms (`peer_fp4_ceiling` is 26,891 tokens off the fold and 213,072 with it, both far above the chunk that caps
+it, so no other term moves); the tier lost 5429 − 5384 = 45 pairs at 2.77 MiB a pair = 118.7 MiB; and the partner
+card's leftover free memory moved only 633 → 631 MiB, because 121 MiB less tier filled and 120 MiB more buffers were
+allocated. Nothing is REMOVED by the flag: the peer still computes its rows into the double-buffered `Dm_b` staging
+the fold reads (`dm16(b)`), so the row wire's buffers are charged in both arms.
+
+**The fix is a pricing knob, not a MiB figure.** `--exp peer_charge_partial=1` makes `peer_bytes` price the
+partial's buffers on an arm that does not fold. It is read in `peer_bytes` alone; `make_peer` still follows
+`peer_partial_merge` for the fold, its events and the combine, so the boot over-reserves and runs the row wire —
+the ruled direction, costing the partner a few tier slots the boot line reports, and the boot now prints what the
+charge holds back. The two arms' rooms then come out of one arithmetic, so the alignment does not rot when the
+chunk changes. With the key unset `peer_bytes` is what it was, byte for byte.
+
+**The gate's silent-pass weak spot is closed.** `placement_facts` returns `None` (absent file) rather than `{}`
+(present, uninformative), and `placement_mismatch` reports either as VOID — an arm whose tier cannot be read has
+not been shown to hold the same experts as any other, which is how the 94.41% got graded at all. `--verdict` now
+always prints a `tier` line, including the case where it read nothing. Because the tool's advice now names an
+`--exp` key, `--base-args`/`--gate-args` go through `arm_args`, which ADDS exp keys beside the operator's instead
+of replacing the first `--exp` (which would silently drop the operator's keys and add a second difference between
+the arms) and refuses a key the command line already carries, rather than letting the engine's last-one-wins pick.
+
+**The corrected re-gate** (both buckets; the only change to the recorded command is the reference arms' charge):
+
+```sh
+python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm emit  $COMMON --base-args '--exp peer_charge_partial=1'
+python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm check $COMMON --base-args '--exp peer_charge_partial=1'
+python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm gate  $COMMON --flag peer_partial_merge=1
+python3 tools/quality_gate.py --verdict $OUT
+```
+
+Expect the `tier` line to print 5384 held / 13.86 GiB room on all three arms; if it does not, the verdict names the
+card, the gap and the arm to charge, and the run stays VOID.
+
+**Checks run**: `tools/test_quality_gate.py` OK (35, was 31 — the missing-log cases and the exp-merging cases);
+`ctest -L cpu` 71/72 (the failure is `expert_multi_test`, this host having no AVX-512 at all, no dependency on any
+file here); `cmake --build build --target prefill` clean; `tools/check_platform_boundary.sh` and
+`tools/check_stderr_logging.sh` ok. No GPU, no boot, no server touched.
