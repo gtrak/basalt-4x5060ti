@@ -2837,6 +2837,21 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(20) **THE BAND IS DETERMINISTIC; THE RESIDENT FILL IS NOT — so the gate needs an ENGINE
+flag, not a boot flag.** `PeerRamShare::taken` is `k % 8 < num` in id order ("the choice
+never depends on the routing") — so the band SELECTION is already deterministic. The
+variance is upstream: `in_ram_band` reads `v.host_res` (which experts the LEAD's resident
+table holds), and the resident fill came out **28.81 GiB vs 28.89 GiB** between arms — 80
+MiB, matching the fold's buffer charge. That shifts host_res -> shifts which experts
+qualify -> 591 vs 703 band -> different sums. NOT fixable with a boot flag:
+`--resident-budget-gib 28` cannot even boot (cudaMalloc for the weight arena fails, 488
+MiB of 15,888 free) because the arena is allocated before the caches — the fill is
+memory-driven, not budget-driven. THE FIX IS AN ENGINE EXP: a flag that FIXES the band
+assignment itself (e.g. `--exp peer_band_pin=N` forcing `num` to a given eighth) so the
+gate's arms cannot differ in it regardless of the fill. Small, contained, and it makes
+the folding gate possible. THAT IS THE OWED WORK; the flag ships meanwhile on the
+evidence in (18)/(19).
+
 (19) **THE FOLDING GATE IS STILL OWED — a third placement confound, at BAND level.**
 The 8192 bucket on a serving-shaped boot (stream_all_min drops to 2560, so `routed chunks
 to 2559 tokens` — the fold floor IS reachable and the guard passed). The three arms ran
