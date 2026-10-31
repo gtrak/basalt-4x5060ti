@@ -719,10 +719,10 @@ static bool qsa_prepare_one(QsaPair& p, const WeightRef& w, const std::string& n
     // packed: equal figures mean the card still holds them, unequal ones mean something wrote over them between
     // here and the product.  Same function on both sides, so the comparison is the kernel's own window (`qsa_chain_bytes_hash`).
     uint32_t packed_hash = 0;
-    if (view.native_bytes % 4 == 0)
-        packed_hash = basalt::kernels::qsa_chain_bytes_hash(
-            (const uint32_t*) (packed.data() + view.codes_bytes + view.scales_bytes + view.offset_bytes),
-            (int64_t) (view.native_bytes / 4));
+    const size_t native_at = (size_t) view.codes_bytes + (size_t) view.scales_bytes + (size_t) view.offset_bytes;
+    if (native_at % 4 == 0 && view.native_bytes % 4 == 0)   // word-aligned both ways, or it is not walked wordwise
+        packed_hash = basalt::kernels::qsa_chain_bytes_hash((const uint32_t*) (packed.data() + native_at),
+                                                            (int64_t) (view.native_bytes / 4));
     // re-describe the view over the DEVICE copy: the sizes are the packer's, the pointers are the card's
     const uint8_t* base = (const uint8_t*) d;
     view.codes = view.codes_bytes ? base : nullptr;
