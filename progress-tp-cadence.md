@@ -150,3 +150,37 @@ Per point, the lines that matter:
 - `per-card cadence ms: CUDA0=... | max-of-4 M, spread S, cadence inflation I`
 - `PARITY ... max|d|=... -> PASS` — the reduce sums against the CPU reference
 - `NOTE the pair ran X ms worse than cover+wire added` — the SM-contention hypothesis, if it is real
+
+## WINDOW RESULTS (10-31, cards idle, server down; supervisor-run)
+
+The decisive points at the REAL ratios (the sweep defaults were unrepresentative —
+cover 2.5 ms/layer vs the engine's ~50; tokens 2048 vs 8192):
+
+**PREFILL GATE: FAILED.** partial-merge r=4 d=4 tokens=8192 cover=49.9ms/layer:
+wire 39.6 ms/layer, HIDDEN 42.7% (model 52.0), ceiling = cover/(cover+wire) = 56% —
+the 70% kill line is UNREACHABLE at this wire:cover ratio. The wire adds ~46% to the
+layer wall (72.6 vs 49.9 ms). Projection: the TP=4 lockstep ~73-100 ms/chunk effective
+vs the split's ~45 ms/chunk (32.6 s / 720 layer-chunks, 2-deep pipelined) — the split
+wins ~1.4-2x. The streaming (~27 ms/layer-card at TP=4) contends with the wire on the
+shared uplink (the owner's face-contention correction) — it cannot hide under it.
+
+**DECODE GATE: PASSED.** cover 0.085 ms/round: wire 42 us/round at 4 ranks, HIDDEN
+90.3% (SM) / 92.6% (copy-engine — within noise), exposed 4 us/round. The 3-peer
+straggler term: spread 0.000-0.006 ms, inflation 1.00x. TP=4's decode coordination
+would NOT inherently break the 19.4 ms windows — but decode alone cannot justify the
+build (tp2's decode is zero-wire; the TP=4 decode gain is second-order).
+
+**HYPOTHESES SETTLED:**
+- max-of-4 straggler: REFUTED (inflation 1.00x everywhere, spread <= 0.15 ms even
+  with tier blobs and at 8192)
+- SM-contention (the spin-wait starving the cover): REFUTED (co-scheduling NEGATIVE
+  — the overlap works; the earlier +326 ms was bug 2 x live contention, retracted)
+- row-ship: dead by capacity AND by hiding (2.8% at 4 ranks, 5.3 s wire/window)
+- the uniform-schedule bias: measured +86 points (the model's own number) — the
+  two-channel schedule is the honest one
+
+**VERDICT (supervisor, per TP4-SKETCH.md's four-gate rule): TP=4 STAYS SHELVED.**
+Gates (a) and (d) failed on measurement; the decode gate passed but is insufficient.
+The sglang prior was regime-mismatched (bandwidth-bound on independent links vs
+compute-bound on a shared pool). The morning's topology statement: the split for
+prefill, tp2 for decode/latency, TP=4 measured-and-shelved.
