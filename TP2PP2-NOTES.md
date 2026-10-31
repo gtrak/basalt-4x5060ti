@@ -2837,6 +2837,25 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(22) **WHY THE REBALANCE DID NOT HELP — THE MODEL HAS NO PEER-BLOB TERM.** The boot's
+pricing line prints the peer as `attention 0.0 + rows 46.0 + back 10.1 + acts 2.8` — **no
+blob term at all**. `peer_layer_time` charges `lead_blobs = (band - r) * slot / blob` and
+nothing for the partner. Physically a band expert's blob must be read by WHOEVER holds
+it, and both cards read the same RAM tier over the same host link (the `blob_mb_ms`
+constant is even commented "priced at the pair's link"), so moving a band expert moves
+the read, it does not delete it. THE ARITHMETIC AT THE MEASURED SHARE: 435 experts/layer
+x 2.55 MB = 1,109 MB of blob reads per layer, **264 ms at 4.2 MB/ms, unpriced** — against
+the 115 ms the lead actually saved. The model therefore reported a win that could not
+exist, and the wall agreed with the physics, not the model: **2,728 -> 2,066 t/s**.
+CONSEQUENCES: (a) `--exp peer_share_cap` is ANSWERED AND REJECTED, default-off, with this
+as the reason; (b) the price needs `peer_blobs = (r + held) * slot / blob` to be honest —
+a correctness fix for the placement model, not a perf change; (c) **the "peer idle" was
+never recoverable by rebalancing BAND experts**: what is recoverable is moving experts
+the partner already HOLDS (no read at all), and that is the `held` term, already at its
+limit. This also explains (2) from the other direction: the peer's idle is RAM-bound,
+not wire-bound, which is why both the wire-protection argument and this one point the
+same way.
+
 (21) **THE LIMITS, EXHAUSTED — what is left and what is not.** Every lever now has a
 measured verdict:
 - PREFILL: **2,700 t/s shipped** (partial-merge, +36%). The remaining headroom is the
