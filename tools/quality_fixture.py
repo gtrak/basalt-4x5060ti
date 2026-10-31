@@ -56,9 +56,18 @@ SPANS = [
     ("src/kernels/cpu/expert.cpp", 12000, 2600, "code"),
     ("serve/chat_template.jinja", 0, 2600, "template"),
     ("docs/precision/features.md", 2600, 2600, "prose"),
+    # Enough material to fill a chunk that actually FOLDS: the partial merge rides the partner's streamed leg,
+    # which only opens at `stream_all_min()` (6144 by default), so a bucket below that floor never exercises the
+    # path and the gate passes vacuously (`tools/quality_gate.py`'s STREAM_FLOOR refuses such a verdict).
+    ("src/program/generate.cpp", 100000, 12000, "code"),
+    ("src/prefill/prefill.cpp", 150000, 12000, "code"),
+    ("docs/precision/quality.md", 0, 12000, "prose"),
+    ("serve/handler.py", 10000, 12000, "code"),
 ]
 
-BUCKETS = [(512, 12), (1024, 6)]        # (n_ctx, chunks): ~3 GB of emitted base for both buckets
+# (n_ctx, chunks). The small buckets are the cheap differential; **8192 is the one that FOLDS** and is therefore the
+# bucket a partial-merge verdict must be taken on.
+BUCKETS = [(512, 12), (1024, 6), (8192, 4)]
 
 # A chunk is quoted source text, so it can quote a platform macro and trip the engine's own code-hygiene scan
 # (tools/check_platform_boundary.sh), which has no way to tell a call from a citation. The fixture is scored data,

@@ -2837,6 +2837,26 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(17) **THE DEEP-SCALE FIX LANDED AND THE FLAG IS STILL BROKEN — TWO BUGS, NOT ONE.**
+The worker's root cause is REAL and its fix is right: **ev_used was created AFTER
+cudaSetDevice(pp->dev)** — on the PARTNER's context — while it is recorded on the LEAD's
+stream (m.cs), so cudaEventRecord failed with cudaErrorInvalidResourceHandle and, being
+UNCHECKED, the error sat pending until the next check(), which was gr_write's. That is
+why a bad event read as a kernel error at a "threshold". THE THRESHOLD IS NOT THE RING:
+the fold runs only under peer_fp4 -> stream_all -> **T >= stream_all_min() (6144)**. The
+fix moves the creation before the SetDevice and wraps the partial path in PP_CALL.
+**AND THE GATE WAS VACUOUS**: it scores n_ctx/2+1 tokens, so the 512/1024 buckets never
+reach 6144 and the fold never ran — my "PASS" measured nothing. The worker added
+STREAM_FLOOR=6144 and --verdict now refuses a fold-off arm. I extended the fixture with
+**an 8192 bucket** — and it is STILL vacuous (n_ctx/2+1 = 4097 < 6144); a folding bucket
+needs **n_ctx >= 12288**. THE RE-BOOT WITH THE FIX: a 16,890-token prompt now gets
+**"corrupted double-linked list" + SIGABRT and the SAME gr_write: invalid resource
+handle** — so the wrong-context event was ONE bug, and at fold scale there is ALSO heap
+corruption in the fold path (a host-side write past a buffer: the fold tables / the
+return-leg packing / the per-group token list). The flag is DARK and must stay dark. NEXT:
+run the engine under compute-sanitizer (or -fsanitize=address on the host side) at a
+16,890-token prompt with the flag on; the corrupted list will name the buffer.
+
 (16) **THE PHYSICS OF DECODE (2.5M windows of real data; the fundamentals, not knobs).**
 Aggregated over 78 boots the terms are, as fractions of the window: **GPU compute 39%,
 GPU-reach wait 30%, per-layer host 14%, draft 17%**. The t/s ceiling by window size, if
