@@ -94,6 +94,22 @@ class Builder(unittest.TestCase):
         with self.assertRaises(SystemExit):
             QF.build(WordTokenizer(), root)
 
+    def test_a_span_that_quotes_platform_calls_is_refused(self):
+        """A chunk is quoted source text, and a span that reads like a platform call would trip the engine's
+        code-hygiene scan; the builder refuses it rather than asking the scan to look the other way."""
+        root = repo_from_spans()
+        saved = QF.SPANS
+        try:
+            QF.SPANS = [("platform_quoting.cpp", 0, 2600, "code")] + list(saved[1:])
+            (root / "platform_quoting.cpp").write_text(
+                "#include <sys/mman.h>\nvoid* p = mmap(0, 1, 0, 0, -1, 0);\n" + " pad ".join(map(str, range(9000))),
+                encoding="utf-8")
+            with self.assertRaises(SystemExit) as cm:
+                QF.build(WordTokenizer(), root)
+            self.assertIn("quotes platform calls", str(cm.exception))
+        finally:
+            QF.SPANS = saved
+
     def test_spans_too_short_to_fill_a_bucket_are_refused(self):
         with self.assertRaises(SystemExit):
             QF.build(WordTokenizer(), repo_with({s[0]: "far too short" for s in QF.SPANS}))

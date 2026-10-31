@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -40,7 +41,7 @@ SPANS = [
     ("docs/precision/index.md", 0, 2600, "prose"),
     ("README.md", 0, 2600, "prose"),
     ("README.md", 2600, 2600, "prose"),
-    ("CONTRIBUTING.md", 0, 2600, "prose"),
+    ("docs/running.md", 0, 2600, "prose"),
     ("src/core/layer.cpp", 44000, 2600, "code"),
     ("src/core/layer.cpp", 46600, 2600, "code"),
     ("src/core/expert_source.cpp", 24000, 2600, "code"),
@@ -49,7 +50,7 @@ SPANS = [
     ("serve/engine/process.py", 26000, 2600, "code"),
     ("tools/ppl_gate.py", 2600, 2600, "code"),
     ("serve/config.py", 6000, 2600, "code"),
-    ("docs/platforms.md", 0, 2600, "prose"),
+    ("docs/probe.md", 0, 2600, "prose"),
     ("docs/model-file.md", 2600, 2600, "prose"),
     ("src/prefill/prefill.cpp", 12000, 2600, "code"),
     ("src/kernels/cpu/expert.cpp", 12000, 2600, "code"),
@@ -58,6 +59,15 @@ SPANS = [
 ]
 
 BUCKETS = [(512, 12), (1024, 6)]        # (n_ctx, chunks): ~3 GB of emitted base for both buckets
+
+# A chunk is quoted source text, so it can quote a platform macro and trip the engine's own code-hygiene scan
+# (tools/check_platform_boundary.sh), which has no way to tell a call from a citation. The fixture is scored data,
+# but a span that reads like a platform call is also a poor probe of a language model's head, so the builder
+# refuses one rather than asking the scan to look the other way.
+PLATFORM_TEXT = re.compile(
+    r"_WIN32|_MSC_VER|__linux__|__unix__|windows\.h|sys/mman\.h|unistd\.h|sys/stat\.h|\bmmap\(|\bmunmap\("
+    r"|madvise|posix_fadvise|sched_setaffinity|pthread_|VirtualAlloc|CreateFileW?\b|__builtin_(ctz|ia32|cpu_supports)"
+    r"|__attribute__\(\(target|\bdlopen\(|\bwaitpid\(|\"/proc/|\"/sys/")
 
 
 def load_tokenizer(pack: str) -> Tokenizer:
@@ -81,7 +91,11 @@ def build(tk: Tokenizer, repo: pathlib.Path) -> list[dict]:
         p = repo / src
         if not p.is_file():
             raise SystemExit(f"{src}: named as a fixture source but not in the tree")
-        texts[(src, off)] = p.read_text(encoding="utf-8", errors="replace")[off:off + ln]
+        body = p.read_text(encoding="utf-8", errors="replace")[off:off + ln]
+        if PLATFORM_TEXT.search(body):
+            raise SystemExit(f"{src}@{off}: this span quotes platform calls; pick another span "
+                             "(tools/check_platform_boundary.sh counts a citation as a hit)")
+        texts[(src, off)] = body
 
     out, n = [], 0
     for bucket, want in BUCKETS:
