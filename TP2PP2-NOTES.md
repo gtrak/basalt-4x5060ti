@@ -2840,16 +2840,18 @@ rule); the l2warm_force regression stands (a 3x window-time change, not acceptan
 (16) **THE PHYSICS OF DECODE (2.5M windows of real data; the fundamentals, not knobs).**
 Aggregated over 78 boots the terms are, as fractions of the window: **GPU compute 39%,
 GPU-reach wait 30%, per-layer host 14%, draft 17%**. The t/s ceiling by window size, if
-every draft landed: T=1 44.5, T=4 100.4, T=5 105.5, T=8 **216.6** — the window is nearly
-FLAT in T (22 ms at T=1, 37 ms at T=8), so **tokens per window is the whole game** and
-the latency terms are secondary. THE PROOF CASE (boot 62, 11,181 windows): 7.79
-tokens/window, drafts accepted **224 of 224**, per-layer host **0.08 ms**, CPU **0.01 ms**,
-expert cache **100.0% (82,709/82,713)** -> **211 t/s at 36.9 ms/window**. THE REAL-TRAFFIC
+every draft landed: T=1 44.5, T=4 100.4, T=5 105.5, T=8 216.6 **[THE T=8/211 FIGURES ARE VOID — owner:
+they were DEGENERATE LOOPING, not a real workload; excluded below]**. THE VOID CASE (boot 62, 11,181 windows): 7.79 tok/win,
+drafts accepted 224 of 224, host 0.08 ms, cache 100% -> 211 t/s. **VOID: DEGENERATE
+LOOPING** (owner) — a collapse loop is perfectly predictable, so the drafter accepts
+everything; it is the RUN 23 collapse class, not a performance datum. Excluded. THE REAL-TRAFFIC
 CASE (boot 89, 54,886 windows): 2.92 tokens/window, host 5.93 ms, cache ~81% -> 75 t/s.
-**THE SAME WINDOW TIME, 2.7x THE THROUGHPUT.** So the engine's ceiling today is ~210 t/s
-and the gap to it is exactly two fundamentals: (a) THE MISS PATH — host 5.9 ms/window of
-CPU-expert work plus the wait it holds, present only when the tier misses; (b) ACCEPTANCE
-— 2.9 vs 7.8 tokens/window. Everything else (flags, swap budgets, prefetch knobs) trades
+**THE CORRECTED BASELINE (2,550,459 non-degenerate windows, all windows with host
+< 0.5 ms dropped as degenerate)**: t/s by window size is **97.1 (T=2.5), 98.9 (T=3),
+98.4 (T=3.5), 99.3 (T=4), 102.3 (T=4.5), 104.4 (T=5), 103.4 (T=5.5), 102.2 (T=6),
+102.0 (T=6.5)** — **a plateau at ~100-105 t/s from T=4 to T=6.5**. So the engine's real
+ceiling is **~105 t/s**, NOT 211, and acceptance past T~5 buys nothing (bigger windows
+cost proportionally more: 39.9 ms at T=4 -> 63.4 ms at T=6.5, host 5.9 -> 17.0 ms). Everything else (flags, swap budgets, prefetch knobs) trades
 one against the other and is workflow-sensitive noise. THE REAL LEVERS, in physics order:
 1) RAISE THE HIT RATE / cut the miss path's cost (the 6B-active working set vs 37 GiB of
 VRAM experts — a residency/placement question, not a knob); 2) RAISE ACCEPTANCE (drafter
