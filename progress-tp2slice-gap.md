@@ -18,7 +18,12 @@ Read it on the window whose line it appears in: `wall + gap` is the wall-clock p
 drumbeat the t/s number is the reciprocal of. `between + prep = gap` by construction. The line's four window terms
 (`run + commit + emit + draft`) and the gap term are disjoint: the window's end stamp is taken after the last host
 action of the window (the drafts and the tail commit) and before the line is written, so nothing is counted twice
-except the line's own stderr write, which lands in the *following* window's `between`.
+except the line's own stderr write, which lands in the *following* window's `between`. (`wall` is stamped a few
+statements after the window's end stamp, so the sum over-counts by that sliver: sub-microsecond except on the window
+that writes the line.)
+
+The aggregate `basalt batch` line's `ms/window` remains the window only — it is not the drumbeat. The drumbeat is
+that line's figure plus the gap term from this line.
 
 Two host-side `Clock::now()` calls per window (the entry and the end); the launch stamp already existed. No new
 synchronisation, no new allocation, no GPU-side work. The term is printed only where the profile line is: the pair
