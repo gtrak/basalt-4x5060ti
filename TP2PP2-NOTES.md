@@ -2948,3 +2948,50 @@ Read per layer: `grep "peer partial merge"` (the return leg it priced and the fo
 share), `grep "peer chunk"` (the peer's per-op breakdown, where the rows leg and the partial leg are separated),
 and the decode profile as usual. Then the quality gate: `basalt-bench --quality` for PPL/KLD against the Q8_0
 reference. The mode is OFF by default and the flag-off path is the unchanged one.
+
+## RUN 26 — the partial merge's failed gate: the debug pass (the fold is innocent; the landing buffer was not)
+
+The gate's numbers (`/tmp/qgate`): top-1 94.4% (512) / 95.7% (1024) against a >=99% bound, KLD mean 0.019, dlogp
+max 1.67-2.36 nats, and the `--peer-rows-fp32` control holding top-1 at 94.5% — so the divergence is not the BF16
+wire and a pure FP32 reassociation cannot move an argmax 1.67 nats. Read both paths end to end and built the term
+ledger for one token:
+
+- **flag off** — `moe_combine_kernel<PeerRows::kPlane>`: one chain over the token's K routings; the lead's own rows
+  read FP32 from `Dm`, the peer's read BF16 from the plane at `(r - peer_lo) * n_embd + d`; each term weighted by
+  `w[t*K + k]`; then the shared expert's term.
+- **flag on** — `moe_combine_partial_kernel`: the same chain with `PeerRows::kSkip` over `[peer_lo, peer_lo+peer_n)`
+  (excluded, they never crossed), then `moe_combine_out(routed, part, shared)`; the peer built `part` in
+  `peer_part_fold_kernel` from `peer_fold_tables`' list, weighting each row by the lead's own router weight.
+- the two row ranges are the same range: `peer_lo = rows_local`, `peer_n = rows_peer`, and the row space is
+  `[0,rows_local) lead | [rows_local, rows_local+rows_peer) peer | [rows_local+rows_peer, T*K) CPU`. Weights are
+  the same array (`m.w` on the lead, `m.w_host` read back beside `m.ids` under the same `cudaStreamSynchronize`).
+
+**Suspects (a)-(d) cleared on the CPU, with the evidence rather than by argument.** The parity test's `make_groups`
+was a hand-written transcription of `peer_fold_tables`, so the builder was never actually graded. It is now shared
+(`include/basalt/prefill/moe_fold.hpp`, `moe_fold_tables`) and called by both the engine and the test — the
+`moe_part.hpp` pattern, which is what makes the test a check of the engine. Under it: test 5 (fold list vs routing
+table) bitwise 0, and a new test 6 counting coverage over 4 block placements x 3 seeds, half of them a skewed
+routing with heavy hitters whose whole K straddles fold groups: `missed=0 doubled=0 malformed=0`. So no row is
+dropped or duplicated by the group/token list, the k-sort, or the clamp, and the weights travel with their own
+rows. The 50% clamp REASSIGNS to the lead rather than dropping (`on_peer[e]` stays 0, `rows_local` is recomputed).
+
+**The defect that survives that analysis is on the lead's side, and the CPU cannot see it.** The fold's accumulator
+`P.part` got careful ordering (`ev_back` before its zeroing, `ev_part`/`ev_fwd` around its copies), but the LEAD's
+landing buffer `m.peer_part` is ONE buffer for the whole 48-layer set and nothing ever waited for the lead's
+combine to finish READING it before the peer's next layer copied over it. The lead records the peer's
+next-layer activation event (`ev_act`) earlier in its own loop than the combine that consumes the partial, and the
+peer runs its groups on its own stream `ps`, so a later layer's copy can land while an earlier layer's combine is
+still queued. The lead then adds a DIFFERENT LAYER's partial to this layer's routed rows: a wrong term set with no
+bad shape, no NaN, no crash — routing- and timing-dependent, exactly the failure signature, and unaffected by
+whether the wire is BF16 or FP32. The rows path has the equivalent guard (`ev_dm`, "its last rows have left"); the
+partial path simply had no counterpart.
+
+**The fix**: `PeerPrefill::ev_used`, recorded on `m.cs` after `moe_combine_partial`, and waited on by the stream
+that writes `m.peer_part` (`P.s_out` on P2P, `P.res_in` on the relay) before each layer's copy when `part_live`.
+Layer 0 does not wait (the buffer has never been written). Flag-off code is untouched.
+
+**NOT YET MEASURED** — no boot was run (CPU-only pass, the server and the cards were never touched). The next
+window should re-run the gate; if top-1 does not reach the >=99% bound, the dump to build next is `P.fold.tok/off/
+rel/wt` plus `peer_lo/peer_n` for one (chunk, layer) beside a second flag-off `moe_combine` over the same inputs,
+keyed by token — the CPU ledger says where it CANNOT be, which narrows the dump to the copy ordering and the
+staging the fold reads (`P.dm16(b)` at the moment of the fold).

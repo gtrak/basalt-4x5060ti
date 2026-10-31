@@ -17,9 +17,11 @@
 //   5. the fold's compact per-token list and the routing table agree: summing a token's held rows from either
 //      comes out bitwise equal, which is what `peer_fold_tables` promises the fold kernel it feeds.
 //
-// The arithmetic under all five is `basalt/prefill/moe_part.hpp`, which the device kernels call, so this measures
-// the engine's chain rather than a transcription of it.
+// The arithmetic under all of this is `basalt/prefill/moe_part.hpp`, which the device kernels call, and the fold's
+// per-token list is built by `basalt/prefill/moe_fold.hpp`, which the prefill thread calls - so this measures the
+// engine's chain and the engine's own table builder, not transcriptions of them.
 #include "basalt/kernels/bf16_bits.hpp"
+#include "basalt/prefill/moe_fold.hpp"
 #include "basalt/prefill/moe_part.hpp"
 
 #include <algorithm>
@@ -37,6 +39,8 @@ using basalt::kernels::f32_from_bf16;
 using basalt::kernels::bf16_from_f32;
 using basalt::kernels::f32_from_bf16;
 using basalt::prefill::kMoeK;
+using basalt::prefill::moe_fold_tables;
+using basalt::prefill::MoeFoldTables;
 using basalt::prefill::PeerRows;
 
 constexpr int64_t T = 97;             // a chunk, deliberately not a round number
@@ -87,6 +91,57 @@ Layer make_layer(uint32_t seed) {
     return L;
 }
 
+/// A routing with heavy hitters: the last few tokens own a contiguous run of `K` rows each at the top of the row
+/// space, so all of a token's routings fall inside the peer's block and straddle fold groups - a run of K split
+/// across groups is the case that a per-group count can get wrong, and it is what a hot expert produces in a real
+/// chunk. Every other routing is placed as in `make_layer`.
+Layer make_layer_skewed(uint32_t seed, int heavy) {
+    Layer L;
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    L.slot.resize((size_t) ROWS);
+    L.inv.resize((size_t) ROWS);
+    std::vector<char> used((size_t) ROWS, 0);
+    for (int32_t h = 0; h < heavy; ++h) {   // heavy token h owns rows [ROWS-(h+1)K, ROWS-hK)
+        const int32_t t = (int32_t) T - 1 - h;
+        for (int k = 0; k < kMoeK; ++k) {
+            const int32_t r = (int32_t) ROWS - (h + 1) * kMoeK - (kMoeK - 1 - k);
+            L.slot[(size_t) (t * kMoeK + k)] = r;
+            used[(size_t) r] = 1;
+        }
+    }
+    std::vector<int32_t> free_rows;
+    for (int32_t r = 0; r < (int32_t) ROWS; ++r) if (!used[(size_t) r]) free_rows.push_back(r);
+    for (size_t i = free_rows.size(); i-- > 1;) {   // a Fisher-Yates over what is left
+        std::uniform_int_distribution<size_t> d(0, i);
+        std::swap(free_rows[i], free_rows[d(rng)]);
+    }
+    size_t next = 0;
+    for (int64_t i = 0; i < ROWS; ++i) {
+        const int32_t t = (int32_t) (i / kMoeK);
+        if (t >= (int32_t) T - heavy) continue;   // already placed
+        L.slot[(size_t) i] = free_rows[next++];
+    }
+    for (int64_t i = 0; i < ROWS; ++i) L.inv[(size_t) L.slot[(size_t) i]] = (int32_t) i;
+    L.rows.resize((size_t) ROWS * ND);
+    for (float& x : L.rows) x = u(rng);
+    L.w.assign((size_t) ROWS, 0.0f);
+    for (int64_t t = 0; t < T; ++t) {
+        float s = 0;
+        for (int k = 0; k < kMoeK; ++k) {
+            const float v = std::abs(u(rng)) + 0.01f;
+            L.w[(size_t) (t * kMoeK + k)] = v;
+            s += v;
+        }
+        for (int k = 0; k < kMoeK; ++k) L.w[(size_t) (t * kMoeK + k)] /= s;
+    }
+    L.shared.resize((size_t) T * ND);
+    for (float& x : L.shared) x = u(rng);
+    L.sg.resize((size_t) T);
+    for (float& x : L.sg) x = u(rng);
+    return L;
+}
+
 float shared_term(const Layer& L, int64_t t, int64_t d) {
     const float sig = 1.0f / (1.0f + std::exp(-L.sg[(size_t) t]));   // the combine's `sigm`, same shape
     return L.shared[(size_t) (t * ND + d)] * sig;
@@ -113,70 +168,63 @@ float combine_split(const Layer& L, int64_t t, int64_t d, int32_t lo, int32_t hi
     return basalt::prefill::moe_combine_out(s, part, shared_term(L, t, d));
 }
 
-/// One fold group in the shape `peer_fold_tables` builds for the fold kernel: `tok[e]` a token the group holds
-/// rows of, `off[e..e+1]` its run in `rel` (the row's ABSOLUTE id, where the kernel indexes its group's staging)
-/// and `wt` (its router weight), the run in k order.
+/// One fold group in the shape the ENGINE builds for the fold kernel: `tok[e]` a token the group holds rows of,
+/// `off[e..e+1]` its run in `rel` and `wt`, the run in k order. The list is built by `moe_fold_tables` - the very
+/// function `peer_fold_tables` calls - from the group's rows described the same way the prefill thread describes
+/// them, so a bug in the builder fails here instead of only on a card.
 struct Group {
-    int32_t lo, hi;
-    std::vector<int32_t> tok, off, rel;   // `rel`: the absolute row id, which is how the FP32 row space is read
+    int32_t lo, hi;      // the group's rows within the peer's block
+    int32_t base;        // the block's first row: the BF16 plane is numbered from it, the staging from 0
+    std::vector<int32_t> tok, off, rel;   // `rel`: the row's index WITHIN the group, how the group's staging reads it
     std::vector<float> wt;
-    std::vector<int32_t> blk;             // ... and the same rows numbered from the peer block's first row, which
-                                          // is how a BF16 plane indexes them: row `lo + i` sits at `i * n_embd`
 };
 
-size_t index_of(const std::vector<int32_t>& v, int32_t x) {
-    for (size_t i = 0; i < v.size(); ++i)
-        if (v[i] == x) return i;
-    return v.size();   // unreachable: a group only lists tokens it has a row of
-}
-
+/// Describe the group's rows as the prefill thread does - group-relative - and let the shared builder sort them.
+/// `k_of_row`/`w_of_row` stand in for `PeerPrefill::fold_k_h`/`w_row_h`, which the lead fills from its router.
 std::vector<Group> make_groups(const Layer& L, int32_t lo, int32_t hi) {
     std::vector<Group> gs;
+    MoeFoldTables scratch;
+    scratch.cnt.assign((size_t) T + 1, 0);
+    scratch.cur.assign((size_t) T + 1, 0);
     for (int32_t g0 = lo; g0 < hi; g0 += GROUP_ROWS) {
         Group g;
         g.lo = g0;
         g.hi = std::min(hi, g0 + GROUP_ROWS);
+        g.base = lo;
         const int32_t nr = g.hi - g.lo;
+        std::vector<int32_t> tok_of_row((size_t) nr), k_of_row((size_t) nr);
+        std::vector<float> w_of_row((size_t) nr);
         for (int32_t q = 0; q < nr; ++q) {
-            const int32_t t = L.inv[(size_t) (g.lo + q)] / kMoeK;
-            if (std::find(g.tok.begin(), g.tok.end(), t) == g.tok.end()) g.tok.push_back(t);
+            const int32_t i = L.inv[(size_t) (g.lo + q)];   // the routing that produced this row
+            tok_of_row[(size_t) q] = i / kMoeK;
+            k_of_row[(size_t) q] = i % kMoeK;
+            w_of_row[(size_t) q] = L.w[(size_t) i];
         }
-        g.off.assign(g.tok.size() + 1, 0);
-        for (int32_t q = 0; q < nr; ++q) g.off[index_of(g.tok, L.inv[(size_t) (g.lo + q)] / kMoeK) + 1]++;
-        for (size_t e = 0; e < g.tok.size(); ++e) g.off[e + 1] += g.off[e];
-        g.rel.assign((size_t) g.off.back(), 0);
-        g.wt.assign((size_t) g.off.back(), 0.0f);
-        std::vector<int32_t> cur(g.tok.size(), 0);
-        for (int32_t q = 0; q < nr; ++q) {   // the row order first, then a stable insertion sort into k order
-            const int32_t r = g.lo + q;
-            const size_t e = index_of(g.tok, L.inv[(size_t) r] / kMoeK);
-            const int32_t p = (int32_t) g.off[e] + cur[e]++;
-            g.rel[(size_t) p] = r;
-            g.wt[(size_t) p] = L.w[(size_t) L.inv[(size_t) r]];
-        }
-        for (size_t e = 0; e < g.tok.size(); ++e) {
-            int32_t* rel = g.rel.data() + g.off[e];
-            float* wt = g.wt.data() + g.off[e];
-            const int32_t n = g.off[e + 1] - g.off[e];
-            for (int32_t i = 1; i < n; ++i) {
-                const int32_t r = rel[i];
-                const float v = wt[i];
-                const int32_t key = L.inv[(size_t) r] % kMoeK;
-                int32_t j = i - 1;
-                while (j >= 0 && L.inv[(size_t) rel[j]] % kMoeK > key) {
-                    rel[j + 1] = rel[j];
-                    wt[j + 1] = wt[j];
-                    --j;
-                }
-                rel[j + 1] = r;
-                wt[j + 1] = v;
-            }
-        }
-        g.blk.resize(g.rel.size());
-        for (size_t i = 0; i < g.rel.size(); ++i) g.blk[i] = g.rel[i] - lo;
+        moe_fold_tables(scratch, tok_of_row.data(), k_of_row.data(), w_of_row.data(), nr);
+        g.tok = scratch.tok;
+        g.off = scratch.off;
+        g.rel = scratch.rel;
+        g.wt = scratch.wt;
         gs.push_back(std::move(g));
     }
     return gs;
+}
+
+/// The group's rows as the block's BF16 staging numbers them. The peer folds out of its OWN per-group staging,
+/// which starts at 0, but the returned rows land in the lead's block at `lo + q`, which is how the flag-off
+/// combine reads them back - so the plane this test builds is numbered from the block, and a folded row has to
+/// be named in the same numbering to be comparable.
+std::vector<int32_t> block_ids(const Group& g) {
+    std::vector<int32_t> ids(g.rel.size());
+    for (size_t i = 0; i < g.rel.size(); ++i) ids[i] = g.lo + g.rel[i] - g.base;
+    return ids;
+}
+
+/// The group's rows as the FP32 row space numbers them: absolute ids, which is how `rows` is indexed.
+std::vector<int32_t> absolute_ids(const Group& g) {
+    std::vector<int32_t> abs(g.rel.size());
+    for (size_t i = 0; i < g.rel.size(); ++i) abs[i] = g.lo + g.rel[i];
+    return abs;
 }
 
 /// The partner's fold, exactly as `peer_part_fold_kernel` runs it: one thread per (token, dimension) of a group,
@@ -191,7 +239,8 @@ std::vector<float> fold_partial(const Layer& L, const std::vector<Group>& gs, co
             for (int64_t d = 0; d < ND; ++d) {
                 float* cell = &part[(size_t) g.tok[e] * ND + d];
                 *cell = basalt::prefill::moe_fold_rows(*cell,
-                                                       plane ? g.blk.data() + g.off[e] : g.rel.data() + g.off[e],
+                                                       plane ? block_ids(g).data() + g.off[e]
+                                                             : absolute_ids(g).data() + g.off[e],
                                                        g.wt.data() + g.off[e], (int32_t) (g.off[e + 1] - g.off[e]),
                                                        plane, plane ? nullptr : L.rows.data(), ND, d);
             }
@@ -308,13 +357,12 @@ int main() {
                     for (size_t e2 = 0; e2 < g2.tok.size(); ++e2)
                         if (g2.tok[e2] == g.tok[e])
                             for (int32_t q = g2.off[e2]; q < g2.off[e2 + 1]; ++q) {
-                                rel.push_back(g2.rel[(size_t) q]);   // ... and k order within each
+                                rel.push_back(g2.rel[(size_t) q] + g2.lo);   // ... and k order within each
                                 wt.push_back(g2.wt[(size_t) q]);
                             }
                 for (int64_t d = 0; d < ND; ++d)
                     flat[(size_t) g.tok[e] * ND + d] = basalt::prefill::moe_fold_rows(
-                        0.0f, rel.data(), wt.data(), (int32_t) rel.size(), nullptr, L.rows.data(), ND, d);
-            }
+                        0.0f, rel.data(), wt.data(), (int32_t) rel.size(), nullptr, L.rows.data(), ND, d);            }
         const std::vector<float> grouped = fold_partial(L, gs, nullptr, false);
         int64_t differs = 0;
         for (size_t i = 0; i < flat.size(); ++i)
@@ -335,7 +383,7 @@ int main() {
                     float via_list = 0.0f, via_table = 0.0f;
                     for (int32_t q = g.off[e]; q < g.off[e + 1]; ++q)
                         via_list = basalt::prefill::moe_term(via_list, g.wt[(size_t) q],
-                                                             L.rows[(size_t) g.rel[(size_t) q] * ND + d]);
+                                                             L.rows[(size_t) (g.lo + g.rel[(size_t) q]) * ND + d]);
                     for (int k = 0; k < kMoeK; ++k) {
                         const int64_t i = t * kMoeK + k;
                         const int32_t r = L.slot[(size_t) i];
@@ -363,6 +411,41 @@ int main() {
         std::printf("   a packed partial round-trips: %lld of %d bf16 values changed\n", (long long) differs,
                     (int) checked);
         if (differs != 0) ++fails;
+    }
+
+    // 6. the fold list covers the block EXACTLY once, under the routings that stress it: a heavy hitter every
+    //    token routes to, one token whose whole K sits in one group, groups the routing leaves empty, and the
+    //    chunk's boundary tokens. A dropped row leaves the MoE sum silently short and a duplicated one silently
+    //    long, and neither shows as a bad shape - so this counts rows rather than comparing chains.
+    {
+        int rows_missed = 0, rows_doubled = 0, list_broken = 0;
+        // four placements of the peer's block: a third in, at the clamp, at the very end, and one row wide
+        const int32_t bases[] = {(int32_t) (ROWS / 3), (int32_t) (ROWS / 2), (int32_t) (ROWS - ROWS / 8),
+                                 (int32_t) (ROWS - 1)};
+        for (const int32_t b : bases) {
+            for (uint32_t seed = 0; seed < 3; ++seed) {
+                const Layer L = (seed & 1) ? make_layer_skewed(7000 + seed, 4) : make_layer(7000 + seed);
+                const std::vector<Group> g2 = make_groups(L, b, (int32_t) ROWS);
+                std::vector<int> seen((size_t) ROWS, 0);
+                for (const Group& g : g2) {
+                    if (g.off.empty() || g.off.back() != g.hi - g.lo) ++list_broken;   // the runs must tile the group
+                    for (size_t e = 0; e < g.tok.size(); ++e) {
+                        for (int32_t q = g.off[e]; q < g.off[e + 1]; ++q) {
+                            const int32_t r = g.lo + g.rel[(size_t) q];
+                            if (r < g.lo || r >= g.hi || L.inv[(size_t) r] / kMoeK != g.tok[e]) ++list_broken;
+                            ++seen[(size_t) r];
+                        }
+                    }
+                }
+                for (int32_t r = b; r < (int32_t) ROWS; ++r) {
+                    if (seen[(size_t) r] == 0) ++rows_missed;
+                    else if (seen[(size_t) r] > 1) ++rows_doubled;
+                }
+            }
+        }
+        std::printf("6. fold coverage over 4 block placements x 3 seeds (half skewed): missed=%d doubled=%d malformed=%d\n",
+                    rows_missed, rows_doubled, list_broken);
+        if (rows_missed || rows_doubled || list_broken) ++fails;
     }
 
     std::printf("%s\n", fails == 0 ? "moe_part_parity: OK" : "moe_part_parity: FAILED");

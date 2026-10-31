@@ -29,6 +29,7 @@
 #include "basalt/prefill/moe_fused.hpp"
 #include "basalt/prefill/moe_fused_iq.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
+#include "basalt/prefill/moe_fold.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/core/peer_experts.hpp"
@@ -706,10 +707,13 @@ struct PeerPrefill {
     cudaEvent_t ev_part = nullptr;  // peer: the partial is packed, its copy may start
     cudaEvent_t ev_back = nullptr;  // peer: the partial has left this card (the next layer's zeroing waits for it)
     cudaEvent_t ev_fwd = nullptr;   // primary: the relay's partial has reached the lead's landing buffer
+    cudaEvent_t ev_used = nullptr;  // lead: its combine has READ the layer's partial, so the next one may land
     bool part_live = false;         // a copy of `part`/`part16` may still be in flight
-    /// Host scratch of the fold tables, and the per-layer counting sort's token arrays (cleared as it goes).
-    std::vector<int32_t> fold_tok_h, fold_off_h, fold_rel_h, fold_cnt, fold_cur, fold_k_h;
-    std::vector<float> fold_w_h;
+    /// Host scratch of the fold tables, and the per-layer counting sort's token arrays (cleared as it goes). The
+    /// list itself and the sort's scratch are the shared builder's (`moe_fold.hpp`); only its `k` order and the
+    /// read-back weights stay here, because the lead's router is the only thing that can supply them.
+    MoeFoldTables fold;
+    std::vector<int32_t> fold_k_h;   // the routing index of each of this card's rows, in its row order
     std::vector<float> w_row_h;     // the router weight of each of this card's rows, in its row order
     /// Bytes the layer's partial costs on the link, for a chunk of `T` tokens.
     size_t part_bytes(int64_t T) const { return (size_t) T * peer_part_bytes(rows_bf16); }
@@ -964,6 +968,7 @@ struct PeerPrefill {
         for (cudaEvent_t e : ev_dm) if (e) cudaEventDestroy(e);
         if (ev_part) cudaEventDestroy(ev_part);
         if (ev_back) cudaEventDestroy(ev_back);
+        if (ev_used) cudaEventDestroy(ev_used);
         if (ev_hx_free) cudaEventDestroy(ev_hx_free);
         for (cudaEvent_t e : ev_d2h) if (e) cudaEventDestroy(e);
         if (s_out) cudaStreamDestroy(s_out);
@@ -3164,8 +3169,8 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
     }
     const int64_t Tp = std::max(pp->T_max, tf);   // the longest chunk the peer takes
     if (pp->partial_merge) {   // the fold's counting sort, sized for the widest chunk the leg takes
-        pp->fold_cnt.assign((size_t) Tp + 1, 0);
-        pp->fold_cur.assign((size_t) Tp + 1, 0);
+        pp->fold.cnt.assign((size_t) Tp + 1, 0);
+        pp->fold.cur.assign((size_t) Tp + 1, 0);
     }
     pp->cap_rows = std::max<int64_t>(1, std::min<int64_t>(cap_rows, Tp * K));
     const MmqPlan& mp = mmq_plan();
@@ -3252,7 +3257,8 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
     for (int b = 0; b < 2 && ok; ++b) ok = cudaEventCreateWithFlags(&pp->ev_dm[b], cudaEventDisableTiming) == cudaSuccess;
     if (pp->partial_merge)
         ok = ok && cudaEventCreateWithFlags(&pp->ev_part, cudaEventDisableTiming) == cudaSuccess &&
-             cudaEventCreateWithFlags(&pp->ev_back, cudaEventDisableTiming) == cudaSuccess;
+             cudaEventCreateWithFlags(&pp->ev_back, cudaEventDisableTiming) == cudaSuccess &&
+             cudaEventCreateWithFlags(&pp->ev_used, cudaEventDisableTiming) == cudaSuccess;
     if (relay) {
         ok = ok && cudaEventCreateWithFlags(&pp->ev_hx_free, cudaEventDisableTiming) == cudaSuccess;
         for (int b = 0; ok && b < PeerPrefill::kRes; ++b)
@@ -3387,43 +3393,11 @@ static bool peer_fp4_possible(bool streamed_share) {
 /// this card's block, and `src_h` the lead's token-of-row table (its rows begin at `rows_local`).
 static int32_t peer_fold_tables(PeerPrefill& P, const int32_t* src_h, int64_t rows_local, int64_t r0, int64_t nr) {
     if (nr <= 0) return 0;
-    const int32_t* tok = src_h + rows_local + r0;   // the token of each of the group's rows
-    P.fold_tok_h.clear();
-    for (int64_t q = 0; q < nr; ++q)
-        if (P.fold_cnt[(size_t) tok[q]]++ == 0) P.fold_tok_h.push_back(tok[q]);
-    const int32_t nt = (int32_t) P.fold_tok_h.size();
-    P.fold_off_h.resize((size_t) nt + 1);
-    P.fold_rel_h.resize((size_t) nr);
-    P.fold_w_h.resize((size_t) nr);
-    int32_t run = 0;
-    for (int32_t e = 0; e < nt; ++e) {
-        const int32_t t = P.fold_tok_h[(size_t) e];
-        P.fold_off_h[(size_t) e] = run;
-        P.fold_cur[(size_t) t] = run;
-        run += P.fold_cnt[(size_t) t];
-    }
-    P.fold_off_h[(size_t) nt] = run;
-    for (int64_t q = 0; q < nr; ++q) {
-        const int32_t p = P.fold_cur[(size_t) tok[q]]++;
-        P.fold_rel_h[(size_t) p] = (int32_t) q;              // the row's index in the group's staging
-        P.fold_w_h[(size_t) p] = P.w_row_h[(size_t) (r0 + q)];
-    }
-    for (int32_t e = 0; e < nt; ++e) {   // the run is one token's rows: at most K of them, so sort them by k
-        int32_t* rel = P.fold_rel_h.data() + P.fold_off_h[(size_t) e];
-        float* wt = P.fold_w_h.data() + P.fold_off_h[(size_t) e];
-        const int32_t n = P.fold_off_h[(size_t) e + 1] - P.fold_off_h[(size_t) e];
-        for (int32_t i = 1; i < n; ++i) {
-            const int32_t r = rel[i];
-            const float v = wt[i];
-            const int32_t key = P.fold_k_h[(size_t) (r0 + r)];
-            int32_t j = i - 1;
-            while (j >= 0 && P.fold_k_h[(size_t) (r0 + rel[j])] > key) { rel[j + 1] = rel[j]; wt[j + 1] = wt[j]; --j; }
-            rel[j + 1] = r;
-            wt[j + 1] = v;
-        }
-        P.fold_cnt[(size_t) P.fold_tok_h[(size_t) e]] = 0;   // clean for the next group
-    }
-    return nt;
+    // The group's rows, group-relative: whose token each is, which routing produced it, and what it is worth. The
+    // counting sort is shared with the CPU parity test (`moe_fold.hpp`), which is what makes that test a check of
+    // this path rather than of a transcription of it.
+    return moe_fold_tables(P.fold, src_h + rows_local + r0, P.fold_k_h.data() + r0,
+                           P.w_row_h.data() + r0, nr);
 }
 
 /// How many staging sets a pair's collective needs at this boot — the SAME figure that decides how many `o_proj`
@@ -5498,13 +5472,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     // a later group on the same stream, so no return event guards it.
                                     const int32_t nt = peer_fold_tables(P, src_h, rows_local, r0, nr);
                                     if (nt > 0) {
-                                        cudaMemcpyAsync(P.fold_tok, P.fold_tok_h.data(), (size_t) nt * 4,
+                                        cudaMemcpyAsync(P.fold_tok, P.fold.tok.data(), (size_t) nt * 4,
                                                         cudaMemcpyHostToDevice, ps);
-                                        cudaMemcpyAsync(P.fold_off, P.fold_off_h.data(), (size_t) (nt + 1) * 4,
+                                        cudaMemcpyAsync(P.fold_off, P.fold.off.data(), (size_t) (nt + 1) * 4,
                                                         cudaMemcpyHostToDevice, ps);
-                                        cudaMemcpyAsync(P.fold_rel, P.fold_rel_h.data(), (size_t) nr * 4,
+                                        cudaMemcpyAsync(P.fold_rel, P.fold.rel.data(), (size_t) nr * 4,
                                                         cudaMemcpyHostToDevice, ps);
-                                        cudaMemcpyAsync(P.fold_w, P.fold_w_h.data(), (size_t) nr * 4,
+                                        cudaMemcpyAsync(P.fold_w, P.fold.wt.data(), (size_t) nr * 4,
                                                         cudaMemcpyHostToDevice, ps);
                                         peer_part_fold(P.part, P.rows_bf16 ? P.dm16(b) : nullptr,
                                                        P.rows_bf16 ? nullptr : P.Dm_b[b], P.fold_tok, P.fold_off,
@@ -5554,13 +5528,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 m.tm.pmark(tl, ChunkTiming::kPRowsA, P.s_out);   // the partial's own span, not a group's
                                 const size_t bytes = P.part_bytes(T);
                                 const void* src = P.rows_bf16 ? (const void*) P.part16 : (const void*) P.part;
+                                // The lead has one landing buffer for the whole layer set, so this layer's copy may
+                                // not land until its combine has FINISHED READING the previous layer's. Without
+                                // this the peer, running ahead on its own stream, overwrites a partial the lead has
+                                // not summed yet and the lead adds a later layer's terms to this layer's rows - a
+                                // wrong sum with no bad shape, which is what the quality gate caught. The rows
+                                // path has the same guard for its staging in `ev_dm`.
                                 if (P.p2p) {
+                                    if (P.part_live) cudaStreamWaitEvent(P.s_out, P.ev_used, 0);
                                     cudaMemcpyPeerAsync(m.peer_part, prevd, src, P.dev, bytes, P.s_out);
                                 } else {
                                     if (P.part_live) cudaStreamWaitEvent(P.s_out, P.ev_fwd, 0);   // its last upload
                                     cudaMemcpyAsync(P.hpart, src, bytes, cudaMemcpyDeviceToHost, P.s_out);
                                     cudaEventRecord(P.ev_back, P.s_out);
                                     cudaSetDevice(prevd);
+                                    if (P.part_live) cudaStreamWaitEvent(P.res_in, P.ev_used, 0);   // the lead read it
                                     cudaStreamWaitEvent(P.res_in, P.ev_back, 0);
                                     cudaMemcpyAsync(m.peer_part, P.hpart, bytes, cudaMemcpyHostToDevice, P.res_in);
                                     cudaEventRecord(P.ev_fwd, P.res_in);
@@ -5985,6 +5967,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                             ppc->rows_bf16 ? nullptr : (const float*) m.peer_part,
                                             (int32_t) peer_lo, (int32_t) (peer_lo + peer_n),
                                             m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                        // the landing buffer is free for the peer's next layer only once this read has run
+                        cudaEventRecord(ppc->ev_used, m.cs);
                     } else if (back16 != nullptr)
                         moe_combine_rows16(m.Dm, back16, (int32_t) peer_lo, (int32_t) (peer_lo + peer_n),
                                            m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
