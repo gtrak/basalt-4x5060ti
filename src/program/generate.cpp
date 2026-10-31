@@ -8421,10 +8421,27 @@ int main(int argc, char** argv) {
             int32_t tok[basalt::kernels::kVerifyMaxT] = {};
             int64_t pos[basalt::kernels::kVerifyMaxT] = {};
             int64_t since = 0;              ///< tick it started waiting (fairness)
+            // the group's own timeline, as batch_step's window stamps: taken at its stage-0 launch and at its last
+            // host action.  Two host Clock::now() calls per group; no sync, no allocation, no device work.
+            Clock::time_point g_in = {};    ///< picked for stage 0; its pre-launch host work starts here
+            Clock::time_point g_w0 = {};    ///< its stage-0 launch
+            double g_gap = -1.0;            ///< the previous group's end to this launch; -1: nothing ended yet
+            double g_prep = 0.0;            ///< g_in to g_w0: this group's own pre-launch host work
+            double g_l2l = -1.0;            ///< the previous group's stage-0 launch to this one; -1: the first one
+            double g_wait0 = 0;             ///< the stages' cumulative GPU-reach wait at the launch
+            int g_slots = 0;                ///< active slots that launched with the group
         };
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
         std::vector<int> stage_group((size_t) n_pipe, -1);
         int64_t pipe_tick = 0, rr = 0;
+        // the pipelined gap's origins: the last group to finish, and the previous group's stage-0 launch
+        Clock::time_point pp_end = Clock::now(), pp_w0 = Clock::now();
+        bool pp_have_end = false, pp_have_w0 = false;
+        int64_t pp_group = 0;   // groups completed since the last idle reset, for the profile line's cadence
+        auto pmsd = [](Clock::time_point a0, Clock::time_point b0) {
+            return std::chrono::duration<double, std::milli>(b0 - a0).count();
+        };
+        auto pipe_wait_sum = [&] { double s = ver.ms_wait; for (auto& st : stages) s += st->ver.ms_wait; return s; };
         auto stage_verifier = [&](int k) -> basalt::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight) return true; return false; };
         auto group_active = [&](int gi) {
@@ -8438,6 +8455,9 @@ int main(int argc, char** argv) {
                 bt_start = Clock::now();
                 bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;
                 bt_miss0 = drive.d.multi_misses; bt_hits0 = drive.d.cache_hits; bt_pcie0 = drive.d.pcie_experts;
+                // the wall time before this group is the slots being idle, not a gap, and there is no previous
+                // launch to measure the drumbeat from
+                pp_have_end = false; pp_have_w0 = false;
             }
             for (int k = 0; k < n_pipe; ++k) {
                 const int gi = stage_group[(size_t) k];
@@ -8475,6 +8495,34 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 ++bt_windows;
                 G.inflight = false;
+                // the group's last host action is done, so from here the next group's launch is the gap.  Its own
+                // wall spans the waits for a free stage too: with n_pipe stages in flight the group's residency
+                // outlasts the launch-to-launch period, so wall + gap is not the drumbeat here - l2l is.
+                const Clock::time_point g_end = Clock::now();
+                pp_end = g_end; pp_have_end = true;
+                ++pp_group;
+                static const bool pp_every = basalt::core::exp_flag("decode_profile", 0) != 0;
+                if (pp_group % 32 == 0 || pp_every) {
+                    auto pf2 = [](double v) { char b[32]; std::snprintf(b, sizeof b, "%.1f", v); return std::string(b); };
+                    const double wall = pmsd(G.g_w0, g_end);
+                    std::string line = "group " + std::to_string(pp_group) + ", " + std::to_string(GS) + " slots (" +
+                                       std::to_string(G.g_slots) + " active), " + std::to_string(n_pipe) +
+                                       " stages pipelined: wall " + pf2(wall) + " ms;";
+                    if (G.g_gap >= 0.0) {   // the gap this group's launch ended, split by its entry stamp
+                        char gb[96];
+                        std::snprintf(gb, sizeof gb, " gap %.1f ms = between %.1f + prep %.1f;",
+                                      G.g_gap, G.g_gap - G.g_prep, G.g_prep);
+                        line += gb;
+                    }
+                    if (G.g_l2l >= 0.0) {   // the drumbeat, and the per-launch term: what l2l leaves over this
+                                            // group's own residency; negative while groups overlap on the stages
+                        char lb[128];
+                        std::snprintf(lb, sizeof lb, " l2l %.1f ms, per-launch %.1f ms;", G.g_l2l, G.g_l2l - wall);
+                        line += lb;
+                    }
+                    line += " GPU-reach wait " + pf2(pipe_wait_sum() - G.g_wait0) + " ms;";
+                    basalt::log::info("basalt decode profile", "%s", line.c_str());
+                }
             }
             // start waiting groups on free stages, the longest waiting first; a new step on stage 0 round-robin
             for (int k = n_pipe - 1; k >= 0; --k) {
@@ -8495,11 +8543,14 @@ int main(int argc, char** argv) {
                     if (pick < 0) continue;
                     rr = pick + 1;
                     PGroup& G = pg[(size_t) pick];
+                    G.g_in = Clock::now();   // the group's entry: what it spends to here is the caller's `between`
+                    G.g_slots = 0;
                     for (int t = 0; t < GS; ++t) {
                         BSlot& sl = bs[(size_t) (pick * GS + t)];
                         G.tok[t] = sl.active ? sl.x : 0;
                         G.pos[t] = sl.active ? sl.p : 0;
                         if (!sl.active) sl.cached = false;   // its pad row writes its state
+                        else ++G.g_slots;
                     }
                     G.inflight = true;
                     G.stage = 0;
@@ -8508,6 +8559,17 @@ int main(int argc, char** argv) {
                 }
                 PGroup& G = pg[(size_t) pick];
                 basalt::core::progress().busy.store(true);
+                if (k == 0) {
+                    // the group's first launch ends the gap the previous group's end opened, and starts the
+                    // launch-to-launch period the t/s number is the reciprocal of.  Read here, printed at the end.
+                    const Clock::time_point w0 = Clock::now();
+                    G.g_gap = pp_have_end ? pmsd(pp_end, w0) : -1.0;
+                    G.g_l2l = pp_have_w0 ? pmsd(pp_w0, w0) : -1.0;
+                    G.g_prep = pmsd(G.g_in, w0);
+                    G.g_w0 = w0;
+                    G.g_wait0 = pipe_wait_sum();
+                    pp_w0 = w0; pp_have_w0 = true;
+                }
                 if (!stage_verifier(k).batch_launch(pick * GS, GS, G.tok, G.pos, err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return false;
