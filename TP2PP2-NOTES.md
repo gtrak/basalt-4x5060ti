@@ -2753,6 +2753,25 @@ wire (50.4 ms at its current share) scales with its rows and cancels the 1.63 us
 row-rate gain. The tp2 prefill is placement-optimal GIVEN the wire; the idle is
 wire-protected, the same class as the slice's dependency-protected idle. The prefill
 levers that remain: full sharding only (whose 4-rank hiding just measured 42.7%).
+(11) **THE ALIGNMENT KNOB FOUND — AND THE CHARGE IMPLEMENTATION'S ONE-LINE BUG.** The
+algebra (verified against all three data points): the tier room = free(partner) −
+(vram_reserve + split_pf + kWindowMib + kPairMibLater + peer_bytes/1MiB) in
+open_partner/stage_room; --peer-reserve-mib is NOT in that formula (it prices a
+peer_device expert tier a tp2 boot never reaches — peer GPU 0.0 GiB). The 121 MiB gap =
+the partial's legitimate buffers (part FP32 80 MiB + part16 40 MiB + the fold tables),
+purely additive in peer_bytes. THE FIX (1e0cd287): --exp peer_charge_partial=1 prices
+the partial's buffers on the reference arms. THE RE-GATE: the flag reached the engines
+(verified) but the reference arms' fill STAYED 13.98 — THE CHARGE IMPLEMENTATION HAS A
+ONE-LINE BUG: `pp.partial_merge = tf > 0 && (peer_partial_merge() ||
+peer_charge_partial())` ORs the charge flag INTO THE STRUCT'S MODE — the reference arms
+got pp.partial_merge=true, changing their behavior/buffers instead of only widening the
+priced walk (the comment says "the MODE is peer_partial_merge's alone"; the code
+contradicts it). THE FIX (one line): pp.partial_merge = tf > 0 &&
+peer_partial_merge(); the charge only widens the peer_bytes pricing (a separate priced
+variable), never the mode. Then the three-arm window re-runs; expect 5,384/13.86 on all
+three arms, then the gate numbers finally measure the flag alone. The serving: restored
+flag-off.
+
 (10) **RUN 27 — THE 94.41% WAS VOID: THE ARMS HELD DIFFERENT EXPERT TIERS.** The gate
 hardening (4 commits: the placement-void verdict parsing each arm's engine.log tier
 facts; fp4::cut_pieces relocated inline so the CPU test drives the engine's REAL group
