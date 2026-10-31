@@ -2837,6 +2837,29 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(25) **THE NONDETERMINISM IS FOUND: THE CPU EXPERT POOL SPLITS ITS REDUCTION BY THE
+LIVE THREAD COUNT.** `ExpertPool::run_split_multi_native` (src/kernels/cpu/pool.cpp:469)
+computes `threads = active_.load()` and then
+    fused_gu_parts_ = lround(kTasksPerThread * threads * gu_share / nb);
+    fused_d_parts_  = lround(kTasksPerThread * threads * (1 - gu_share) / nb);
+and each part computes a ROW RANGE of the projection (`FF*part/pg .. FF*(part+1)/pg`,
+then `H*part/pd ..`), the parts' partial sums combining in task order (pool.cpp:268-292).
+So the PARTITION of the reduction is a function of how many pool threads were active -
+which depends on system load, not on the input. Different partition, different FP
+grouping, a ~1e-2..1e0 nat difference with mostly-stable argmax: exactly the measured
+signature (mean 4.1e-02, max 1.14 nats, top-1 98.95%, from ROW 1). It also explains why
+the 512-token bucket is perfectly reproducible (KLD 6.49e-07): a small chunk's CPU share
+is tiny or absent, so the pool's partition does not enter. AND WHY IT MATTERED SO MUCH
+TODAY: the CPU pool is also the DECODE miss path, so the same variable has been moving
+under every decode measurement and every gate verdict taken at a folding size.
+THE FIX (nobody has made it yet): make the partition a CONSTANT (a fixed parts-per-expert
+independent of `active_`, the way the GPU kernels fix their launch geometry), or make the
+partial-sum order fixed by construction (a per-part accumulator summed in part-index
+order). Either is small and CPU-only; the cost is some scheduling slack on a loaded box.
+**EVERY FOLDING-SCALE QUALITY VERDICT TAKEN SO FAR IS INVALID FOR THIS REASON**, and so
+is any cross-boot numeric comparison on decode. The 512-bucket result survives (it does
+not exercise the pool).
+
 (24) **THE NONDETERMINISM IS STRUCTURAL, NOT FP NOISE — the evidence, sharpened.**
 Comparing two 8192-bucket runs row by row: **per-row NLL mean |delta| 4.1e-02 nats, MAX
 1.14 nats, 3,671 of 8,190 rows apart by >0.01**, while top-1 still agrees 98.95%; the
