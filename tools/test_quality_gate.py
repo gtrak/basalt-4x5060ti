@@ -170,6 +170,114 @@ class Fixture(unittest.TestCase):
         self.assertTrue(all(c >= 4 for c in buckets.values()), "a bucket with a couple of chunks grades nothing")
 
 
+class Placement(unittest.TestCase):
+    """The arms must run on one placement. `--exp peer_partial_merge=1` is read inside `Prefill::peer_bytes`, which
+    sizes the reserve the partner's expert tier is charged, so a flag-on boot fills the partner's tier into a
+    smaller room and holds fewer ranked pairs - and which card computes a row decides whether it crosses as BF16
+    bits or stays FP32. The gate must refuse that comparison rather than grade it."""
+
+    BOOT = {"same": [
+        "basalt generate: tp2: CUDA1 holds 5429 of the 12288 ranked pairs of its stage's layers "
+        "(13.98 GiB of 13.98 GiB room); its lead card holds 1358\n",
+        "basalt prefill: peer fp4 crossover 8192 tokens: 621 MiB (5429 experts held, 584 band); "
+        "RAM rows on, 1/8 of 4583 band experts of layers 24-48\n",
+        "basalt generate: experts live in VRAM 37.3 GiB (59%), RAM 26.0 GiB (41%)\n",
+    ], "moved": [
+        "basalt generate: tp2: CUDA1 holds 5384 of the 12288 ranked pairs of its stage's layers "
+        "(13.86 GiB of 13.86 GiB room); its lead card holds 1358\n",
+        "basalt prefill: peer fp4 crossover 8192 tokens: 154 MiB (5384 experts held, 591 band); "
+        "RAM rows on, 1/8 of 4628 band experts of layers 24-48\n",
+        "basalt generate: experts live in VRAM 37.1 GiB (59%), RAM 26.2 GiB (41%)\n",
+    ]}
+
+    def arms(self, root: pathlib.Path, gate_lines):
+        self.good(root)
+        for arm, lines in (("emit", self.BOOT["same"]), ("check", self.BOOT["same"]), ("gate", gate_lines)):
+            d = root / arm
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "engine.log").write_text("".join(lines), encoding="utf-8")
+
+    def good(self, root):
+        write_rows(root / "check" / "rows.tsv", 40, kld=0.00007, same_top1=100.0)
+        write_rows(root / "gate" / "rows.tsv", 40, kld=0.0002, same_top1=99.5)
+
+    def test_facts_are_read_from_the_boot_its_own_log(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = pathlib.Path(d) / "engine.log"
+            log.write_text("".join(self.BOOT["same"]), encoding="utf-8")
+            f = QG.placement_facts(log)
+            self.assertEqual(f["partner held"], "(5429 experts held, 584 band)")
+            self.assertIn("CUDA1 holds 5429", f["partner tier"])
+            self.assertEqual(QG.placement_facts(pathlib.Path(d) / "absent.log"), {})
+
+    def test_identical_placements_do_not_void_the_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            self.arms(root, self.BOOT["same"])
+            self.assertEqual(QG.placement_mismatch(root), [])
+            self.assertEqual(QG.verdict(root), 0)
+
+    def test_a_moved_tier_voids_the_run_however_good_the_numbers_are(self):
+        """The numbers the gate arm printed were measured on a different tier, so a PASS would be an artefact."""
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            self.arms(root, self.BOOT["moved"])
+            bad = QG.placement_mismatch(root)
+            self.assertTrue(bad, "5429 held against 5384 must be caught")
+            self.assertIn("5384 experts held", "\n".join(bad))
+            self.assertEqual(QG.verdict(root), 1)
+
+    def test_the_refusal_names_the_reserve_that_pins_the_placement(self):
+        """13.98 GiB against 13.86 GiB is ~123 MiB of partner VRAM: the verdict must hand the operator the figure
+        and the arm to charge it on, or the re-gate is a guess."""
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            self.arms(root, self.BOOT["moved"])
+            bad = "\n".join(QG.placement_mismatch(root))
+            self.assertIn("--base-args", bad)
+            self.assertIn("--peer-reserve-mib", bad)
+            self.assertIn("123 MiB", bad)
+
+    def test_the_refusal_attributes_each_room_to_the_right_arm(self):
+        """The tighter card belongs to whichever arm runs the flag that costs it bytes. Naming the two rooms
+        against the wrong arms would send the operator to raise the reserve on the wrong side."""
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            self.arms(root, self.BOOT["moved"])          # the gate arm holds the tighter tier
+            bad = "\n".join(QG.placement_mismatch(root))
+            self.assertIn("13.86 GiB on the gate arm", bad)
+            self.assertIn("13.98 GiB on the check arm", bad)
+            self.assertIn("reference (emit, check)", bad)
+            # the arm being charged must be shrunk INTO the tighter room, not left in its own wider one
+            self.assertIn("fill them into 13.86 GiB", bad)
+
+    def test_a_flag_that_frees_room_points_at_the_gate_arm(self):
+        """The mirror image: when the tested flag leaves the GATE arm the wider card, the reference arms are
+        already right and it is the gate arm that must be charged."""
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            self.arms(root, self.BOOT["same"])           # gate into 13.98 ...
+            (root / "check" / "engine.log").write_text("".join(self.BOOT["moved"]), encoding="utf-8")  # ... check 13.86
+            bad = "\n".join(QG.placement_mismatch(root))
+            self.assertIn("--gate-args", bad)
+            self.assertNotIn("--base-args", bad)
+            self.assertIn("123 MiB", bad)
+            self.assertIn("fill them into 13.86 GiB", bad)
+
+    def test_the_reference_arm_moving_also_voids(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            self.arms(root, self.BOOT["same"])
+            (root / "emit" / "engine.log").write_text("".join(self.BOOT["moved"]), encoding="utf-8")
+            self.assertTrue(any("emit arm" in m for m in QG.placement_mismatch(root)))
+
+    def test_a_run_with_no_logs_says_nothing_rather_than_crashing(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            self.good(root)          # rows but no engine.log: an old run directory
+            self.assertEqual(QG.placement_mismatch(root), [])
+
+
 class ArgHandling(unittest.TestCase):
     def test_set_args_replaces_and_appends(self):
         base = ["--model", "m", "--spec", "8", "--gpu", "0,1"]
@@ -180,7 +288,8 @@ class ArgHandling(unittest.TestCase):
     def _arm(self, args, bucket=512, arm="check"):
         """Drive run_arm as far as the point where it would start the engine. Returns (args_it_settled_on,
         exit_message): the second is None when it got that far, or the SystemExit text when it refused first."""
-        ns = argparse.Namespace(arm=arm, t=3, progress=0, engine_bin="/nonexistent/basalt", flag="peer_partial_merge=1")
+        ns = argparse.Namespace(arm=arm, t=3, progress=0, engine_bin="/nonexistent/basalt",
+                                flag="peer_partial_merge=1", gate_args="", base_args="")
         seen = {}
         real_boot = QG.boot
 
@@ -243,6 +352,34 @@ class ArgHandling(unittest.TestCase):
             got, msg = self._arm(["--model", "m"], arm=arm)
             self.assertIsNone(msg)
             self.assertNotIn("peer_partial_merge", " ".join(got))
+
+    def test_the_reference_arms_are_charged_the_bytes_the_flag_costs(self):
+        """The partial's buffers live on the partner card, so the gate arm fills its expert tier into a narrower
+        room and holds fewer experts - which changes which rows cross as BF16. `--base-args` charges the reference
+        arms the same bytes; it must reach the engine on emit and check and not on the gate arm."""
+        for arm, wants in (("check", True), ("emit", True), ("gate", False)):
+            with self.subTest(arm=arm):
+                ns = argparse.Namespace(arm=arm, t=3, progress=0, engine_bin="/nonexistent/basalt",
+                                        flag="peer_partial_merge=1", gate_args="", base_args="--peer-reserve-mib 723")
+                got = {}
+                real_boot = QG.boot
+                QG.boot = lambda b, a_, log: (got.setdefault("args", a_), (_ for _ in ()).throw(SystemExit(0)))[0]
+                try:
+                    with tempfile.TemporaryDirectory() as d:
+                        base = pathlib.Path(d) / f"base-{512}.kld"
+                        QG.write_base(base, chunks(1, 512), 512, N_VOCAB)
+                        try:
+                            QG.run_arm(ns, 512, chunks(1, 512), 512, N_VOCAB, base,
+                                       pathlib.Path(d) / arm, ["--model", "m"])
+                        except SystemExit as e:
+                            self.assertEqual(e.code, 0)
+                finally:
+                    QG.boot = real_boot
+                where = got["args"].index("--peer-reserve-mib") + 1 if "--peer-reserve-mib" in got["args"] else None
+                if wants:
+                    self.assertEqual(got["args"][where], "723", f"{arm} must carry the pinned reserve")
+                else:
+                    self.assertIsNone(where, f"{arm} must not carry it")
 
     def test_unknown_flags_reach_the_engine_and_known_ones_are_replaced(self):
         """The docs promise that flags the tool does not know go to the engine, and an engine flag given here

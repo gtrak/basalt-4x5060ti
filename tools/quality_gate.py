@@ -10,7 +10,11 @@ as a llama.cpp `_logits_` base, and three runs are taken against it:
     gate   the arm under test (`--flag`), reading the same base: KLD / same-top-1 / dlogp are the verdict
 
 Both arms score the SAME committed token ids through the SAME `ppl=` path, so the only difference between them is
-the flag: nothing diverges by generation, which would compare two different sequences and mean nothing.
+the flag: nothing diverges by generation, which would compare two different sequences and mean nothing. That
+premise is checked, not assumed: `--verdict` reads each boot's own log and VOIDs the run when the two arms placed
+the experts differently, because which card computes a row decides whether it crosses as BF16 bits or stays FP32.
+A flag that costs the partner card VRAM - which `--exp peer_partial_merge=1` does, since `Prefill::peer_bytes`
+reads it - is paid for on the *reference* arms with `--base-args`, and the verdict prints the figure that pins it.
 
 The engine is started as a child process and driven over its stdin, the way tools/ppl_gate.py drives it: a
 `ppl=K ppl_t=T` request is an engine protocol key, not part of the server's HTTP API. This tool never connects to
@@ -28,6 +32,7 @@ import argparse
 import json
 import math
 import pathlib
+import re
 import struct
 import subprocess
 import sys
@@ -50,6 +55,82 @@ BOUND_SAME_TOP1 = 99.0      # percent, of scored rows whose top-1 matches the re
 BOUND_DLOGP_MAX = 0.05      # nats: the base's own top-1 must not fall this far under the tested arm's
 SELF_CHECK_KLD_MEAN = 0.001  # above this, the emitter and the reader disagree and the run is VOID
 SELF_CHECK_SAME_TOP1 = 100.0  # below this, likewise
+
+# The placement the two arms must agree on.  The gate's premise is that the arms differ by one word; a word that
+# also moves the expert tier moves WHICH ROWS CROSS AS BF16 (a row the partner computes crosses as BF16 bits, the
+# same row the lead computes stays FP32), and then the arms are not measuring one change.  `--exp
+# peer_partial_merge=1` does exactly that: it is read inside `Prefill::peer_bytes`, which sizes the reserve the
+# partner's expert tier is charged, so the flag-on boot holds fewer ranked pairs on the partner card.  These are
+# the boot's own facts about where the experts ended up; the verdict refuses the run when the arms disagree.
+# (docs/precision/moe-partial-merge.md.)
+PLACEMENT_PATTERNS = [
+    ("partner tier", re.compile(r"tp2: CUDA\d+ holds \d+ of the \d+ ranked pairs of its stage's layers "
+                                r"\([\d.]+ GiB of [\d.]+ GiB room\); its lead card holds \d+")),
+    ("expert tiers", re.compile(r"experts live in .*")),
+    ("partner held", re.compile(r"\(\d+ experts held, \d+ band\)")),
+    ("ram band", re.compile(r"\d+/\d+ of \d+ band experts of layers \d+-\d+")),
+]
+# The room the partner's tier was filled into, from the same line: the figure an operator adjusts
+# `--peer-reserve-mib` to bring back into line.
+PARTNER_ROOM = re.compile(r"tp2: CUDA(\d+) holds (\d+) of the \d+ ranked pairs of its stage's layers "
+                          r"\([\d.]+ GiB of ([\d.]+) GiB room\)")
+
+
+def placement_facts(log: pathlib.Path) -> dict:
+    """What the boot said about where the experts landed.  Parsed from the arm's own engine log, so the verdict
+    compares what the engine decided rather than what the command line asked for."""
+    if not log.is_file():
+        return {}
+    text = log.read_text(encoding="utf-8", errors="replace")
+    facts = {}
+    for name, pat in PLACEMENT_PATTERNS:
+        hits = pat.findall(text)
+        for i, hit in enumerate(hits):
+            facts[f"{name} {i}" if len(hits) > 1 else name] = hit if isinstance(hit, str) else hit[0]
+    return facts
+
+
+def placement_mismatch(out: pathlib.Path) -> list:
+    """Why the arms did not run the same experiment, or empty when they did.  A moved placement voids the run the
+    way the self-check does: every number the gate arm then printed was measured on a different tier."""
+    seen = {arm: placement_facts(out / arm / "engine.log") for arm in ("emit", "check", "gate")}
+    if not seen["check"] or not seen["gate"]:
+        return []   # an old run directory with no logs to compare: nothing to say, and nothing to trust either
+    bad = []
+    reference = seen["check"]
+    for arm in ("emit", "gate"):
+        for key in sorted(set(reference) | set(seen[arm])):
+            a, b = reference.get(key), seen[arm].get(key)
+            if a == b:
+                continue
+            bad.append(f"the {arm} arm placed the experts differently from the check arm on {key}:\n"
+                       f"        check: {a}\n        {arm}:  {b}")
+    if bad:
+        rooms = {}
+        for arm in ("check", "gate"):
+            log = out / arm / "engine.log"
+            if log.is_file():
+                rooms[arm] = {c: float(r) for c, _, r in PARTNER_ROOM.findall(log.read_text(encoding="utf-8",
+                                                                                              errors="replace"))}
+        for card in sorted(set(rooms.get("check", {})) | set(rooms.get("gate", {}))):
+            r_chk, r_gt = rooms.get("check", {}).get(card), rooms.get("gate", {}).get(card)
+            if r_chk is None or r_gt is None or r_chk == r_gt:
+                continue
+            gap_mib = round(abs(r_chk - r_gt) * 1024)
+            # The arm that ends up with the SMALLER room is the one whose flag costs the card bytes, so the fix is
+            # to charge the OTHER arm those bytes - through `--base-args` for the reference arms, or `--gate-args`
+            # for the gate arm - and the arm being charged must fill into the TIGHTER room, the one the first arm
+            # already reached, not into its own wider one.
+            if r_gt < r_chk:
+                arm, flag, room = "reference (emit, check)", "--base-args", r_gt
+            else:
+                arm, flag, room = "gate", "--gate-args", r_chk
+            bad.append(f"the partner card CUDA{card}'s expert tier was filled into {r_gt:.2f} GiB on the gate arm "
+                       f"and {r_chk:.2f} GiB on the check arm: the {arm} arms have {gap_mib} MiB more room than the "
+                       f"other, so they hold different experts - re-run them with {flag} "
+                       f"'--peer-reserve-mib <N>' with N raised by about {gap_mib} MiB to fill them into "
+                       f"{room:.2f} GiB like the arm that runs the flag")
+    return bad
 
 
 def read_fixture(path: pathlib.Path, bucket: int) -> list[dict]:
@@ -195,6 +276,17 @@ def run_arm(a, bucket: int, chunks: list[dict], n_ctx: int, n_vocab: int, base: 
             if w == "--exp" and i + 1 < len(args) and any(e.split("=", 1)[0] == key for e in args[i + 1].split(",")):
                 sys.exit(f"--exp already carries {key} ({args[i + 1]!r}); drop it, or the gate arm cannot own that flag")
         args += ["--exp", a.flag]
+    if a.arm == "gate" and a.gate_args:
+        # Engine flags for this arm alone: the mirror image of `--base-args`, for a tested flag that FREES room on
+        # a card and so leaves the gate arm filling its expert tier into a wider room than the reference arms.
+        args = set_args(args, a.gate_args.split())
+    if a.arm != "gate" and a.base_args:
+        # A flag that costs the partner card VRAM on the arm that runs it (the partial's buffers, for
+        # `--exp peer_partial_merge=1`) shrinks the room that arm fills its expert tier into, so the tier holds
+        # fewer ranked pairs - and which card holds an expert decides whether its rows cross as BF16 bits or stay
+        # FP32. The reference arms must be charged the same bytes, or the two arms place different experts and the
+        # gate grades a placement change. `--verdict` measures the gap and prints the figure to give here.
+        args = set_args(args, a.base_args.split())
     if a.arm == "emit":
         if base.exists():
             base.unlink()
@@ -234,6 +326,9 @@ def verdict(out: pathlib.Path) -> int:
             print(f"FAIL  no rows for the {arm} arm ({out / arm / 'rows.tsv'}); run that arm first")
             return 1
     chk, gt = s["check"], s["gate"]
+    facts = placement_facts(out / "check" / "engine.log")
+    if facts:
+        print("tier  " + "; ".join(facts[k] for k in sorted(facts) if k.startswith(("partner held", "expert tiers"))))
     if s["emit"] is not None:
         print(f"emit  {s['emit']['rows']} rows, PPL {s['emit']['PPL']:.4f} (the reference arm's own score)")
     print(f"check {chk['rows']} rows, KLD mean {chk['KLD mean']:.6f}, same top-1 {chk['same top-1']:.2f}%  "
@@ -244,6 +339,10 @@ def verdict(out: pathlib.Path) -> int:
           f"PPL {gt['PPL']:.4f} against the reference {chk['PPL']:.4f}")
 
     fails = []
+    moved = placement_mismatch(out)
+    if moved:
+        fails.append("VOID: the arms did not place the experts the same way, so the gate arm measured a different "
+                     "tier from the reference\n      " + "\n      ".join(moved))
     if chk["KLD mean"] > SELF_CHECK_KLD_MEAN:
         fails.append(f"VOID: the self-check arm scored KLD mean {chk['KLD mean']:.6f} > {SELF_CHECK_KLD_MEAN}; "
                      "the emitter and the reader disagree, so no conclusion can be drawn from this run")
@@ -275,6 +374,12 @@ def main() -> int:
     ap.add_argument("--arm", choices=("emit", "check", "gate"), help="which arm to run")
     ap.add_argument("--flag", default="peer_partial_merge=1",
                     help="the --exp flag the gate arm turns on (default: the partial merge)")
+    ap.add_argument("--gate-args", default="",
+                    help="engine flags given to the gate arm only, as one quoted string")
+    ap.add_argument("--base-args", default="",
+                    help="engine flags given to the emit and check arms only, as one quoted string; use it to "
+                         "charge the reference arms the bytes the tested flag costs a card, so both arms fill "
+                         "the partner's expert tier into the same room (--verdict prints the figure)")
     ap.add_argument("--t", type=int, default=3, help="tokens per verify window (default 3)")
     ap.add_argument("--chunks", type=int, default=0, help="only the first N chunks of the bucket (0: all)")
     ap.add_argument("--progress", type=int, default=4, help="a progress line every N chunks (0: none)")
@@ -301,6 +406,8 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     (out / "args.json").write_text(json.dumps({"arm": a.arm, "bucket": n_ctx, "t": a.t, "chunks": len(chunks),
                                               "flag": a.flag if a.arm == "gate" else None,
+                                              "gate_args": a.gate_args if a.arm == "gate" else None,
+                                              "base_args": a.base_args if a.arm != "gate" else None,
                                               "engine_args": a.engine_args}, indent=1) + "\n", encoding="utf-8")
     base = pathlib.Path(a.out) / f"base-{a.bucket}.kld"
     args = ["--model", str(pathlib.Path(a.pack).resolve()), "--spec", "8",
