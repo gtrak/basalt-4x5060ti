@@ -7569,6 +7569,12 @@ int main(int argc, char** argv) {
         // the window's phase line: the last window's draft and commit times and the chain's GPU-reach wait, for the deltas
         double wp_draft0 = 0, wp_commit0 = 0, wp_wait0 = 0;
         int64_t wp_win = 0;
+        // the gap the window's own stamps cannot see: its draft end to the NEXT window's graph launch (the caller's
+        // bookkeeping, the drafter's ingest, the re-launch).  Two stamps, both host-side: the window's entry and its
+        // draft end.  The line reports the gap that preceded its own window, so it reads with that window's wall.
+        Clock::time_point wp_end = Clock::now();
+        bool wp_have_end = false;   // no gap until a window has ended once (and not after the slots go idle)
+        double wp_gap = -1.0, wp_prep = 0.0;   // the gap into the current window, read at its launch, printed at its end
         int64_t bt_slotwin = 0, bt_dr_off = 0, bt_dr_acc = 0;
         std::vector<std::pair<std::vector<int32_t>, uint64_t>> bscript((size_t) std::max(o.batch, 0));
         const bool bdigest = basalt::core::exp_flag("concur5_digest", 0) != 0;
@@ -7955,6 +7961,9 @@ int main(int argc, char** argv) {
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
         auto batch_step = [&]() -> bool {
+            // the gap's mid stamp: everything the host does between this window's launch and the previous window's
+            // end is the caller's; what it does from here to the launch is this window's own re-launch cost
+            const Clock::time_point w_in = Clock::now();
             constexpr int MR = basalt::kernels::kVerifyMaxT;
             const int MB = std::min(MR, ver.max_t());   // the row budget is this verifier capacity; MR only sizes the arrays
             int S = 0, R = 0;
@@ -8135,6 +8144,7 @@ int main(int argc, char** argv) {
                 bt_start = Clock::now();
                 bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;
                 bt_miss0 = drive.d.multi_misses; bt_hits0 = drive.d.cache_hits; bt_pcie0 = drive.d.pcie_experts;
+                wp_have_end = false;   // the wall time before this window is the slots being idle, not a gap
             }
             const Clock::time_point w0 = Clock::now();
             {
@@ -8142,6 +8152,11 @@ int main(int argc, char** argv) {
                 wp_draft0 = bt_draft;
                 wp_wait0 = ver.ms_wait;
                 for (size_t k = 0; k < stages.size(); ++k) wp_wait0 += stages[k]->ver.ms_wait;
+                // the gap into this window: the previous window's last stamp to this launch, read here because the
+                // window stamps its own end below.  `prep` is what this window spent before launching, before that
+                // the caller spent it between the windows.
+                wp_gap = wp_have_end ? std::chrono::duration<double, std::milli>(w0 - wp_end).count() : -1.0;
+                wp_prep = std::chrono::duration<double, std::milli>(w0 - w_in).count();
             }
             if (!ver.run_slot_segs(rows, lens, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
@@ -8309,6 +8324,11 @@ int main(int argc, char** argv) {
                 bt_commit += msd(c0, Clock::now());
             }
             basalt::core::progress().busy.store(was_busy);
+            // the window's end: the last host stamp of its own work (the drafts and the tail commit are done), from
+            // which the next window's launch is the gap.  The window's four terms cover up to here, so wall + gap is
+            // the drumbeat the wall clock sees, less the line's own write.
+            wp_end = Clock::now();
+            wp_have_end = true;
             // the window's phase line, for the pair topology: every 32 windows, or every window with
             // --exp decode_profile=1; the per-stage GPU phases are read at the window's own syncs, so the
             // line adds no wait
@@ -8331,7 +8351,14 @@ int main(int argc, char** argv) {
                                        std::to_string(R) + " rows, " + std::to_string(wp_tokens) + " tokens, " +
                                        (S > 1 ? "concurrent" : "solo") + ": wall " + f2(wall) + " ms = run " +
                                        f2(run_ms) + " + commit " + f2(commit_ms) + " + emit " + f2(emit_ms) +
-                                       " + draft " + f2(draft_ms) + "; GPU-reach wait " + f2(gw) + " ms;";
+                                       " + draft " + f2(draft_ms) + ";";
+                    if (wp_gap >= 0.0) {   // the gap this window's launch ended, split by the window's entry stamp
+                        char gb[96];
+                        std::snprintf(gb, sizeof gb, " gap %.1f ms = between %.1f + prep %.1f;",
+                                      wp_gap, wp_gap - wp_prep, wp_prep);
+                        line += gb;
+                    }
+                    line += " GPU-reach wait " + f2(gw) + " ms;";
                     std::vector<basalt::core::Verifier::DecodePhase> ph(stages.size() + 1);
                     ver.decode_phase(ph[0]);
                     for (size_t k = 0; k < stages.size(); ++k) stages[k]->ver.decode_phase(ph[k + 1]);
