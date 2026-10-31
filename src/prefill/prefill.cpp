@@ -3588,6 +3588,9 @@ uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_r
     // ceiling above is deliberately the mode's, not the priced one: `Tp` has to be the figure `make_peer` will
     // allocate against, or the reserve would be priced for a wider share than the walk ever takes.
     pp.partial_merge = tf > 0 && (peer_partial_merge() || peer_charge_partial());
+    // The MODE is peer_partial_merge's alone: the charge flag only widens the priced walk (the sizing below),
+    // it must never turn the fold/combine behavior on an arm that runs the row wire.  `make_peer` (line ~3174)
+    // reads the mode separately and stays `peer_partial_merge()`'s.
     // the same reserve rule for the band's ring: with the flag on and the share able to open, the tier leaves the
     // ring's slots free whether or not this run's placement ends up reading it - under-reserving would fail the
     // allocation, over-reserving only costs the partner a few tier slots the boot line reports
@@ -3630,10 +3633,14 @@ uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_r
             sum += (uint64_t) ((qsa->n_qsa_layers() * basalt::kernels::kTp2Samples * 4 + 255) & ~size_t(255));
         }
     }
+    // `sum` above already prices the partial: the walk ran in the fold's mode (`pp.partial_merge`), which is the
+    // whole point of the charge.  `charged` is reported for the boot line only - adding it to `sum` would charge
+    // the partial twice and leave the reference arms with LESS room than the arm they are compared against.
     if (charged != 0)
-        basalt::log::info("basalt prefill", "peer tier: --exp peer_charge_partial holds back %llu of the %llu MiB "
-                                            "priced for the partner's prompt buffers, unused",
-                          (unsigned long long) (charged >> 20), (unsigned long long) (sum >> 20));
+        basalt::log::info("basalt prefill", "peer tier: --exp peer_charge_partial charges %llu MiB on top of the %llu MiB "
+                                            "the partner's prompt buffers price, so an arm that does not fold reserves "
+                                            "what an arm that folds does",
+                          (unsigned long long) (charged >> 20), (unsigned long long) ((sum - charged) >> 20));
     return sum;
 }
 
