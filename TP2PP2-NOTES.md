@@ -2753,6 +2753,24 @@ wire (50.4 ms at its current share) scales with its rows and cancels the 1.63 us
 row-rate gain. The tp2 prefill is placement-optimal GIVEN the wire; the idle is
 wire-protected, the same class as the slice's dependency-protected idle. The prefill
 levers that remain: full sharding only (whose 4-rank hiding just measured 42.7%).
+(9) **THE RACE FIX: BIT-IDENTICAL RESULT — THE DIVERGENCE IS DETERMINISTIC.** 83d8bdda
+(the ev_used consumption barrier, diff-reviewed clean) changed NOTHING: the gate arm
+re-run at the 512 bucket reproduces the pre-fix numbers TO THE DIGIT (PPL 7.15675, KLD
+mean 0.0190273, top-1 94.4118%, dlogp 2.35697). A timing race cannot produce
+bit-identical wrong sums across a fix — the divergence is DETERMINISTIC and structural.
+The FP32-wire control already ruled out the rounding; the fold-table builder is now
+shared with the parity test and covers the block exactly once. THE REMAINING SUSPECT
+SPACE: a term-set difference the ledger's paper verification missed at RUNTIME — the
+kSkip range vs the fold's actual coverage per token, the CPU-tier rows' offsets under
+the flag's changed staging, or the weight read-back path. THE NEXT STEP (defined): the
+runtime dump — P.fold.tok/off/rel/wt + peer_lo/peer_n + P.part for one (chunk, layer)
+beside a flag-off moe_combine on the same inputs, per token; the decomposition names the
+term. The dump worker hit provider 502s twice (revived once); the task stands in its
+session. ONE TOOL QUESTION FLAGGED: the check arm's first scored position (512) differs
+from the gate arm's (256) in rows.tsv — if the tool's row alignment is offset, part of
+the 0.019 KLD could be artifact; the ENGINE-computed same_top column (94.4%) is
+alignment-independent and stands either way.
+
 (8) **THE GATE RAN — AND CAUGHT A REAL BUG. THE FLAG STAYS DARK.** The quality harness
 (kimi-gated design, 6 commits: --ppl-emit in PplGate, the emitted-base differential, the
 committed pre-tokenized bucketed fixture, tools/quality_gate.py; the instrument floor
