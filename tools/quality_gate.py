@@ -12,9 +12,10 @@ as a llama.cpp `_logits_` base, and three runs are taken against it:
 Both arms score the SAME committed token ids through the SAME `ppl=` path, so the only difference between them is
 the flag: nothing diverges by generation, which would compare two different sequences and mean nothing. That
 premise is checked, not assumed: `--verdict` reads each boot's own log and VOIDs the run when the two arms placed
-the experts differently, because which card computes a row decides whether it crosses as BF16 bits or stays FP32.
-A flag that costs the partner card VRAM - which `--exp peer_partial_merge=1` does, since `Prefill::peer_bytes`
-reads it - is paid for on the *reference* arms with `--base-args`, and the verdict prints the figure that pins it.
+the experts differently, or when an arm left no log to read.  A flag that costs the partner card VRAM - which `--exp
+peer_partial_merge=1` does, since `Prefill::peer_bytes` reads it - is paid for on the *reference* arms with
+`--base-args '--exp peer_charge_partial=1'`, which charges them those bytes through the same pricing walk, so both
+arms fill the partner's expert tier into the same room.
 
 The engine is started as a child process and driven over its stdin, the way tools/ppl_gate.py drives it: a
 `ppl=K ppl_t=T` request is an engine protocol key, not part of the server's HTTP API. This tool never connects to
@@ -70,17 +71,26 @@ PLACEMENT_PATTERNS = [
     ("partner held", re.compile(r"\(\d+ experts held, \d+ band\)")),
     ("ram band", re.compile(r"\d+/\d+ of \d+ band experts of layers \d+-\d+")),
 ]
-# The room the partner's tier was filled into, from the same line: the figure an operator adjusts
-# `--peer-reserve-mib` to bring back into line.
+# The room the partner's tier was filled into, from the same line: the figure that says by how much the two arms
+# diverged.  A tp2 partner card's room is its free memory less the reserve, the chunk's own buffers, the verify
+# windows and `Prefill::peer_bytes` (`stage_room` in `src/program/generate.cpp`), so the buffer set that function
+# prices is the only lever on it: `--peer-reserve-mib` prices an EXPERT TIER (`--peer-device`), which a tp2 boot
+# has none of, and `--vram-reserve-mib` shrinks the lead card's tier beside the partner's.
 PARTNER_ROOM = re.compile(r"tp2: CUDA(\d+) holds (\d+) of the \d+ ranked pairs of its stage's layers "
                           r"\([\d.]+ GiB of ([\d.]+) GiB room\)")
 
+# The three runs `--verdict` compares. Every one of them must leave a log: an arm whose placement cannot be read is
+# not an arm that agreed with the others.
+ARMS = ("emit", "check", "gate")
 
-def placement_facts(log: pathlib.Path) -> dict:
+
+def placement_facts(log: pathlib.Path) -> dict | None:
     """What the boot said about where the experts landed.  Parsed from the arm's own engine log, so the verdict
-    compares what the engine decided rather than what the command line asked for."""
+    compares what the engine decided rather than what the command line asked for.  `None` when the file is not
+    there at all: an arm that left no log is not the same fact as a boot whose log holds none of these lines, and
+    neither one may read as agreement."""
     if not log.is_file():
-        return {}
+        return None
     text = log.read_text(encoding="utf-8", errors="replace")
     facts = {}
     for name, pat in PLACEMENT_PATTERNS:
@@ -92,13 +102,25 @@ def placement_facts(log: pathlib.Path) -> dict:
 
 def placement_mismatch(out: pathlib.Path) -> list:
     """Why the arms did not run the same experiment, or empty when they did.  A moved placement voids the run the
-    way the self-check does: every number the gate arm then printed was measured on a different tier."""
-    seen = {arm: placement_facts(out / arm / "engine.log") for arm in ("emit", "check", "gate")}
-    if not seen["check"] or not seen["gate"]:
-        return []   # an old run directory with no logs to compare: nothing to say, and nothing to trust either
+    way the self-check does: every number the gate arm then printed was measured on a different tier.  An arm whose
+    log cannot be read is itself reported - a run that cannot be traced to a placement has not been shown to hold
+    one placement, and a silent pass on it is what let one graded run be scored on two different tiers."""
+    logs = {arm: out / arm / "engine.log" for arm in ARMS}
+    seen = {arm: placement_facts(logs[arm]) for arm in ARMS}
     bad = []
+    for arm in ARMS:
+        if seen[arm] is None:
+            bad.append(f"the {arm} arm left no engine.log at {logs[arm]}: which experts it held cannot be read, so "
+                       "the arms have not been shown to hold the same ones - the run is VOID")
+        elif not seen[arm]:
+            bad.append(f"the {arm} arm's engine.log at {logs[arm]} holds none of the lines that say where its "
+                       "experts landed: the run cannot be traced to a placement, so it is VOID")
+    if not (seen["check"] and seen["gate"]):
+        return bad          # nothing to compare the gate arm against; the lines above are the verdict
     reference = seen["check"]
     for arm in ("emit", "gate"):
+        if not seen[arm]:
+            continue        # already reported above; there is nothing here to compare line against line
         for key in sorted(set(reference) | set(seen[arm])):
             a, b = reference.get(key), seen[arm].get(key)
             if a == b:
@@ -108,28 +130,33 @@ def placement_mismatch(out: pathlib.Path) -> list:
     if bad:
         rooms = {}
         for arm in ("check", "gate"):
-            log = out / arm / "engine.log"
-            if log.is_file():
-                rooms[arm] = {c: float(r) for c, _, r in PARTNER_ROOM.findall(log.read_text(encoding="utf-8",
-                                                                                              errors="replace"))}
+            if seen[arm]:
+                rooms[arm] = {c: float(r) for c, _, r in
+                               PARTNER_ROOM.findall(logs[arm].read_text(encoding="utf-8", errors="replace"))}
         for card in sorted(set(rooms.get("check", {})) | set(rooms.get("gate", {}))):
             r_chk, r_gt = rooms.get("check", {}).get(card), rooms.get("gate", {}).get(card)
             if r_chk is None or r_gt is None or r_chk == r_gt:
                 continue
-            gap_mib = round(abs(r_chk - r_gt) * 1024)
+            gap_mib = round(abs(r_chk - r_gt) * 1024)   # the boot prints GiB to two places, so this is approximate
             # The arm that ends up with the SMALLER room is the one whose flag costs the card bytes, so the fix is
             # to charge the OTHER arm those bytes - through `--base-args` for the reference arms, or `--gate-args`
             # for the gate arm - and the arm being charged must fill into the TIGHTER room, the one the first arm
             # already reached, not into its own wider one.
             if r_gt < r_chk:
-                arm, flag, room = "reference (emit, check)", "--base-args", r_gt
+                arm, room = "reference (emit, check)", r_gt
+                how = ("re-run them with --base-args '--exp peer_charge_partial=1', which charges them the "
+                       "partner's partial buffers through the same Prefill::peer_bytes walk the arm that folds "
+                       "pays, so one price sets both rooms")
             else:
-                arm, flag, room = "gate", "--gate-args", r_chk
+                arm, room = "gate", r_chk
+                how = (f"re-run them with --gate-args to leave that arm's card {gap_mib} MiB poorer: the tested "
+                       f"flag FREES those bytes on the card it runs on, and no lever charges an arm back what its "
+                       f"own flag freed, so the rooms must be made equal by the flag itself")
             bad.append(f"the partner card CUDA{card}'s expert tier was filled into {r_gt:.2f} GiB on the gate arm "
-                       f"and {r_chk:.2f} GiB on the check arm: the {arm} arms have {gap_mib} MiB more room than the "
-                       f"other, so they hold different experts - re-run them with {flag} "
-                       f"'--peer-reserve-mib <N>' with N raised by about {gap_mib} MiB to fill them into "
-                       f"{room:.2f} GiB like the arm that runs the flag")
+                       f"and {r_chk:.2f} GiB on the check arm: the {arm} arms have about {gap_mib} MiB more room "
+                       f"than the other, so they hold different experts - {how}, and fill them into {room:.2f} GiB "
+                       f"like the arm that runs the flag (--peer-reserve-mib moves no tp2 partner's tier, and "
+                       f"--vram-reserve-mib moves the lead card's with it)")
     return bad
 
 
@@ -176,6 +203,41 @@ def set_args(args: list[str], extra: list[str]) -> list[str]:
             out += [flag, *value]
         i += 1 + has_value
     return out
+
+
+def arm_args(args: list[str], extra: list[str], who: str) -> list[str]:
+    """An arm's own engine flags: plain ones through `set_args`, `--exp` entries added BESIDE the operator's.
+
+    `--exp` is repeatable and each occurrence takes a comma list, so the one place a flag may not simply be
+    replaced: swapping out the first occurrence would silently drop an experimental key the operator passed, and
+    an arm missing a key the other arm kept is not the arm `--verdict` compared.  A key the operator already set
+    is refused rather than left to the engine's last-one-wins, which would decide the arms' difference by
+    argument order."""
+    out = list(args)
+    rest: list[str] = []
+    keys: dict[str, str] = {}
+    i = 0
+    while i < len(extra):
+        if extra[i] == "--exp":
+            if i + 1 >= len(extra) or extra[i + 1].startswith("--"):
+                sys.exit(f"{who}: --exp needs NAME=VALUE")
+            for e in extra[i + 1].split(","):
+                if e:
+                    keys[e.split("=", 1)[0]] = e
+            i += 2
+        else:
+            rest.append(extra[i])
+            i += 1
+    if keys:
+        for j, w in enumerate(out):
+            if w == "--exp" and j + 1 < len(out):
+                for e in out[j + 1].split(","):
+                    if e.split("=", 1)[0] in keys:
+                        sys.exit(f"{who} sets --exp {e.split('=', 1)[0]}, which the command line already carries "
+                                 f"({out[j + 1]!r}); drop it there, or which arm runs the key is decided by "
+                                 "argument order")
+        out += ["--exp", ",".join(keys.values())]
+    return set_args(out, rest)
 
 
 def boot(engine_bin: str, args: list[str], log: pathlib.Path):
@@ -279,14 +341,16 @@ def run_arm(a, bucket: int, chunks: list[dict], n_ctx: int, n_vocab: int, base: 
     if a.arm == "gate" and a.gate_args:
         # Engine flags for this arm alone: the mirror image of `--base-args`, for a tested flag that FREES room on
         # a card and so leaves the gate arm filling its expert tier into a wider room than the reference arms.
-        args = set_args(args, a.gate_args.split())
+        args = arm_args(args, a.gate_args.split(), "--gate-args")
     if a.arm != "gate" and a.base_args:
         # A flag that costs the partner card VRAM on the arm that runs it (the partial's buffers, for
         # `--exp peer_partial_merge=1`) shrinks the room that arm fills its expert tier into, so the tier holds
         # fewer ranked pairs - and which card holds an expert decides whether its rows cross as BF16 bits or stay
         # FP32. The reference arms must be charged the same bytes, or the two arms place different experts and the
-        # gate grades a placement change. `--verdict` measures the gap and prints the figure to give here.
-        args = set_args(args, a.base_args.split())
+        # gate grades a placement change. `--exp peer_charge_partial=1` charges them through the same
+        # `Prefill::peer_bytes` walk, so no MiB figure has to be re-measured; `--verdict` prints the gap it is
+        # closing when the two rooms still differ.
+        args = arm_args(args, a.base_args.split(), "--base-args")
     if a.arm == "emit":
         if base.exists():
             base.unlink()
@@ -329,6 +393,10 @@ def verdict(out: pathlib.Path) -> int:
     facts = placement_facts(out / "check" / "engine.log")
     if facts:
         print("tier  " + "; ".join(facts[k] for k in sorted(facts) if k.startswith(("partner held", "expert tiers"))))
+    else:
+        print(f"tier  nothing read from the check arm's log ({out / 'check' / 'engine.log'}): "
+              f"{'the file is not there' if facts is None else 'it holds no placement lines'} - the run cannot be "
+              "shown to hold one placement")
     if s["emit"] is not None:
         print(f"emit  {s['emit']['rows']} rows, PPL {s['emit']['PPL']:.4f} (the reference arm's own score)")
     print(f"check {chk['rows']} rows, KLD mean {chk['KLD mean']:.6f}, same top-1 {chk['same top-1']:.2f}%  "
@@ -379,7 +447,8 @@ def main() -> int:
     ap.add_argument("--base-args", default="",
                     help="engine flags given to the emit and check arms only, as one quoted string; use it to "
                          "charge the reference arms the bytes the tested flag costs a card, so both arms fill "
-                         "the partner's expert tier into the same room (--verdict prints the figure)")
+                         "the partner's expert tier into the same room ('--exp peer_charge_partial=1' does that "
+                         "for the partial merge; --verdict prints the gap)")
     ap.add_argument("--t", type=int, default=3, help="tokens per verify window (default 3)")
     ap.add_argument("--chunks", type=int, default=0, help="only the first N chunks of the bucket (0: all)")
     ap.add_argument("--progress", type=int, default=4, help="a progress line every N chunks (0: none)")

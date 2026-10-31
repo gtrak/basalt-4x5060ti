@@ -42,6 +42,29 @@ def write_rows(path: pathlib.Path, n_rows: int, kld: float, same_top1: float, nl
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+# What a boot says about where its experts landed, in the engine's own words. `same` and `moved` are two boots whose
+# partner card filled a different number of ranked pairs into a different room - the confound the gate must refuse.
+BOOT_LINES = {"same": [
+    "basalt generate: tp2: CUDA1 holds 5429 of the 12288 ranked pairs of its stage's layers "
+    "(13.98 GiB of 13.98 GiB room); its lead card holds 1358\n",
+    "basalt prefill: peer fp4 crossover 8192 tokens: 621 MiB (5429 experts held, 584 band); "
+    "RAM rows on, 1/8 of 4583 band experts of layers 24-48\n",
+    "basalt generate: experts live in VRAM 37.3 GiB (59%), RAM 26.0 GiB (41%)\n",
+], "moved": [
+    "basalt generate: tp2: CUDA1 holds 5384 of the 12288 ranked pairs of its stage's layers "
+    "(13.86 GiB of 13.86 GiB room); its lead card holds 1358\n",
+    "basalt prefill: peer fp4 crossover 8192 tokens: 154 MiB (5384 experts held, 591 band); "
+    "RAM rows on, 1/8 of 4628 band experts of layers 24-48\n",
+    "basalt generate: experts live in VRAM 37.1 GiB (59%), RAM 26.2 GiB (41%)\n",
+]}
+
+
+def write_log(path: pathlib.Path, lines: list[str] | None = None) -> None:
+    """engine.log as `boot()` leaves it, holding the lines the verdict reads the placement from."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(BOOT_LINES["same"] if lines is None else lines), encoding="utf-8")
+
+
 class BaseLayout(unittest.TestCase):
     def test_header_and_tokens_where_the_engine_reads_them(self):
         with tempfile.TemporaryDirectory() as d:
@@ -103,6 +126,9 @@ class Verdict(unittest.TestCase):
     def good(self, root):  # the numbers a passing flag-on run would show
         self.arm(root, "check", kld=0.00007, same_top1=100.0)
         self.arm(root, "gate", kld=0.0002, same_top1=99.5)
+        # a real run always leaves a log; without one the verdict must refuse the run, not pass it
+        for arm in ("emit", "check", "gate"):
+            write_log(root / arm / "engine.log")
 
     def test_a_run_inside_every_bound_passes(self):
         with tempfile.TemporaryDirectory() as d:
@@ -176,26 +202,12 @@ class Placement(unittest.TestCase):
     smaller room and holds fewer ranked pairs - and which card computes a row decides whether it crosses as BF16
     bits or stays FP32. The gate must refuse that comparison rather than grade it."""
 
-    BOOT = {"same": [
-        "basalt generate: tp2: CUDA1 holds 5429 of the 12288 ranked pairs of its stage's layers "
-        "(13.98 GiB of 13.98 GiB room); its lead card holds 1358\n",
-        "basalt prefill: peer fp4 crossover 8192 tokens: 621 MiB (5429 experts held, 584 band); "
-        "RAM rows on, 1/8 of 4583 band experts of layers 24-48\n",
-        "basalt generate: experts live in VRAM 37.3 GiB (59%), RAM 26.0 GiB (41%)\n",
-    ], "moved": [
-        "basalt generate: tp2: CUDA1 holds 5384 of the 12288 ranked pairs of its stage's layers "
-        "(13.86 GiB of 13.86 GiB room); its lead card holds 1358\n",
-        "basalt prefill: peer fp4 crossover 8192 tokens: 154 MiB (5384 experts held, 591 band); "
-        "RAM rows on, 1/8 of 4628 band experts of layers 24-48\n",
-        "basalt generate: experts live in VRAM 37.1 GiB (59%), RAM 26.2 GiB (41%)\n",
-    ]}
+    BOOT = BOOT_LINES
 
     def arms(self, root: pathlib.Path, gate_lines):
         self.good(root)
         for arm, lines in (("emit", self.BOOT["same"]), ("check", self.BOOT["same"]), ("gate", gate_lines)):
-            d = root / arm
-            d.mkdir(parents=True, exist_ok=True)
-            (d / "engine.log").write_text("".join(lines), encoding="utf-8")
+            write_log(root / arm / "engine.log", lines)
 
     def good(self, root):
         write_rows(root / "check" / "rows.tsv", 40, kld=0.00007, same_top1=100.0)
@@ -204,11 +216,12 @@ class Placement(unittest.TestCase):
     def test_facts_are_read_from_the_boot_its_own_log(self):
         with tempfile.TemporaryDirectory() as d:
             log = pathlib.Path(d) / "engine.log"
-            log.write_text("".join(self.BOOT["same"]), encoding="utf-8")
+            write_log(log)
             f = QG.placement_facts(log)
             self.assertEqual(f["partner held"], "(5429 experts held, 584 band)")
             self.assertIn("CUDA1 holds 5429", f["partner tier"])
-            self.assertEqual(QG.placement_facts(pathlib.Path(d) / "absent.log"), {})
+            self.assertIsNone(QG.placement_facts(pathlib.Path(d) / "absent.log"),
+                              "no log is not the same fact as a log that says nothing about placement")
 
     def test_identical_placements_do_not_void_the_run(self):
         with tempfile.TemporaryDirectory() as d:
@@ -227,16 +240,19 @@ class Placement(unittest.TestCase):
             self.assertIn("5384 experts held", "\n".join(bad))
             self.assertEqual(QG.verdict(root), 1)
 
-    def test_the_refusal_names_the_reserve_that_pins_the_placement(self):
+    def test_the_refusal_names_the_lever_that_pins_the_placement(self):
         """13.98 GiB against 13.86 GiB is ~123 MiB of partner VRAM: the verdict must hand the operator the figure
-        and the arm to charge it on, or the re-gate is a guess."""
+        and the arm to charge it on, or the re-gate is a guess. It must name a lever that reaches a tp2 PARTNER
+        card's tier - `--peer-reserve-mib` prices an expert tier, which a tp2 boot has none of, so pointing at it
+        is what made one re-gate run change nothing."""
         with tempfile.TemporaryDirectory() as d:
             root = pathlib.Path(d)
             self.arms(root, self.BOOT["moved"])
             bad = "\n".join(QG.placement_mismatch(root))
             self.assertIn("--base-args", bad)
-            self.assertIn("--peer-reserve-mib", bad)
+            self.assertIn("--exp peer_charge_partial=1", bad)
             self.assertIn("123 MiB", bad)
+            self.assertIn("--peer-reserve-mib moves no tp2 partner's tier", bad)
 
     def test_the_refusal_attributes_each_room_to_the_right_arm(self):
         """The tighter card belongs to whichever arm runs the flag that costs it bytes. Naming the two rooms
@@ -257,7 +273,7 @@ class Placement(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = pathlib.Path(d)
             self.arms(root, self.BOOT["same"])           # gate into 13.98 ...
-            (root / "check" / "engine.log").write_text("".join(self.BOOT["moved"]), encoding="utf-8")  # ... check 13.86
+            write_log(root / "check" / "engine.log", self.BOOT["moved"])   # ... check into 13.86
             bad = "\n".join(QG.placement_mismatch(root))
             self.assertIn("--gate-args", bad)
             self.assertNotIn("--base-args", bad)
@@ -268,14 +284,43 @@ class Placement(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = pathlib.Path(d)
             self.arms(root, self.BOOT["same"])
-            (root / "emit" / "engine.log").write_text("".join(self.BOOT["moved"]), encoding="utf-8")
+            write_log(root / "emit" / "engine.log", self.BOOT["moved"])
             self.assertTrue(any("emit arm" in m for m in QG.placement_mismatch(root)))
 
-    def test_a_run_with_no_logs_says_nothing_rather_than_crashing(self):
+    def test_an_arm_that_left_no_log_voids_the_run(self):
+        """An untraceable boot has not been shown to hold the same experts as any other. Reading its absence as
+        agreement is how a run whose arms held 5429 and 5384 ranked pairs was graded at all."""
+        for missing in ("emit", "check", "gate"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as d:
+                root = pathlib.Path(d)
+                self.arms(root, self.BOOT["same"])
+                (root / missing / "engine.log").unlink()
+                bad = "\n".join(QG.placement_mismatch(root))
+                self.assertIn("no engine.log", bad)
+                self.assertIn(f"the {missing} arm", bad)
+                self.assertEqual(QG.verdict(root), 1)
+
+    def test_a_log_that_says_nothing_about_placement_voids_the_run(self):
+        """A log that exists but holds none of the placement lines is a run whose tier was never read - not a run
+        whose arms agreed, and not a reason to print nothing."""
         with tempfile.TemporaryDirectory() as d:
             root = pathlib.Path(d)
-            self.good(root)          # rows but no engine.log: an old run directory
-            self.assertEqual(QG.placement_mismatch(root), [])
+            self.arms(root, self.BOOT["same"])
+            (root / "gate" / "engine.log").write_text("engine /usr/local/bin/basalt\nargs --model m\n",
+                                                      encoding="utf-8")
+            bad = "\n".join(QG.placement_mismatch(root))
+            self.assertIn("holds none of the lines", bad)
+            self.assertEqual(QG.verdict(root), 1)
+
+    def test_a_run_with_no_logs_at_all_is_refused_not_quietly_passed(self):
+        """An old run directory, or one whose boots died before the tier was filled, must not reach the bounds."""
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            self.good(root)          # rows.tsv for the two scored arms, and no engine.log anywhere
+            bad = QG.placement_mismatch(root)
+            self.assertEqual(len(bad), 3, "one line naming each arm whose log is missing")
+            self.assertTrue(all("no engine.log" in m for m in bad))
+            self.assertEqual(QG.verdict(root), 1)
 
 
 class ArgHandling(unittest.TestCase):
@@ -355,12 +400,14 @@ class ArgHandling(unittest.TestCase):
 
     def test_the_reference_arms_are_charged_the_bytes_the_flag_costs(self):
         """The partial's buffers live on the partner card, so the gate arm fills its expert tier into a narrower
-        room and holds fewer experts - which changes which rows cross as BF16. `--base-args` charges the reference
-        arms the same bytes; it must reach the engine on emit and check and not on the gate arm."""
+        room and holds fewer experts - which changes which rows cross as BF16. `--base-args '--exp
+        peer_charge_partial=1'` charges the reference arms those bytes through the engine's own pricing walk; the
+        key must reach the engine on emit and check and not on the gate arm."""
         for arm, wants in (("check", True), ("emit", True), ("gate", False)):
             with self.subTest(arm=arm):
                 ns = argparse.Namespace(arm=arm, t=3, progress=0, engine_bin="/nonexistent/basalt",
-                                        flag="peer_partial_merge=1", gate_args="", base_args="--peer-reserve-mib 723")
+                                        flag="peer_partial_merge=1", gate_args="",
+                                        base_args="--exp peer_charge_partial=1")
                 got = {}
                 real_boot = QG.boot
                 QG.boot = lambda b, a_, log: (got.setdefault("args", a_), (_ for _ in ()).throw(SystemExit(0)))[0]
@@ -375,11 +422,57 @@ class ArgHandling(unittest.TestCase):
                             self.assertEqual(e.code, 0)
                 finally:
                     QG.boot = real_boot
-                where = got["args"].index("--peer-reserve-mib") + 1 if "--peer-reserve-mib" in got["args"] else None
+                exps = [v for i, w in enumerate(got["args"]) if w == "--exp" for v in got["args"][i + 1].split(",")]
                 if wants:
-                    self.assertEqual(got["args"][where], "723", f"{arm} must carry the pinned reserve")
+                    self.assertIn("peer_charge_partial=1", exps, f"{arm} must carry the pinned charge")
                 else:
-                    self.assertIsNone(where, f"{arm} must not carry it")
+                    self.assertNotIn("peer_charge_partial=1", exps, f"{arm} must not carry it")
+
+    def test_an_arm_charge_does_not_evict_the_operators_exp_flags(self):
+        """`--exp` is repeatable and takes a comma list, so an arm's own key must be ADDED beside the operator's
+        rather than replace the first occurrence: an arm that quietly lost `decode_profile` is a second difference
+        between the arms, and the verdict would grade it as the flag under test."""
+        for arm, extra in (("check", "--exp peer_charge_partial=1"), ("gate", "--exp qsa_peer_fold_us=0")):
+            with self.subTest(arm=arm):
+                ns = argparse.Namespace(arm=arm, t=3, progress=0, engine_bin="/nonexistent/basalt",
+                                        flag="peer_partial_merge=1", gate_args="", base_args="")
+                setattr(ns, "base_args" if arm != "gate" else "gate_args", extra)
+                seen = {}
+                real_boot = QG.boot
+                QG.boot = lambda b, a_, log: (seen.setdefault("args", a_), (_ for _ in ()).throw(SystemExit(0)))[0]
+                try:
+                    with tempfile.TemporaryDirectory() as d:
+                        base = pathlib.Path(d) / f"base-{512}.kld"
+                        QG.write_base(base, chunks(1, 512), 512, N_VOCAB)
+                        try:
+                            QG.run_arm(ns, 512, chunks(1, 512), 512, N_VOCAB, base, pathlib.Path(d) / arm,
+                                       ["--model", "m", "--exp", "decode_profile=1,draft_reseed=1"])
+                        except SystemExit as e:
+                            self.assertEqual(e.code, 0)
+                finally:
+                    QG.boot = real_boot
+                exps = [v for i, w in enumerate(seen["args"]) if w == "--exp" for v in seen["args"][i + 1].split(",")]
+                self.assertIn("decode_profile=1", exps)
+                self.assertIn("draft_reseed=1", exps)
+                self.assertIn(extra.split()[1], exps)
+
+    def test_an_arm_charge_refuses_a_key_the_operator_already_set(self):
+        """Two arms, one key, two values: the engine would keep whichever `--exp` it parsed last, so the tool
+        refuses instead of letting argument order pick which arm ran which."""
+        ns = argparse.Namespace(arm="check", t=3, progress=0, engine_bin="/nonexistent/basalt",
+                                flag="peer_partial_merge=1", gate_args="", base_args="--exp peer_charge_partial=1")
+        real_boot = QG.boot
+        QG.boot = lambda b, a_, log: (_ for _ in ()).throw(AssertionError("the engine must not be reached"))
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                base = pathlib.Path(d) / f"base-{512}.kld"
+                QG.write_base(base, chunks(1, 512), 512, N_VOCAB)
+                with self.assertRaises(SystemExit) as cm:
+                    QG.run_arm(ns, 512, chunks(1, 512), 512, N_VOCAB, base, pathlib.Path(d) / "check",
+                               ["--model", "m", "--exp", "peer_charge_partial=0"])
+        finally:
+            QG.boot = real_boot
+        self.assertIn("peer_charge_partial", str(cm.exception.code))
 
     def test_unknown_flags_reach_the_engine_and_known_ones_are_replaced(self):
         """The docs promise that flags the tool does not know go to the engine, and an engine flag given here
