@@ -2735,7 +2735,30 @@ on (inert on verbatim tails by construction, active where the sims say it pays).
 - Term-by-term: the model's attn (54.4) and rows (89.5) track the chunk lines (attn
   48.5-50.0, lead-experts 87.8) within ~5-10% - the accounting is honest.
 - blob_mb_ms still unmeasured (the one constant the model admits not knowing).
-- Prefill re-confirmed 2,004 t/s fresh concurrent on this boot.**KIMI #8 — the TP=4 arithmetic CORRECTED (the night's most consequential finding)**:
+- Prefill re-confirmed 2,004 t/s fresh concurrent on this boot.**WINDOW RESULTS (10-31, the supervisor's window)**: (1) THE RENDEZVOUS BENCH (tpstep0,
+progress-tp-cadence.md): the TP=4 PREFILL GATE FAILED at the real ratio (partial-merge
+r=4 tokens=8192 cover=49.9 ms/layer: wire 39.6 ms/layer, hidden 42.7%, ceiling 56% —
+the 70% line unreachable; the wire adds ~46% to the layer wall; the projection puts the
+TP=4 lockstep ~1.4-2x SLOWER than the split's effective ~45 ms/chunk). The DECODE GATE
+PASSED (42 us/round at 4 ranks, 90-93% hidden, straggler spread 0.000 ms) — but decode
+alone cannot justify the build. The max-of-4 straggler REFUTED (inflation 1.00x); the
+SM-contention hypothesis REFUTED (co-scheduling negative — the overlap works); row-ship
+dead by capacity AND hiding (2.8%). VERDICT: TP=4 STAYS SHELVED, now on measurement
+(TP4-SKETCH.md's gates (a) and (d) failed). The sglang prior was regime-mismatched.
+(2) THE SHARE RE-PRICE: NULL. The flags read (2.61/0.98 in the pricing lines) but the
+placement did not move (5429 held, the same band); prefill 1,993/1,994/2,002 vs 2,004.
+THE REASON (the real finding): the peer idles ~170-190 ms/layer (lead 259-283 vs peer
+93-96) but moving rows costs the RETURN WIRE at the shared fabric — the peer's back
+wire (50.4 ms at its current share) scales with its rows and cancels the 1.63 us/visit
+row-rate gain. The tp2 prefill is placement-optimal GIVEN the wire; the idle is
+wire-protected, the same class as the slice's dependency-protected idle. The prefill
+levers that remain: full sharding only (whose 4-rank hiding just measured 42.7%).
+(3) The gap instrumentation landed in batch_step, but the tp2pp2 pair serving runs the
+PIPELINED pump() path (piped ? pump : batch_step) — the profile lines never fire; the
+decode-timing line DOES see the drumbeat (35-40 ms/window, GPU-reach wait ~12, per-layer
+host 4.5-6.4). A port of the gap stamps into pump() is in flight (worker a04f42e0).
+
+**KIMI #8 — the TP=4 arithmetic CORRECTED (the night's most consequential finding)**:
 my prefill case under-priced the combine wire ~4x. The routed output crosses at
 n_embd=2560-wide BF16 = 5,120 B per ROUTING (640 is the FFN hidden width — nothing
 640-wide crosses a card), volume per routing T x K x (1-1/4) = 61,440/layer/chunk.
