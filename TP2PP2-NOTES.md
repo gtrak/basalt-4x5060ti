@@ -2753,6 +2753,40 @@ wire (50.4 ms at its current share) scales with its rows and cancels the 1.63 us
 row-rate gain. The tp2 prefill is placement-optimal GIVEN the wire; the idle is
 wire-protected, the same class as the slice's dependency-protected idle. The prefill
 levers that remain: full sharding only (whose 4-rank hiding just measured 42.7%).
+(6) **KIMI #9 — THE NIGHT VERIFIED, THE MORNING NAMED**:
+- TP=4 shelved CONFIRMED STRUCTURAL — the reduce is dependency-sandwiched (only ~42-52%
+  intra-layer independent compute exists to hide under; 70% would need dependency-free
+  compute the model graph does not have); the streaming/wire contention on the shared
+  uplink makes production hide LESS than the bench's idealized 42.7%; even the appeal
+  (BF16 + perfect 52%) ceilings at ~3,100-3,500 vs the split's 3,750-3,868. Banked
+  positives: 4-rank 42 us/round coordination; the straggler refutation (max-of-4 clean
+  on this fabric) — durable for any future N-card design.
+- The #7 anatomy: SUPERSEDED-WITH-ATTRIBUTION (not retracted): the magnitude was right
+  (~half the per-token cost is host), the location wrong (in-window per-layer host, not
+  inter-window). **THE DECODE-NARRATIVE GATE**: three incompatible window figures exist
+  (19.4 old / 25.3-25.9 session-2 / 40.8-44.7 tonight) — STOP QUOTING any tp2
+  decode-latency advantage until one piped-vs-unpiped reconciliation boot (solo, matched
+  dl) settles which binary+config produced what. This gates the morning's topology
+  statement.
+- The re-price null: the wire-protection algebra HOLDS (the model refuses to move iff
+  back_wire/visit >= ~1.63 us = the tier-contended rate ~3.1 GB/s — exactly this
+  fabric); boot B's flags read (2.61/0.98 in its pricing) and the placement held. One
+  open discriminator: interior vs band-clamp (the "1/8 band" phrasing) — superseded by
+  the lever below.
+- **THE NIGHT'S MISSED LEVER — PARTIAL-MERGE COMBINE FOR TP2 PREFILL**: the peer sums
+  its experts' weighted outputs LOCALLY and returns ONE T x 2,560 vector (42 MB ~ 10 ms,
+  CONSTANT) instead of per-row results (50.4 ms scaling with rows). The balancing
+  constraint collapses from row_us + wire_us to pure compute balance; the peer absorbs
+  rows until the sides meet ~190 ms/layer -> PREFILL WALL -25-35% (~2,600-2,700 t/s).
+  The substrate exists (the activations cross once anyway; RUN 21's FP4 planes; the peer
+  already local-quantizes). THE GATE: the MoE sum's reduction order changes -> PPL/KLD
+  through the decode path + docs/precision/. THE morning candidate.
+- The lever re-rank: GPU-reach wait + CPU-pool = ONE COUPLED LEVER (the miss-serving
+  pipeline: fewer misses via L2-cover/adaptive-boundary — re-ranked up; faster CPU
+  experts; protocol overlap last). Slots -> #3. The power asymmetry = the live telemetry
+  for both (the peer's draw should rise toward the lead's as the balance closes; thermal
+  headroom confirms 4-slot occupancy is safe).
+
 (5) **THE GAP IS DEAD — THE HEADLINE FINDING**: the serving (boot C: the clean recipe +
 the gap-instrumented binary) prints the gap term on every window: **gap 0.1 ms =
 between 0.1 + prep 0.0**. The ~17 ms invisible host gap from the kimi #7 anatomy DOES
