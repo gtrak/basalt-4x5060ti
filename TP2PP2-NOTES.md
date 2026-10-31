@@ -2837,6 +2837,24 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(24) **THE NONDETERMINISM IS STRUCTURAL, NOT FP NOISE — the evidence, sharpened.**
+Comparing two 8192-bucket runs row by row: **per-row NLL mean |delta| 4.1e-02 nats, MAX
+1.14 nats, 3,671 of 8,190 rows apart by >0.01**, while top-1 still agrees 98.95%; the
+divergence starts at **row 1**. FP reduction noise is ~1e-6, so this is a MATERIALLY
+DIFFERENT COMPUTATION that lands on the same argmax most of the time. Placement is
+already excluded (the band pin made it canonical: 1,746/1,742 on every arm; resident
+fill identical at 28.81 GiB). THE RANKED SUSPECTS, handed to a worker with file:line
+evidence to gather: (a) the EXPERT SET SERVED differs per (token,expert) - peer tier vs
+band vs CPU tier - via some state the pin does not cover (ring contents, peer_holds,
+adaptive state even with swaps off); (b) a RACE reading a buffer before it lands (the
+ev_used class) in the band's ring, Dm staging, or the fused path; (c) **THE FUSED PATH
+TOGGLING** - `fused_l` now depends on `peer_ram`, which depends on `T <= ram_top` and
+`ram_num > 0`; if that can differ between runs the same layer runs fused in one boot and
+MMQ in another, recomputing everything differently (strongest candidate); (d) an
+attention working buffer sized by chunk. The 512-token differential is REPRODUCIBLE
+(KLD 6.49e-07, top-1 100%), so the difference is specific to what a large chunk engages:
+the streamed share, the band, the possible fused toggle.
+
 (23) **THE FOLDING GATE IS BLOCKED BY A PRE-EXISTING NONDETERMINISM, NOT BY THE FOLD.**
 The band pin works exactly as designed (canonical set: **1,746 / 1,742 band on every
 arm**, the boot line naming the pin) — the (19) confound is GONE. But the self-check arm
