@@ -85,6 +85,28 @@ Layer anatomy (stage A, 153.2 ms): **whole** attention 54.4 on the lead (NOT spl
 see §4 correction) + lead-experts 77.8 + peer-wait 11.0. Stage B inverted (lead 77.1,
 peer 92.2). Leads' PCIe RX ~7.5 GB/s during prefill (tier fill + uploads + returns).
 
+## 2c. THE NIGHT OF 10-31 (the window executed; read TP2PP2-NOTES.md (6) first)
+
+Owner asleep; decision authority delegated ("if tp4 becomes a clear win, take it, too" —
+it did not: the prefill gate failed structurally, TP=4 stays shelved, kimi #9 confirmed).
+THE SERVING IS RESTORED: boot C, the clean recipe, the gap-instrumented binary (commit
+ffe18c18), SANE-verified, 75-78 t/s solo. Zero engine-code changes beyond instrumentation;
+all diffs reviewed against bytes per the owner's final instruction.
+
+THE MORNING'S TRACK (kimi #9's, in order):
+1. **PARTIAL-MERGE COMBINE FOR TP2 PREFILL** — the flagship lever: the peer sums its
+   experts' weighted outputs locally, returns ONE T x 2,560 vector (~10 ms CONSTANT)
+   instead of per-row results (50.4 ms scaling) -> the balancing constraint collapses to
+   pure compute balance -> prefill wall -25-35% (~2,600-2,700 t/s). Gate: the MoE sum's
+   reduction order changes -> PPL/KLD through the decode path + docs/precision/ page.
+2. **THE RECONCILIATION BOOT** — solo, pump vs unpiped, matched dl: three incompatible
+   window figures exist (19.4 / 25.3-25.9 / 40.8-44.7); UNTIL IT RUNS, quote NO tp2
+   decode-latency advantage (the gate on any topology sentence).
+3. **THE MISS-SERVING COUPLED LEVER** (the GPU-reach wait + the CPU pool as ONE unit):
+   L2-cover + adaptive boundary re-ranked up; then slots 2->4 (#3).
+4. Then re-state tp2 vs split with honest decode numbers; TP=4 shelved on measurement
+   (the banked positives: 42 us/round 4-rank coordination, the straggler refutation).
+
 ## 2b. THE DECODE CAMPAIGN (kimi #7, the current phase — supersedes §6's topology sequence)
 
 **The owner's redirect**: optimize tp2 decode to the limit ("much faster, or know why we
