@@ -2837,6 +2837,27 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(19) **THE FOLDING GATE IS STILL OWED — a third placement confound, at BAND level.**
+The 8192 bucket on a serving-shaped boot (stream_all_min drops to 2560, so `routed chunks
+to 2559 tokens` — the fold floor IS reachable and the guard passed). The three arms ran
+and the verdict FAILED, but the failure is NOT the fold's arithmetic: **the reference arm
+self-agrees at only 99.13%** (KLD 0.000668 against its own emission) — the bucket does not
+reproduce itself — and the tier facts show **band 591 vs 703** while both arms hold the
+same 5,384 / 13.86 GiB tier. So which experts sit in the RAM BAND differs run to run,
+which changes which rows take the band path, which changes the sums. This is the SAME
+class as the earlier VOIDs (placement 13.98 vs 13.86, then the swap-budget regression):
+a workflow-sensitive variable moving underneath the measurement.
+CONSEQUENCE, stated plainly: **the folding-scale differential remains UNMEASURED.** The
+flag ships on: the term-set ledger (45 real geometries, mutation-tested), the 512-bucket
+differential (KLD 6.49e-07, top-1 100%), the production A/B (+36%, no crash), SANE
+output, and the sanitizer-clean run. That is strong evidence the reduction order is
+sound, but it is NOT a folding-scale gate, and the notes say so. THE NEXT STEP is a
+gate arm that PINS the band: the band is chosen from the adaptive tier's state, so the
+gate must force `--adapt-swaps 0` (already done), and additionally force a FIXED band
+assignment (a new exp that disables the band, or a boot where the band is empty at this
+chunk) so the two arms cannot differ in it. Until then the gate's failing rows are not
+evidence about the fold.
+
 (18) **PARTIAL-MERGE SHIPS: +36% PREFILL, MEASURED AT PRODUCTION SCALE.** The worker's
 wrong-context fix RESOLVED IT: the crash I re-observed was the OLD INODE (the restored
 serving still ran the pre-fix binary — a stale-artifact error on my side, the same class
