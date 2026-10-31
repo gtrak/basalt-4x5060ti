@@ -2753,6 +2753,26 @@ wire (50.4 ms at its current share) scales with its rows and cancels the 1.63 us
 row-rate gain. The tp2 prefill is placement-optimal GIVEN the wire; the idle is
 wire-protected, the same class as the slice's dependency-protected idle. The prefill
 levers that remain: full sharding only (whose 4-rank hiding just measured 42.7%).
+(12) **THE GATE IS GREEN — AND THE FLAG STILL CANNOT SHIP (a 122k crash).**
+TWO ONE-LINE FIXES in the charge and the gate passed DECISIVELY: (a) mine — the charge
+walk priced the partial but the charge was never ADDED (log said "unused"; my first fix
+then added it TWICE, since peer_layout already books the partial — leaving the
+reference arms 11 MiB roomier, 13.75 vs 13.86); (b) the correct form: the pricing walk
+alone runs in the fold's mode, nothing is added. RESULT: all three arms hold 5,384
+experts / 13.86 GiB; **KLD mean 6.49e-07 (BELOW the emitter's 7.33e-05 floor), p99
+6.95e-05, max 1.06e-04, same top-1 100.00%, dlogp max 2e-06, PPL 7.1567 both
+arms — verdict PASS.** The 94.41% top-1 was ENTIRELY the placement confound; the fold's
+arithmetic is exact. THE SHIPPING TEST FAILED, though: boot E (the flag on, the clean
+recipe) is SANE on short prompts and computes a CORRECT answer, but the 122k prompt
+dies with **"prefill gr_write: invalid resource handle"** — a CUDA GRAPH capture error
+at the real scale (the gate ran 512-token chunks; the production prompt runs 8,192-token
+chunks with the deep ring). The flag stays DARK. NEXT (precise): the partial's buffers
+are allocated outside the graph-captured region or an event is recorded on a stream the
+graph owns — the prefill graph capture (the "captured the N-token window" path) must
+include the fold/pack copies, or the partial path must be excluded from capture at
+chunk > kDeepRingTokens. Reproduce with a 16k-token prompt on the flag-on boot; the
+error is deterministic and cheap. The serving: restored flag-off, SANE.
+
 (11) **THE ALIGNMENT KNOB FOUND — AND THE CHARGE IMPLEMENTATION'S ONE-LINE BUG.** The
 algebra (verified against all three data points): the tier room = free(partner) −
 (vram_reserve + split_pf + kWindowMib + kPairMibLater + peer_bytes/1MiB) in
