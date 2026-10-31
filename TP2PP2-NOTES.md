@@ -2753,6 +2753,12 @@ wire (50.4 ms at its current share) scales with its rows and cancels the 1.63 us
 row-rate gain. The tp2 prefill is placement-optimal GIVEN the wire; the idle is
 wire-protected, the same class as the slice's dependency-protected idle. The prefill
 levers that remain: full sharding only (whose 4-rank hiding just measured 42.7%).
+(4) THE POWER PROFILE (the owner's proxy method, dmon during live serving): tp2pp2
+draws 24-37% of TDP per card (leads 56-58 W avg, peers 44-47 W of 180 W TDP; SM util
+36-56%) — nothing compute-bound, the whole topology memory/idle-bound, the peers
+lowest (the idle + the wire wait). The owner's "tp2 utilization is pretty low"
+quantified: the headroom is real but wire-protected (see (2)).
+
 (3) The gap instrumentation landed in batch_step, but the tp2pp2 pair serving runs the
 PIPELINED pump() path (piped ? pump : batch_step) — the profile lines never fire; the
 decode-timing line DOES see the drumbeat (35-40 ms/window, GPU-reach wait ~12, per-layer
