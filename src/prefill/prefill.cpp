@@ -650,7 +650,7 @@ static uint64_t peer_act_bytes(bool acts_planes) {
 /// return leg is this many bytes a token whatever the share - where the row wire's was `K` rows a token.  The same
 /// widths as the rows themselves, so `--peer-rows-fp32` keeps its meaning: the summed partial crosses in the
 /// format the rows would have crossed in (`PeerPrefill::rows_bf16`).
-static uint64_t peer_part_bytes(bool rows_bf16) { return peer_row_bytes(rows_bf16); }
+static uint64_t peer_part_bytes(bool rows_bf16) { return peer_part_wire_bytes(1, N, rows_bf16); }
 
 /// The fold's own tables on the peer's leg, per row-visit: the row's index in its group and its router weight.
 /// Small, but it does scale with the share, so the price bills it instead of pretending the return leg is free.
