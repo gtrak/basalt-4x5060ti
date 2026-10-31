@@ -2837,6 +2837,27 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(27) **THE DUMP NAMES IT: THE ROUTER PARTS AT LAYER 20, WITH THE SPLIT AND BAND STILL
+IDENTICAL.** Two identical boots, `--exp chunk_dump=1`, 96 lines each, diffed:
+**layers 0-19 are BIT-IDENTICAL** on every field (path fp4, ids, split, lead/peer rows,
+band). At **layer 20 `ids=` diverges while `split=` still matches**, and the row counts
+shift (`lead 215/17973` vs `215/17975`). From layer 22 the split follows. So the FIRST
+parting is the ROUTER's computation in the prompt read — not the row split, not the band
+(the band count is 73/73 at layer 20), not the kernel choice (fp4 both), and not the CPU
+pool (cpu 0/0 on these lines, and the pool is not on the streamed path).
+THIS ELIMINATES, with evidence: the fused toggle (absent), the band membership/pin (equal),
+the expert row split (equal at the first divergence), the placement (equal), and (25)'s
+pool partition AS THE CAUSE OF THE PROMPT READ'S PARTING (the rows may still have a
+separate question — see (26)).
+WHAT IS LEFT: the layer-20 router's own arithmetic — the top-K selection over 512 experts
+(the router matmul plus its selection and tie-break). A near-tie in the top-K boundary is
+exactly the shape: identical for 19 layers, then one token's 10th expert flips. THE FIX
+DIRECTION: make the router's selection deterministic under equal scores (an explicit
+tie-break on expert id), and/or check whether the router matmul itself is
+partition-dependent (it is an MMQ/GEMV over n_embd=2560 with n_out=512 — if its reduction
+splits by the live thread/block count the way (25) described for the pool, the same class
+of bug is here). The dump is banked as the instrument that found it.
+
 (26) **`--exp chunk_dump=1`: the per-layer record that says which kernel ran and who served
 the rows — and what the artifacts already say before it is booted.**
 
