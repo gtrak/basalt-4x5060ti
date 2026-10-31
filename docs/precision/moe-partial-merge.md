@@ -102,9 +102,92 @@ limits the share); `qsa_lead_row_us`, `qsa_peer_row_us` and `qsa_link_mb_ms` re-
 line prints `partial T x 2560 (...)` instead of `rows ...` in its `fp4 peer share` entry, and the peer's rows in the
 `peer layer time` line's parens now name the fold.
 
+## How the gate measures it
+
+The gate is `tools/quality_gate.py` over the committed scored set `tests/data/quality/partial_merge.jsonl` (built and
+validated by `tools/quality_fixture.py`). Everything the two arms score is committed as token ids, so a tokenizer
+change cannot move the scored set: each chunk is exactly `n_ctx` tokens, its first `n_ctx/2 + 1` are the prompt and
+the rest are teacher-forced through verify windows of `--t` tokens. Nothing is generated, so the arms cannot diverge
+into two different sequences - which is what makes them comparable at all.
+
+One base file, three runs against it:
+
+| arm | what the engine does | what it is for |
+|---|---|---|
+| `emit` | writes its own head log-probs into the base's logit rows (`--ppl-emit`) | the reference: the flag-off arm as its own base |
+| `check` | reads that base back (`--ppl-base`), flag still off | proves the instrument: the emitter and the reader must agree |
+| `gate` | reads the same base, with `--exp peer_partial_merge=1` | the verdict |
+
+The base is a llama.cpp `_logits_` file laid out by the tool (header, every chunk's tokens, the logit rows left as a
+hole) and filled by the engine, so the reference is read back through the untouched KL-divergence reader that
+[quality.md](quality.md) already quotes - one measurement surface, not two. A chunk the engine never scored reads
+back with every log-prob at 0.0, which makes KLD enormous rather than plausible: a missing row fails loudly. A row's
+quantization is `PplGate::quantize_row`, shared by the writer and the reader and pinned by
+`tests/program/ppl_emit_parity_test.cpp`.
+
+### The three runs
+
+`$PACK` is `models/Qwen3.8-FN-FP4Local.basalt`, `$OUT` a scratch directory. The engine flags are the production
+server's, so the gate measures the shipping configuration; the two arms differ by exactly one word.
+
+```sh
+COMMON="--model $PACK --prefill 8192 --resident-budget-gib 37 --spec 8 --ple-io direct --kv int8
+        --max-context 262144 --resident-experts --peer-reserve-mib 600 --short-read 512
+        --tp-size 2 --peer-ram-rows --gpu 0,1,2,3 --batch 2"
+
+python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm emit $COMMON
+python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm check $COMMON
+python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm gate $COMMON \
+    --flag peer_partial_merge=1
+python3 tools/quality_gate.py --verdict $OUT
+```
+
+Flags the tool does not know go to the engine as they are, the way `tools/ppl_gate.py` passes them; an engine flag
+given here replaces the tool's default for that flag. The tool boots its own engine and drives it over its stdin
+(`ppl=K ppl_t=T` is an engine protocol key, not part of the server's HTTP API); it never connects to a running
+server. `--adapt-swaps 0 --peer-adapt-swaps 0` are forced on both arms so the adaptive tier cannot differ between
+them, and `--max-context` must clear the chunk plus its window. Run both length buckets (512 and 1024 tokens, 12
+and 6 chunks; the emitted base is 1.42 GiB each).
+
+## The bounds
+
+Not measured yet - **DERIVED-PRIOR**, to be calibrated by the first real run. The reasoning, and why each number is
+where it is:
+
+| bound | value | why |
+|---|---|---|
+| self-check KLD mean | `<= 1e-3` | the emitter's own floor is 7.3e-05 (see below); an order of magnitude above it means the writer and the reader have drifted, and then nothing the `gate` arm says means anything. **Violating this voids the run**, it is not a FAIL |
+| self-check same-top-1 | `== 100%` | the same argument: a row whose top-1 disagrees with itself is a row the instrument cannot see |
+| KLD mean | `<= 2e-3` | the change is a K-term reassociation plus one BF16 rounding of the partial - at worst half a `2^-7` ulp of the partial, not of the MoE output. ~27x the emitter's floor, and ~10% of the 0.0233 that separates two independent implementations of this model, so a genuine error of this class cannot hide under it while a real bug still trips it |
+| KLD p99 | `<= 2e-2` | the tail is where a reassociation error shows first: a token whose rows land badly across two cards moves its whole row, not the mean of the set |
+| same-top-1 | `>= 99%` | argmax agreement; near-ties may legitimately flip, and the CPU test's own worst BF16 case sits at 0.93-0.98 of its bound, so this is not free |
+| dlogp max | `<= 0.05` nats | the base's own top-1 token must not lose that much mass under the tested arm: a single row can be badly wrong and still leave the means untouched |
+
+One more condition, outside the numbers: **any row whose NLL moves by more than 1 nat is a FAIL regardless of the
+means** - a distribution that has moved that far is not the same distribution, however few such rows there are.
+
+A `PASS` licenses shipping the flag; a `FAIL` on `KLD mean` while `same-top-1` stays at 100% is the signature of
+reassociation noise above the bound rather than a wrong answer, and the first thing to try is `--peer-rows-fp32`,
+which removes the partial's rounding and should collapse the difference.
+
+### The emitter's floor, measured
+
+`tests/program/ppl_emit_parity_test.cpp` (`ctest -L cpu -R ppl_emit`) feeds synthetic head rows through
+`quantize_row` and decodes them with the reader's own arithmetic, at the model's vocabulary of 248,320:
+
+| measured | value |
+|---|---|
+| worst \|decoded − true\| log-prob | 5.5e-04, within half the row's uint16 step plus float slack |
+| worst KL(base ‖ test) against its own logits | **7.33e-05** |
+| emitted top-1 vs the logits' top-1 | agrees on every row |
+
+That 7.33e-05 is the resolution of the instrument, not a property of the model: it is what the `check` arm will
+report if nothing is wrong, and every bound above is stated relative to it.
+
 ## Status of the gate
 
-The mode is **not yet graded**. It needs the project's quality gate on the real pack — PPL and KLD against the
-Q8_0 reference through the decode path (`basalt-bench --quality`) — and per-layer timing from a boot with the flag
-on against one with it off. Until those exist, treat the numbers above as the arithmetic's bounds, measured on
-synthetic rows, and nothing as a quality or performance claim.
+Built, unit-tested, **not yet run**: the three arms need the pack on the cards, so the boots are the operator's.
+Until a run exists, treat everything in this page as the arithmetic's bounds measured on synthetic rows, and the
+`+34-35%` prefill figure as a development A/B - the flag stays dark (`--exp peer_partial_merge=1`, off by default)
+until `--verdict` prints PASS on both length buckets and the numbers above are replaced by the run's own.
+
