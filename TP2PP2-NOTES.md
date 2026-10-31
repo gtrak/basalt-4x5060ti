@@ -3160,6 +3160,11 @@ python3 tools/quality_gate.py --verdict $OUT
 Expect the `tier` line to print 5384 held / 13.86 GiB room on all three arms; if it does not, the verdict names the
 card, the gap and the arm to charge, and the run stays VOID.
 
+**The gate boots `bin/basalt`, and that binary predates `--exp peer_charge_partial`** (built 13:49 today; the flag
+landed after). The re-gate therefore starts with a build, and `bin/basalt` is the file the live server on `:8000`
+was started from, so relinking it is the window's call, not something to do under a running server. A boot with
+the key unset is unaffected either way.
+
 **Checks run**: `tools/test_quality_gate.py` OK (35, was 31 — the missing-log cases and the exp-merging cases);
 `ctest -L cpu` 71/72 (the failure is `expert_multi_test`, this host having no AVX-512 at all, no dependency on any
 file here); `cmake --build build --target prefill` clean; `tools/check_platform_boundary.sh` and
