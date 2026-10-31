@@ -2753,6 +2753,21 @@ wire (50.4 ms at its current share) scales with its rows and cancels the 1.63 us
 row-rate gain. The tp2 prefill is placement-optimal GIVEN the wire; the idle is
 wire-protected, the same class as the slice's dependency-protected idle. The prefill
 levers that remain: full sharding only (whose 4-rank hiding just measured 42.7%).
+(14) **NO REGRESSION — THE 80 t/s IS STILL THERE (owner asked; the engine is cleared).**
+The engine-side audit: every commit since the 80 t/s era is instrumentation or
+FLAG-GATED (partial-merge, peer_charge_partial, ppl-emit — all default OFF); nothing on
+the default serving path changed. THE REAL ANSWER: **mean 80.5 t/s over the last 30
+decode-timing samples**, with 25 of 30 windows at >= 3.5 tok/window (T 3.3-6.2, the
+drafter policy converged). The 47-60 t/s figures from today's sweeps were SHORT COLD-START
+probes: the DraftPolicy (draft_policy.hpp, "learned over the whole process") picks the
+window size from EMA acceptance/cost and needs a long generation to converge, so a
+600-token done-line grades the cold start, not the engine. **MEASUREMENT RULE (new,
+enforced): decode t/s from done-lines on generations < ~1500 tokens is NOT an engine
+grade — read the decode-timing window line (tok/window + ms/window) instead, or run
+>=1800 tokens.** This is the per-layer-metrics discipline applied to decode. The
+adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
+rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
+
 (13) **DECODE SPEED HUNT (autonomous, flag sweeps on quiet silicon)**: **--adapt-swaps
 96 -> 384 = +10.5% decode** (3-run matched-acceptance A/B: 96 gives 46.8/53.3/57.2 =
 mean 51.0 t/s; 384 gives 52.1/60.7/64.0 = mean 56.4; acceptance 71-75% either side; the
