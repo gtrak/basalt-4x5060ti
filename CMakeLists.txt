@@ -1136,6 +1136,12 @@ if(BUILD_TESTING)
   target_include_directories(moe_part_parity PRIVATE include)
   target_link_libraries(moe_part_parity PRIVATE Threads::Threads)
   basalt_cpu_test(NAME moe_part_parity COMMAND moe_part_parity)
+  # the emitted base of the differential quality gate: the row the emitter writes must decode back, through the
+  # untouched llama.cpp reader, to the log-probs of the logits it was given (basalt/program/ppl_gate.hpp)
+  add_executable(ppl_emit_parity_test tests/program/ppl_emit_parity_test.cpp)
+  target_include_directories(ppl_emit_parity_test PRIVATE include)
+  target_link_libraries(ppl_emit_parity_test PRIVATE Threads::Threads)
+  basalt_cpu_test(NAME ppl_emit_parity COMMAND ppl_emit_parity_test)
 endif()
 
 add_library(kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
