@@ -2753,6 +2753,24 @@ wire (50.4 ms at its current share) scales with its rows and cancels the 1.63 us
 row-rate gain. The tp2 prefill is placement-optimal GIVEN the wire; the idle is
 wire-protected, the same class as the slice's dependency-protected idle. The prefill
 levers that remain: full sharding only (whose 4-rank hiding just measured 42.7%).
+(7) **PARTIAL-MERGE: MEASURED +34% — GATED-OWED (the morning's decision)**: boot D ran
+--exp peer_partial_merge=1 (build: 5 commits, diff-reviewed CLEAN — the fold kernel one
+thread per (token,dim), deterministic k-order, the zeroing race caught pre-emptively;
+parity: flag-off bitwise, FP32 1.2e-7, BF16 within half-ulp). The boot: the return leg
+priced 10.0 ms constant (was 50.4 scaling), the crossing 621 -> 154 MiB/1024 tokens, and
+THE PREFILL A/B: **2,688 / 2,712 t/s vs the 2,004 baseline — +34-35%**, at the top of
+kimi #9's projection (the model's cap-bound pessimism was wrong — the boot decided).
+SANE probes pass; the greedy output differs from flag-off AS THE REDUCTION ORDER
+PREDICTS. **THE GATE IS OWED**: no PPL/KLD base artifact exists (the harness was never
+built — AGENTS.md requires it for numerics-affecting changes), so the flag stays DARK
+for serving until gated; the serving restored flag-off. THE RESIDENCY RE-WALK is the
+next unlock (the peer's r clamps at the experts it holds ~50% — under the flag the
+optimal residency shifts, the peer should hold MORE experts; the model's cap-bound
+prediction ignored this and was still beaten by the boot). The morning: (1) build the
+PPL/KLD harness (the base from the reference logits + the procedure), (2) gate the flag,
+(3) if green: the flag ships (+34% prefill), (4) the residency re-walk on top, (5) the
+reconciliation boot (still owed).
+
 (6) **KIMI #9 — THE NIGHT VERIFIED, THE MORNING NAMED**:
 - TP=4 shelved CONFIRMED STRUCTURAL — the reduce is dependency-sandwiched (only ~42-52%
   intra-layer independent compute exists to hide under; 70% would need dependency-free
