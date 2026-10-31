@@ -2735,7 +2735,28 @@ on (inert on verbatim tails by construction, active where the sims say it pays).
 - Term-by-term: the model's attn (54.4) and rows (89.5) track the chunk lines (attn
   48.5-50.0, lead-experts 87.8) within ~5-10% - the accounting is honest.
 - blob_mb_ms still unmeasured (the one constant the model admits not knowing).
-- Prefill re-confirmed 2,004 t/s fresh concurrent on this boot.**FIRST MEASURED CONCURRENT DECODE AGGREGATE (live, the worker code-gen class)**: two
+- Prefill re-confirmed 2,004 t/s fresh concurrent on this boot.**KIMI #8 — the TP=4 arithmetic CORRECTED (the night's most consequential finding)**:
+my prefill case under-priced the combine wire ~4x. The routed output crosses at
+n_embd=2560-wide BF16 = 5,120 B per ROUTING (640 is the FFN hidden width — nothing
+640-wide crosses a card), volume per routing T x K x (1-1/4) = 61,440/layer/chunk.
+Row-shipping: ~250 GB total — EXCEEDS the entire d2d pool at zero exposure (dead by
+capacity). Only partial-merge combine fits (~65-95 GB, 2.7-3.9 GB/s aggregate) — but
+it changes the MoE sum's reduction order => PPL/KLD gate, non-negotiable. Side note
+with teeth: partial-merge is 5x cheaper at TP=2 too (42 vs 210 MB/layer-chunk) —
+"why is the current pair row-shipping" is now an open question. The sglang prior
+downgraded to weak evidence (compute-bound + shared pool vs bandwidth-bound +
+per-link-independent). The bench got three mandatory extensions (two-channel cadence,
+decode-cadence mode, two combine channels; SM/copy-engine separation mandatory).
+The collective-free decode ruling EXTENDS a fortiori to TP=4 — the natural design
+generalizes the peer-window/ring from 2 to 3 peers (dec_moe.hpp kDmMaxX=2 is the
+literal seam). The window order: gap -> extended bench -> share re-price -> power
+piggybacked (dmon during the other boots; power is a MISLEADING idle indicator in
+compute-bound phases unless phase-tagged). The drafter retired as done-at-scale.
+Owed: a split-concurrent baseline (matched dl) before any morphology claim.
+Full verdict filed; the corrected ledger + the gates + the decision rule in
+TP4-SKETCH.md. The lever ranking UNCHANGED in order.
+
+**FIRST MEASURED CONCURRENT DECODE AGGREGATE (live, the worker code-gen class)**: two
 slots' agentic turns interleaving — done-lines acc 68-88%, dl 2.7-4.1, 51-76 t/s per slot;
 the live totals swinging 79 -> 93 t/s, with both-slots-speculating-well bursts crossing
 ~114. The drafter reseed's payoff at scale: the acceptance holding high through real
