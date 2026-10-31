@@ -2625,6 +2625,23 @@ rule and needs the PPL/KLD gate, not just greedy identity.
    term-by-term vs peer chunk; the row-rate ratio >= 1.4x) + a blob_mb_ms measurement -
    1-boot exercises, top of the morning list.
 
+**RUN 25 FINAL GRADE — the pitch fix landed (3187f880: the gate took one pitch for three
+operands; only the lead's are wide — the product read rows the gate never wrote = the NaN
+source), correctness RESTORED (the =2 greedy output coherent, semantically valid; the greedy
+stream differs from gate-off as the FP32 reduce's reordering predicts — the bar is semantic
+validity, not bitwise), and the =2 grade on clean correctness: 1,836 t/s (-8.2%). THE
+STRUCTURAL FINDING IS NOW MEASURED THREE WAYS: =1 half-pipelined 1,833 / =2 corrupted 1,826 /
+=2 clean 1,836 — all -8.5 to -8.9%, peer-wait 69.7 ms invariant to staging depth, event
+protocol, and correctness state. THE DATA DEPENDENCY IS THE WHOLE STORY: the partner's
+attention(l+1) consumes mixed_h(l+1) = the lead's MoE(l) output — no software lever removes
+that serial cost. Decode tier tax confirmed: 63.6 t/s cached under the flag (vs 77-82).
+THE CHARACTERIZATION IS COMPLETE: the slice under PP=2 is structurally -8.5%, unfixable by
+software; its machinery folds into full sharding only; full sharding's best projection
+(2,430-2,520) loses to the split's 3,750 on prefill at its own best case; the decode win
+(19.4 vs 35.4 ms windows) is real and topology-bound. THE OWNER'S DECISION: workload-value —
+halved decode latency + ~2,430-2,520 prefill vs doubled decode latency + 3,750 prefill, or
+the morph (split for prefill-heavy phases, tp2 for latency-sensitive ones).
+
 **KIMI REVIEW #6 (the night's capstone, on the full measured set):**
 1. The structural finding CONFIRMED airtight at its measured granularity (the one escape -
    sub-layer tile scheduling - priced and rejected: it contradicts RUN 24's coarser-rendezvous
