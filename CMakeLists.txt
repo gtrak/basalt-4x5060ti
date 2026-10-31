@@ -1136,6 +1136,11 @@ if(BUILD_TESTING)
   target_include_directories(moe_part_parity PRIVATE include)
   target_link_libraries(moe_part_parity PRIVATE Threads::Threads)
   basalt_cpu_test(NAME moe_part_parity COMMAND moe_part_parity)
+  # the RAM band's share: the rank walk the price, the lead's stream and the row split all count with, and the
+  # eighths `--exp peer_band_pin` fixes it to (basalt/prefill/peer_band.hpp, which prefill.cpp calls)
+  add_executable(peer_band_parity tests/prefill/peer_band_parity.cpp)
+  target_include_directories(peer_band_parity PRIVATE include)
+  basalt_cpu_test(NAME peer_band_parity COMMAND peer_band_parity)
   # the emitted base of the differential quality gate: the row the emitter writes must decode back, through the
   # untouched llama.cpp reader, to the log-probs of the logits it was given (basalt/program/ppl_gate.hpp)
   add_executable(ppl_emit_parity_test tests/program/ppl_emit_parity_test.cpp)

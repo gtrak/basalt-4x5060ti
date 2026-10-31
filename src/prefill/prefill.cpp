@@ -32,6 +32,7 @@
 #include "basalt/prefill/moe_fold.hpp"
 #include "basalt/prefill/moe_part.hpp"   // the partial's widths, which the fold's buffers are allocated from
 #include "basalt/prefill/moe_fp4.hpp"
+#include "basalt/prefill/peer_band.hpp"   // the RAM band's share, which the price and the stream count together
 #include "basalt/ggml/ggml.h"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/platform/file.hpp"
@@ -803,6 +804,8 @@ struct PeerPrefill {
     bool ram_rows = false;                  // the program asked for it and the placement pays (`set_peer`)
     int ram_num = 0;                        // `ram_num` of every PeerRamShare::kDen band experts take the band
     int64_t ram_top = 0;                    // no chunk longer than this uses the band (PeerRamShare::top)
+    bool ram_canonical = false;             // the share came from `--exp peer_band_pin`: the band is the canonical
+                                            // set, so the walk tests membership before this card's residency
     int ring = 0;                           // staging slots, 0 with the share off
     static constexpr int kRing = 48;        // three groups' blobs in flight: the peer's copy engine never waits on
                                             // its own compute, and a slot is 2.4 MiB of the peer's VRAM
@@ -1982,13 +1985,23 @@ struct RamView {
     const core::ExpertSource* src = nullptr;
 };
 
-/// The experts whose bytes lie in the RAM tier: held by no card's tier, and page-locked in host memory, so any card
-/// can read their blobs over its own PCIe link.  `set_peer` prices them and the streamed walk picks them out with
-/// this same test, so a blob the lead leaves out of its stream is always one the partner reads for itself.
-static bool in_ram_band(const RamView& v, const core::PeerExperts& peer, int64_t l, int32_t e, int64_t n_expert) {
-    if (v.host_res && v.cache && v.host_res[(size_t) l * n_expert + e] >= 0) return false;
+/// The experts whose bytes the partner may read for itself: the ONE test the price (`peer_ram_share`,
+/// `peer_link`) and the streamed walk count the band with, so a blob the lead leaves out of its stream is always
+/// one the partner reads.  Unpinned these are the experts whose bytes lie in the RAM tier - held by no card's
+/// tier, and page-locked in host memory, so any card can read their blobs over its own PCIe link.
+///
+/// `pinned` (`--exp peer_band_pin`, a gate instrument) replaces that with the CANONICAL test: every expert the
+/// PARTNER's tier leaves, whatever this card's tier or the host complement happens to hold.  The band's members
+/// are then chosen by the peer's placement and the expert's id alone, so two boots of one build hand the same
+/// experts over even when their resident fills differ - which the rank `peer_band_taken` counts, and therefore
+/// the rows each card computes, depend on.  The cost is stated where it bites: the walk hands over an expert this
+/// card's tier holds as well, and that copy idles for the chunk.
+static bool in_ram_band(const RamView& v, const core::PeerExperts& peer, int64_t l, int32_t e, int64_t n_expert,
+                        bool pinned) {
     if (peer.has(l, e)) return false;
     if (v.ring_peer && v.ring_peer->exclusive() && v.ring_peer->has(l, e)) return false;
+    if (pinned) return v.src != nullptr;   // the peer's tier is all the test reads: neither card's fill moves it
+    if (v.host_res && v.cache && v.host_res[(size_t) l * n_expert + e] >= 0) return false;
     return v.src != nullptr && v.src->pinned(l, e);   // bytes only in the file's pages: the lead's stager reads them
 }
 
@@ -2100,22 +2113,25 @@ static PeerLayerTime peer_layer_time(const PeerTimePrice& p, int64_t chunk, int6
 /// the A/B the time objective is graded against; its `r` is the point where the lead's blob lane meets the pair's
 /// link lane.
 struct PeerRamShare {
-    static constexpr int kDen = 8;            // the share's denominator, fixed so every card counts the band alike
+    static constexpr int kDen = kPeerBandDen;   // the share's denominator, fixed so every card counts the band alike
     int64_t layers = 0, band = 0, take = 0;   // the layers with a band, its experts, and those the partner reads
     int64_t heavy = 0;                        // of the stage's layers, those whose band's rows outweigh its blob
-    int num = 0;                              // `take` of `band`, rounded to eighths
+    int num = 0;                              // `take` of `band`, rounded to eighths (or the pin's, see below)
     int64_t top = 0;                          // the longest chunk whose expert's rows still weigh less than its blob
     uint64_t lead = 0, pair = 0;              // the two lanes' bytes over those layers at the priced share
     PeerLayerTime sum;                        // the two cards' predicted layer times at the priced share, summed
+    int pin = 0;                              // the `--exp peer_band_pin` this was priced at, 0 = the model's share
     /// The band experts the partner reads: `num` of every `kDen` of them, counted in id order, so the choice never
     /// depends on the routing and the price, the lead's stream and the row split all pick out the same ones.
-    static bool taken(int64_t k, int num) { return k % kDen < num; }
+    static bool taken(int64_t k, int num) { return peer_band_taken(k, num); }
 };
 
 static PeerRamShare peer_ram_share(const RamView& v, const core::PeerExperts& peer, int64_t lb, int64_t le,
                                    int64_t n_expert, int64_t chunk, bool rows_bf16, bool acts_planes,
-                                   bool partial_merge, const PeerTimePrice& price, bool time_objective) {
+                                   bool partial_merge, const PeerTimePrice& price, bool time_objective, int pin) {
     PeerRamShare pr;
+    pr.pin = pin;
+    const bool pinned = pin > 0;   // the band is the canonical set and the share is ordered, not struck
     if (n_expert <= 0 || chunk <= 0) return pr;
     const uint64_t rb = peer_row_bytes(rows_bf16);
     const uint64_t acts = (uint64_t) chunk * peer_act_bytes(acts_planes);   // the layer's activations, out over the link
@@ -2123,20 +2139,25 @@ static PeerRamShare peer_ram_share(const RamView& v, const core::PeerExperts& pe
         int64_t held = 0, band = 0;
         for (int32_t e = 0; e < n_expert; ++e) {
             if (peer.has(l, e)) { ++held; continue; }
-            if (in_ram_band(v, peer, l, e, n_expert)) ++band;
+            if (in_ram_band(v, peer, l, e, n_expert, pinned)) ++band;
         }
         if (band == 0) continue;
         const uint64_t B = core::PeerExperts::slot_bytes(l);
         const uint64_t w = (uint64_t) chunk * (uint64_t) K / (uint64_t) n_expert * rb;
         const PeerLayerTime t0 = peer_layer_time(price, chunk, n_expert, held, band, 0, rb, acts, B, partial_merge);
-        // a band whose move costs more than it saves, in whichever currency the balance is struck in, stays whole
-        if (w >= B || (time_objective && t0.d_peer >= t0.d_lead)) { ++pr.heavy; continue; }
+        // a band whose move costs more than it saves, in whichever currency the balance is struck in, stays whole -
+        // unless the share was ordered: `--exp peer_band_pin` is the operator deciding, so nothing vetoes it here
+        if (!pinned && (w >= B || (time_objective && t0.d_peer >= t0.d_lead))) { ++pr.heavy; continue; }
         ++pr.layers;
         pr.band += band;
         const int64_t top = (int64_t) (B * (uint64_t) n_expert / ((uint64_t) K * rb));
         pr.top = pr.top == 0 ? top : std::min(pr.top, top);
         int64_t r;
-        if (time_objective) {
+        if (pinned) {
+            // the count `taken` will actually hand over at the pinned share, so the price below is the price of
+            // what runs rather than of a share the walk never takes
+            r = peer_band_take(band, pin);
+        } else if (time_objective) {
             // the cards meet where the lead's time comes down to the peer's; both move `d_lead`/`d_peer` per expert
             const double gap = t0.lead_ms() - t0.peer_ms();
             r = gap > 0 ? (int64_t) (gap / (t0.d_lead + t0.d_peer) + 0.5) : 0;
@@ -2151,7 +2172,7 @@ static PeerRamShare peer_ram_share(const RamView& v, const core::PeerExperts& pe
         // peer_share_cap=1` lets the placement use the whole band instead; the ceiling that still binds is the
         // band's own size, which is a memory bound, not a wire one.
         const int64_t half_cap = (int64_t) (n_expert / 2 - held);
-        r = std::min(r, core::exp_flag("peer_share_cap", 0.0) != 0.0 ? (int64_t) band : half_cap);
+        if (!pinned) r = std::min(r, core::exp_flag("peer_share_cap", 0.0) != 0.0 ? (int64_t) band : half_cap);
         r = std::max<int64_t>(0, std::min(r, band));
         pr.take += r;
         pr.lead += (uint64_t) (band - r) * B;
@@ -2165,7 +2186,13 @@ static PeerRamShare peer_ram_share(const RamView& v, const core::PeerExperts& pe
         pr.sum.peer_rows += t.peer_rows;
         pr.sum.peer_acts += t.peer_acts;
     }
-    if (pr.take > 0 && pr.band > 0)
+    if (pinned) {
+        // The pin IS the share, and no chunk length vetoes it: `top` is the price model's opinion of when a row is
+        // cheaper than its blob, and the operator has just overruled that.  Priced at `chunk`, the longest chunk
+        // the leg is ever given, so the run's `T <= PeerPrefill::ram_top` test always passes.
+        pr.num = peer_band_num(pr.band, pin, 0);
+        pr.top = pr.num > 0 ? chunk : 0;
+    } else if (pr.take > 0 && pr.band > 0)
         pr.num = (int) std::min<int64_t>(PeerRamShare::kDen,
                                          std::max<int64_t>(1, (pr.take * PeerRamShare::kDen + pr.band / 2) / pr.band));
     return pr;
@@ -3199,6 +3226,7 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
     if (pp->ram_rows) {
         pp->ram_num = ram->num;
         pp->ram_top = ram->top;
+        pp->ram_canonical = ram->pin > 0;
     }
     const int64_t Tp = std::max(pp->T_max, tf);   // the longest chunk the peer takes
     if (pp->partial_merge) {   // the fold's counting sort, sized for the widest chunk the leg takes
@@ -3364,10 +3392,12 @@ struct PeerLink {
 
 /// Both sides of the pair's link bill for `peer`'s placement over the layers [lb, le); `n_expert`: a layer's experts.
 /// With `ram_num` the band's share (null `m`: no band), the bill includes the experts the partner reads for itself,
-/// so the share's crossover widens with the coverage it buys.  The rows back are billed at the wire's width
-/// (`peer_row_bytes`) and the activations out at theirs (`peer_act_bytes`).
+/// so the share's crossover widens with the coverage it buys.  `pinned` is `--exp peer_band_pin` on: the band is
+/// then the canonical set (`in_ram_band`), which is the same test the walk counts, so the bill prices the share
+/// that actually runs.  The rows back are billed at the wire's width (`peer_row_bytes`) and the activations out at
+/// theirs (`peer_act_bytes`).
 static PeerLink peer_link(const core::PeerExperts& peer, const RamView* v, int64_t lb, int64_t le, int64_t n_expert,
-                          int ram_num, bool rows_bf16, bool acts_planes, bool partial_merge) {
+                          int ram_num, bool pinned, bool rows_bf16, bool acts_planes, bool partial_merge) {
     PeerLink pl;
     if (n_expert <= 0) return pl;
     const uint64_t rb = peer_row_bytes(rows_bf16), ab = peer_act_bytes(acts_planes);
@@ -3376,7 +3406,8 @@ static PeerLink peer_link(const core::PeerExperts& peer, const RamView* v, int64
         int64_t held = 0, moved = 0, k = 0;
         for (int32_t e = 0; e < n_expert; ++e) {
             if (peer.has(l, e)) { ++held; continue; }
-            if (v != nullptr && in_ram_band(*v, peer, l, e, n_expert) && PeerRamShare::taken(k++, ram_num)) ++moved;
+            if (v != nullptr && in_ram_band(*v, peer, l, e, n_expert, pinned) && PeerRamShare::taken(k++, ram_num))
+                ++moved;
         }
         if (held == 0 && moved == 0) continue;
         ++pl.layers;
@@ -3749,16 +3780,29 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
     // `--exp qsa_share_bytes=1` (the earlier objective, kept as the A/B and the fallback).
     const PeerTimePrice price = peer_time_price(lb == 0);
     const bool time_objective = core::exp_flag("qsa_share_bytes", 0.0) == 0;
+    // `--exp peer_band_pin=N`: the band's share FIXED to N of every `PeerRamShare::kDen` of its experts, and its
+    // membership fixed to the canonical set with it (`in_ram_band`), so two boots of one build hand the partner
+    // the same experts whatever either card's resident fill ends up holding.  A gate instrument: it hands over
+    // experts this card's tier holds too, so a pinned boot's placement is NOT production's and its wall is not a
+    // throughput number (docs/precision/moe-partial-merge.md).  A value that is not a whole number of eighths is
+    // refused rather than rounded: a sweep that misspoke itself would otherwise be read as a neighbouring share.
+    const double pin_flag = core::exp_flag("peer_band_pin", 0.0);
+    if (pin_flag != std::floor(pin_flag) || pin_flag < 0 || pin_flag > PeerRamShare::kDen) {
+        err = "prefill peer: --exp peer_band_pin=" + std::to_string(pin_flag) +
+              " is refused: the share is a whole number of eighths, 0 to " + std::to_string(PeerRamShare::kDen);
+        return false;
+    }
+    const int band_pin = (int) pin_flag;
     const PeerRamShare prs = peer_ram_rows && !peer_fp4_gate(streamed_share)
                                  ? peer_ram_share(rv, *peer, lb, le, ne, m.T_max, rows_bf16, acts_planes, partial,
-                                                  price, time_objective)
+                                                  price, time_objective, band_pin)
                                  : PeerRamShare{};
     // The head cut the ratio names for this stage.  It changes no work here - the prompt attention runs whole on
     // the lead - so it is carried for the line below, which prices the pair's two cards at it.
     const double ratio = core::exp_flag(lb == 0 ? "qsa_ratio_stage_a" : "qsa_ratio_stage_b", 0.5);
     const int64_t heads = m.g ? m.g->n_head : 0;
-    const PeerLink pl = peer_link(*peer, prs.num > 0 ? &rv : nullptr, lb, le, ne, prs.num, rows_bf16, acts_planes,
-                                  partial);
+    const PeerLink pl = peer_link(*peer, prs.num > 0 ? &rv : nullptr, lb, le, ne, prs.num, prs.pin > 0,
+                                  rows_bf16, acts_planes, partial);
     // capped by the ceiling `peer_bytes` sized its buffers for, so the allocation always fits the reserve
     const int64_t t_fp4 = peer_fp4_possible(streamed_share)
                               ? std::min({m.T_max, pl.tokens,
@@ -3773,6 +3817,13 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
         basalt::log::warn("basalt prefill", "%s", why.c_str());
     }
     const bool ram_on = prs.num > 0 && tf > 0;
+    if (band_pin > 0 && !ram_on)
+        basalt::log::warn("basalt prefill", "peer band pin %d of %d unused: %s", band_pin,
+                          (int) PeerRamShare::kDen,
+                          !peer_ram_rows ? "--peer-ram-rows is off"
+                                         : (peer_fp4_gate(streamed_share) != nullptr
+                                                ? peer_fp4_gate(streamed_share)
+                                                : "no band to share at the priced chunk"));
     // The one line that says what this pair's prompt share is: the crossover, whether the FP4 share is on and if not
     // which gate shut, the routed-only share with the derate an unlike partner carries, and the RAM band's verdict.
     const char* gate = peer_fp4_gate(streamed_share);
@@ -3792,7 +3843,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
              : prs.band == 0 ? "off: no RAM band, every expert of the stage is on a card"
                              : "off: the pair's link already carries more than the lead's at " +
                                    std::to_string(m.T_max) + " tokens";
-    else
+    else {
         band = "on, " + std::to_string(prs.num) + "/" + std::to_string(PeerRamShare::kDen) + " of " +
                std::to_string(prs.band) + " band experts of layers " + std::to_string(lb) + "-" + std::to_string(le) +
                " over " + std::to_string(prs.layers) + " layers read on the partner's own link: " +
@@ -3800,6 +3851,10 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
                std::to_string(prs.pair / (prs.layers << 20)) +
                " MiB a layer of activations and rows on the pair's, to " + std::to_string(prs.top) +
                " tokens, its ring " + std::to_string(PeerPrefill::kRing) + " slots";
+        if (prs.pin > 0)
+            band += ", the share and the band pinned (--exp peer_band_pin=" + std::to_string(prs.pin) +
+                    "): the placement is canonical, not this pair's";
+    }
     basalt::log::info("basalt prefill",
                       "peer fp4 crossover %lld tokens: %llu MiB of activations and rows per 1024 tokens against "
                       "%llu MiB of partner-held blobs over %lld layers (%lld experts held, %lld band); the share is "
@@ -4358,6 +4413,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // compute.  Decided here, at the chunk's start and before the routing is known, exactly like the stream's
         // other skips, and recorded in `ram_take` so the row split below always sends a skipped expert's rows there.
         const bool peer_ram = ppc != nullptr && peer_fp4 && ppc->ram_num > 0 && T <= ppc->ram_top;
+        // what the band's membership test reads of this card's state: `in_ram_band`'s own view, built once here so
+        // the stream and the setup-time price read the same four pointers
+        const RamView band_view{m.host_res, m.cache, m.ring_peer, m.src};
         struct PeerEntry { int32_t l, e; const uint8_t* blob; };
         std::vector<PeerEntry> pseq;
         std::vector<size_t> pseq_start;
@@ -4379,13 +4437,41 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const bool ram_l = peer_ram && mmq_plan().any && mmq_plan().layer[(size_t) l];
                 int64_t rk = 0;
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
-                    if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                    const bool resident = m.host_res && m.cache &&
+                                          m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                    int job = -1;
+                    const uint8_t* b = nullptr;
+                    // The band's own test, AHEAD of the residency skip below - which is the whole point of the
+                    // pin.  With `--exp peer_band_pin` the band is the canonical set (`in_ram_band`), so an expert
+                    // this card's tier happens to hold is handed to the partner exactly like one it does not: its
+                    // blob goes over from host memory and the tier copy idles for this chunk.  That is what makes
+                    // two boots of one build hand over the same experts whatever the fill costs them, and it is
+                    // why the flag grades the fold's arithmetic instead of measuring the pair (see the boot line
+                    // and docs/precision/moe-partial-merge.md).  An unpinned band never names a resident expert
+                    // (`in_ram_band` refuses one), so for it the skip below is still the whole rule.
+                    const bool band = ram_l && ppc->peer &&
+                                      in_ram_band(band_view, *ppc->peer, l, e, m.g->n_expert, ppc->ram_canonical);
+                    if (band && PeerRamShare::taken(rk++, ppc->ram_num)) {
+                        b = m.src->blob(l, e);
+                        if (b) {   // leave it out of this card's stream entirely: the partner reads it, computes the rows
+                            ram_take[(size_t) l * m.g->n_expert + e] = 1;
+                            peer_holds[(size_t) l] = 1;
+                            pseq.push_back({(int32_t) l, e, b});
+                            continue;
+                        }
+                        // No host copy to hand over, so the expert stays where its bytes are.  An unpinned band
+                        // promised one (`in_ram_band` read `pinned`), so the source breaking that promise is the
+                        // error it has always been; a pinned band asked for an expert only another card holds.
+                        if (!ppc->ram_canonical && !resident) {
+                            err = "prefill: expert source has no blob";
+                            return false;
+                        }
+                    }
+                    if (resident) continue;
                     if (ppc && ppc->peer && ppc->peer->has(l, e)) {
                         peer_holds[(size_t) l] = 1;   // multi-GPU: computed on (or read from) the peer
                         continue;
                     }
-                    int job = -1;
-                    const uint8_t* b = nullptr;
                     if (m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(l, e)) {   // no host copy: from the peer
                         seq.push_back({(int32_t) l, e, nullptr, -1, m.ring_peer->slot_ptr(l, e), m.ring_peer->device()});
                         continue;
@@ -4398,15 +4484,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     }
                     {
-                        b = m.src->blob(l, e);
+                        if (!b) b = m.src->blob(l, e);
                         if (!b) { err = "prefill: expert source has no blob"; return false; }
-                        if (ram_l && m.src->pinned(l, e) && PeerRamShare::taken(rk++, ppc->ram_num)) {
-                            // leave it out of this card's stream entirely: the partner reads it and computes the rows
-                            ram_take[(size_t) l * m.g->n_expert + e] = 1;
-                            peer_holds[(size_t) l] = 1;
-                            pseq.push_back({(int32_t) l, e, b});
-                            continue;
-                        }
                         if (!m.src->pinned(l, e)) {
                             job = (int) js.size();
                             js.push_back(make_job(*m.src, l, e, b, (size_t) lay0.blob_bytes(l)));
@@ -4950,7 +5029,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool fp4_l = use_mmq && lay.native && mmq_gt == GGML_TYPE_NVFP4 && mmq_dt == GGML_TYPE_NVFP4 &&
                                        lay.fmt[(size_t) l].tail != 0 && T >= FP4_MIN_TOKENS;
                     const bool fused_nat = use_mmq && stream_all && lay.native && fused::native_supported(mmq_gt, mmq_dt);
-                    const bool fused_l = (use_mmq && stream_all && !lay.native && fused::enabled()) || fused_nat;
+                    // A PINNED band hands the partner experts this card's tier holds, so the layer must run on the
+                    // MMQ path, which is the one that honours the row split: the fused path walks every expert of
+                    // the layer and would compute the partner's rows here as well.  The gate at `peer_fp4_gate`
+                    // already shuts the FP4 leg (and with it the band) on a pack the fused kernels cover whole;
+                    // this is the case where only some of a native pack's layers are covered.  Inert unless pinned.
+                    const bool fused_l = ((use_mmq && stream_all && !lay.native && fused::enabled()) || fused_nat) &&
+                                         !(ppc != nullptr && ppc->ram_canonical && peer_ram);
                     bool peer_now = false;                // multi-GPU: the peer computed rows of this layer (MMQ path only)
                     bool acts_sent = false;               // ... and this layer's activations reached its card
                     int64_t peer_lo = 0, peer_n = 0;      // ... and the block of Dm rows its share filled
@@ -5168,12 +5253,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             on_peer.assign((size_t) m.g->n_expert, 0);
                             for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                 const int32_t c = m.cnt[(size_t) e];
-                                if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0))
-                                    continue;
+                                if (c == 0) continue;
                                 // A band expert's blob never reached this card's ring, so only the partner can
                                 // compute its rows; the row cap (never reached: the peer's tables hold the whole
                                 // chunk's rows) bounds only the experts this card could have streamed itself.
                                 const bool ram = peer_reads_it_from_ram(e);
+                                // The residency skip, AFTER the band's own decision: a PINNED band (`--exp
+                                // peer_band_pin`) takes experts this card's tier holds as well, and their rows
+                                // must follow their blob to the partner or both cards would compute them. With
+                                // the pin off the walk never marked a resident expert, so `ram` is false here
+                                // whenever the tier holds it and this reads as the one test it was.
+                                if (m.host_res && m.cache &&
+                                    m.host_res[(size_t) l * m.g->n_expert + e] >= 0 && !ram)
+                                    continue;
                                 if (!ram && (!ppc->peer || !ppc->peer->has(l, e))) continue;
                                 if (!ram && rows_peer + c > ppc->cap_rows) { continue; }
                                 on_peer[(size_t) e] = 1;
