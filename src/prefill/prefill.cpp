@@ -2145,7 +2145,13 @@ static PeerRamShare peer_ram_share(const RamView& v, const core::PeerExperts& pe
             const uint64_t lead = (uint64_t) band * B, pair = acts + (uint64_t) held * w;
             r = (int64_t) ((lead > pair ? lead - pair : 0) / (B + w));
         }
-        r = std::min(r, (int64_t) (n_expert / 2 - held));   // never more than half the chunk's rows
+        // Never more than half the chunk's rows -- the rule the ROW WIRE imposed, because every row the partner
+        // held crossed back on the pair's link.  The partial merge removed that: the return leg is one chunk-wide
+        // vector whatever the share, so the only thing stopping the partner is its own compute.  `--exp
+        // peer_share_cap=1` lets the placement use the whole band instead; the ceiling that still binds is the
+        // band's own size, which is a memory bound, not a wire one.
+        const int64_t half_cap = (int64_t) (n_expert / 2 - held);
+        r = std::min(r, core::exp_flag("peer_share_cap", 0.0) != 0.0 ? (int64_t) band : half_cap);
         r = std::max<int64_t>(0, std::min(r, band));
         pr.take += r;
         pr.lead += (uint64_t) (band - r) * B;
