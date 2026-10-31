@@ -2837,6 +2837,33 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(21) **THE LIMITS, EXHAUSTED — what is left and what is not.** Every lever now has a
+measured verdict:
+- PREFILL: **2,700 t/s shipped** (partial-merge, +36%). The remaining headroom is the
+  lead's attention (49-54 ms/layer, unsplittable — the slice proved it structurally) and
+  the peer's idle, which is WIRE-protected (moving rows costs the return wire; (2)).
+  Verdict: at the platform's limit bar the combine form.
+- DECODE THROUGHPUT: ceiling ~105 t/s non-degenerate, plateaued T=4..6.5 (2.55M windows).
+  Live traffic sits ~75-100 depending on acceptance. The gap is the miss path + fixed
+  per-window cost.
+- THE MISS PATH: **no room here.** The CPU expert path already runs AVX2 (`unpack_q2_0`,
+  `block_dot`, __m256i) at ~0.72 ms per expert entry; the host has NO AVX-512 (the boot
+  says so) so there is no faster kernel to reach. PCIe reads are 0.00 — every miss goes
+  to the RAM tier.
+- HIT RATE: **workload-driven, not residency-driven.** Across 134 boots: 1,359 slots
+  reaches 92.9-99.7% on some traffic, 3,046 slots gets 71.1% on other traffic. More VRAM
+  does not buy a higher hit rate. Verdict: not a lever.
+- ACCEPTANCE: plateau at T~5 (bigger windows cost proportionally more). Verdict: not a
+  throughput lever past the knee.
+- THE FLAGS: adapt-swaps 96 optimal (384 costs 22%, 768 collapses); l2warm_force a 3x
+  regression; the host gap is 0.1 ms (the 17 ms question was answered by the instrument).
+**WHAT REMAINS**: (a) the band-pin exp, so the folding gate can finally grade
+partial-merge (worker in flight — the last correctness debt); (b) nothing else on the
+engine side that the physics shows as reachable. **THE HONEST STATEMENT: on this
+hardware, tp2 is at ~2,700 prefill / ~105 t/s decode ceiling, and both further limits are
+hardware (the shared fabric for prefill, the AVX-2 host + the traffic's miss rate for
+decode).**
+
 (20) **THE BAND IS DETERMINISTIC; THE RESIDENT FILL IS NOT — so the gate needs an ENGINE
 flag, not a boot flag.** `PeerRamShare::taken` is `k % 8 < num` in id order ("the choice
 never depends on the routing") — so the band SELECTION is already deterministic. The
