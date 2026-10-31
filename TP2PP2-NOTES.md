@@ -2837,6 +2837,107 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(26) **`--exp chunk_dump=1`: the per-layer record that says which kernel ran and who served
+the rows — and what the artifacts already say before it is booted.**
+
+**Built.** One line per layer of a prompt chunk: the expert kernel the layer ran on
+(`fp16`/`mmq`/`fp4`/`fused`/`fused-nat`), every gate that picked it (`ring`/`ring_min`,
+`stream_all`, `peer_fp4`, the band's `ram`/`canon`, `T_fp4`/`T_max`, `planes`, `peer_now`,
+`acts`, `bf16`, `merge`, `p2p`, `native`, `fused`, `peer`), who served the rows (`lead`,
+`peer`, `band`, `cpu` expert and row counts, `stream`, and `holds` — what each card's tier
+held that layer, plus `band_all`), and two FNV-1a words: `ids` over the routing as the host
+read it and `split` over which card each expert went to. `include/basalt/prefill/chunk_dump.hpp`
+holds the classification and the fingerprints (header-only, the `peer_band.hpp` pattern),
+`src/prefill/prefill.cpp` fills the record where it decides and prints it at the layer's end
+(`chunk_dump_print`), and `tests/prefill/chunk_dump_parity.cpp` grades all of it (6 checks,
+`ctest -L cpu`). Nothing in it reads the device: an added sync would hide the scheduling
+dependence the flag exists to catch. Diff two boots' lines; the first layer that differs
+names the decision that parted them, and WHICH word differs says which decision it was
+(`ids` — a router's input had already parted upstream; `split` alone — the row division
+moved, which is a numerics change because a partner's rows cross as BF16 and this card's
+stay FP32).
+
+**Hypothesis (a), the fused-path toggle, is OUT at this geometry — three independent ways.**
+`fused_l` (prefill.cpp:5069) is statically false for this pack: `lay.native` is true, so the
+first disjunct needs `!lay.native` and fails, and `fused_nat` (5063) needs
+`fused::native_supported(mmq_gt, mmq_dt)` whose coverage is IQ2_XXS/XS/S, IQ3_XXS/S and
+IQ4_XS for gate/up and Q2_0 or IQ4_NL for down (`src/prefill/moe_fused_iq.cu:934-937,963`)
+— NVFP4 is in neither list. And the engine's own once-a-boot confession, "prompt experts on
+the fused int8 kernels", occurs **0 times in both** `/tmp/qg{pin,ctl}/check/engine.log`. The
+toggle was never going to fire here; the dump prints the path per layer anyway, so the same
+question on a pack the fused kernels do cover is settled by one boot instead of a reading
+session.
+
+**Where the two boots already part, read off the artifacts (no boot needed).** The two
+stages' aggregate lines are in both logs. Layers 0-23 agree to the last printed digit on
+both prompts (`expert-visits lead 4479 peer 6815`, `peer read 1522 from RAM`,
+`rows/expert min 1 mean 87.0 max 2138` twice over; and `4419/6759`, `1499`, `max 2295` on
+the second). Layers 24-48 do NOT: `lead 4364 peer 6657 (peer read 1483 from RAM) ... max
+2007` against `lead 4373 peer 6648 (1482) ... max 2015`, and on the second prompt
+`4381/6652 (1499) max 2218` against `4356/6650 (1501) max 2219`. `rows/expert max` is the
+maximum of the routing histogram, so some expert of some layer in 24-47 held ~8 more tokens
+in one boot than the other: **the divergence begins in the second card pair's layers during
+the prompt read**, with routing in the first pair's layers bit-identical. It also says the
+set of experts whose blobs the partner read out of the RAM band moved (`1483` vs `1482`),
+which is hypothesis (b) arriving on its own.
+
+**Why 512 reproduces and 4096 does not, structurally.** `stream_all` (prefill.cpp:4417)
+is `m.ring > STAGE && T >= stream_all_min() && m.src != nullptr`, and a boot that gives the
+partner rows lowers the floor to 2560 (`src/program/generate.cpp:1448-1451`; the boot's own
+`routed chunks to 2559 tokens` in both logs is that figure). At `T = 512` the floor is above
+the chunk, so `peer_fp4` (4425), `peer_ram` (4441), the streamed ring walk and `fused_nat`
+are all inert and the pair makes no per-chunk placement decision at all — which is exactly
+the 512-bucket differential's KLD 6.49e-07 with top-1 100%. At `T = 4096` every one of them
+runs. The reproducible bucket is the one with nothing to decide.
+
+**What the dump adds over that.** The aggregate line is per stage per chunk; the dump is
+per LAYER, so `ids=` names the first layer whose routing parted and `holds`/`split=` say
+whether the two cards held the same experts that layer. Run it on both boots over the same
+fixture and bucket and the answer is a line number, not an argument.
+
+**The scored rows are verify-window rows, so (25) is a live suspect beside this one.**
+`include/basalt/program/ppl_gate.hpp`:7 — a `ppl=K` request "reads chunk K's first half as
+its prompt and then teacher-forces the rest through the verify windows". So all 8,190 rows
+of `rows.tsv` come out of the draft/verify path, not out of the prompt read, even though the
+prompt read's own routing (above) also differs. Note (25)'s CPU-pool reduction partition
+(`src/kernels/cpu/pool.cpp:484-485`, by `active_`) is therefore on the path of every scored
+row. It is NOT on the prompt read's path at this size: the prefill's CPU share needs
+`!stream_all` (prefill.cpp:5273 `cpu_maybe`), and `stream_all` is on at 4096 tokens. So the
+prompt read's parting is not the pool's, and the rows' parting may be. The dump separates
+them: if `ids=`/`split=` match at every layer of both boots, the prompt read is reproducible
+and everything left is the verify path (25).
+
+**Not excluded.** (c) ring/event ordering — `PeerPrefill::ev_used` (prefill.cpp:760), the
+band ring's `p_live`/`p_hold`/`p_publish` window (prefill.cpp:5527-5529), `Dm_b` staging —
+and (d) an
+attention working buffer sized by the chunk. The dump speaks to those only by elimination,
+and says so: matching `ids` and `split` at every layer with logits still apart leaves the
+GPU-side order and nothing else.
+
+**The boot, verbatim** (it is `--serve`, which is what `tools/quality_gate.py:265` prepends,
+so the 2560 floor is in effect; run each, then `diff` the `chunk dump` lines):
+
+```
+cd /home/gary/opt/basalt-tp2pp2 && bin/basalt --serve \
+  --model models/Qwen3.8-FN-FP4Local.basalt --spec 8 --adapt-swaps 0 --peer-adapt-swaps 0 \
+  --resident-experts --gpu 0,1,2,3 --prefill 8192 --resident-budget-gib 37 --ple-io direct \
+  --kv int8 --max-context 262144 --peer-reserve-mib 600 --short-read 512 --tp-size 2 \
+  --peer-ram-rows --batch 2 --exp peer_charge_partial=1,peer_band_pin=2,chunk_dump=1 \
+  --ppl-base /tmp/qgpin/base-8192.kld --ppl-out /tmp/qgpin/check/rows2.tsv
+```
+
+with the same line a second time writing `/tmp/qgctl/check/rows2.tsv`; the gate itself takes
+it as `--base-args "--exp peer_charge_partial=1,peer_band_pin=2,chunk_dump=1"` so both arms
+and both reference runs carry it. Expect 48 lines per chunk per stage; the words to diff are
+`ids=` and `split=`.
+
+**Checks run**: `ctest -L cpu` 73/74 (`chunk_dump_parity` new and passing; the one failure
+is `expert_multi_test`, this host having no AVX-512 at all — it fails the same way at HEAD
+and touches no file here); `tools/check_stderr_logging.sh` ok; `tools/check_platform_boundary.sh`
+ok; `ninja basalt` links. Docs: the flag is documented in `docs/precision/peer-band-pin.md`
+under "Telling two boots apart". **No GPU was touched, nothing was booted, the server on
+:8000 (PID 858228) was not signalled.**
+
 (25) **THE NONDETERMINISM IS FOUND: THE CPU EXPERT POOL SPLITS ITS REDUCTION BY THE
 LIVE THREAD COUNT.** `ExpertPool::run_split_multi_native` (src/kernels/cpu/pool.cpp:469)
 computes `threads = active_.load()` and then
