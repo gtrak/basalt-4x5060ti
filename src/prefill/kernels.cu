@@ -1,5 +1,6 @@
 // src/prefill/kernels.cu - see include/basalt/prefill/kernels.hpp.
 #include "basalt/prefill/kernels.hpp"
+#include "basalt/prefill/moe_part.hpp"
 #include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/kernels/mrope.hpp"
 #include "basalt/kernels/router_top10.hpp"
@@ -496,10 +497,11 @@ __global__ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32
     const int64_t r = i / per, j = i % per;
     reinterpret_cast<uint4*>(dst)[r * per + j] = reinterpret_cast<const uint4*>(x)[(int64_t) src[r] * per + j];
 }
-// The MoE combine's one pass over the result rows.  ROWS16: the rows [lo, hi) of the row space are BF16 bits in
-// `rows16` (a peer card's return leg) and every other row is FP32 in Dm; the plane is picked where the row is read,
-// so the BF16 rows cost no pass of their own.
-template <bool ROWS16>
+// The MoE combine's one pass over the result rows.  PEER: the rows [lo, hi) of the row space are a peer card's -
+// BF16 bits in `rows16` (the row wire) or already summed on the partner's card (the partial merge, which adds the
+// layer's partial instead) - and every other row is FP32 in Dm; the plane is picked where the row is read, so the
+// BF16 rows cost no pass of their own.  The arithmetic is `moe_routed_sum`, shared with the partner's fold.
+template <PeerRows PEER>
 __global__ void moe_combine_kernel(const float* __restrict__ Dm, const uint16_t* __restrict__ rows16,
                                    int32_t lo, int32_t hi, const int32_t* __restrict__ slot,
                                    const float* __restrict__ w, const float* __restrict__ shared,
@@ -507,16 +509,50 @@ __global__ void moe_combine_kernel(const float* __restrict__ Dm, const uint16_t*
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
-    float s = 0.0f;
-#pragma unroll
-    for (int k = 0; k < 10; ++k) {
-        const int32_t r = slot[t * 10 + k];
-        const float v = ROWS16 && r >= lo && r < hi
-                            ? basalt::kernels::f32_from_bf16(rows16[(int64_t) (r - lo) * N + d])
-                            : Dm[(int64_t) r * N + d];
-        s = fmaf(w[t * 10 + k], v, s);
-    }
+    const float s = moe_routed_sum<PEER>(slot, w, t * 10, Dm, rows16, lo, hi, N, d);
     bo[i] = s + shared[i] * sigm(sg[t]);
+}
+
+// The lead's half of a PARTIAL MERGE (`--exp peer_partial_merge`): the same pass with the partner's rows left out
+// of the chain (they never crossed), and the partner's summed partial added to the routed sum before the shared
+// expert's term.  PART16: the partial crossed as BF16 bits, the rows' own wire; else as FP32 (`--peer-rows-fp32`).
+template <bool PART16>
+__global__ void moe_combine_partial_kernel(const float* __restrict__ Dm, const uint16_t* __restrict__ part16,
+                                           const float* __restrict__ part, int32_t lo, int32_t hi,
+                                           const int32_t* __restrict__ slot, const float* __restrict__ w,
+                                           const float* __restrict__ shared, const float* __restrict__ sg,
+                                           float* __restrict__ bo, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    const float s = moe_routed_sum<PeerRows::kSkip>(slot, w, t * 10, Dm, nullptr, lo, hi, N, d);
+    const float p = PART16 ? moe_part_unpack(part16[i]) : part[i];
+    bo[i] = moe_combine_out(s, p, shared[i] * sigm(sg[t]));
+}
+
+// The partner's half: its own weighted rows, folded into the layer's FP32 partial group by group.  One thread per
+// (token, dimension) OF THE GROUP'S TOKEN LIST, so no two threads touch one cell and the fold needs no atomics:
+// a token's rows are added in row order, the groups in launch order, and the partial is reproducible.  The rows
+// are read in the format the down product wrote them, which is the format they would have crossed in.
+template <bool ROWS16>
+__global__ void peer_part_fold_kernel(float* __restrict__ part, const uint16_t* __restrict__ rows16,
+                                      const float* __restrict__ rows, const int32_t* __restrict__ tok,
+                                      const int32_t* __restrict__ off, const int32_t* __restrict__ rel,
+                                      const float* __restrict__ wt, int32_t n_tok) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // one (token, dimension)
+    if (i >= (int64_t) n_tok * N) return;
+    const int32_t e = (int32_t) (i / N);
+    const int64_t d = i - (int64_t) e * N;
+    float* cell = part + (int64_t) tok[e] * N + d;
+    *cell = moe_fold_rows(*cell, rel + off[e], wt + off[e], off[e + 1] - off[e],
+                          ROWS16 ? rows16 : nullptr, ROWS16 ? nullptr : rows, N, d);
+}
+
+/// The layer's partial, one rounding for the whole run, into the width the pair's link carries it in.
+__global__ void peer_part_pack_kernel(uint16_t* __restrict__ out, const float* __restrict__ part, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = moe_part_pack(part[i]);
 }
 
 // ---------------------------------------------------------------- QSA helpers
@@ -888,15 +924,42 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
 }
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream) {
-    moe_combine_kernel<false><<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, nullptr, 0, 0, slot, w, shared,
-                                                                                    sg, bo, T);
+    moe_combine_kernel<PeerRows::kPlane><<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(
+        Dm, nullptr, 0, 0, slot, w, shared, sg, bo, T);
     check("moe_combine");
 }
 void moe_combine_rows16(const float* Dm, const uint16_t* rows16, int32_t lo, int32_t hi, const int32_t* slot,
                         const float* w, const float* shared, const float* sg, float* bo, int64_t T, void* stream) {
-    moe_combine_kernel<true><<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, rows16, lo, hi, slot, w, shared,
-                                                                                   sg, bo, T);
+    moe_combine_kernel<PeerRows::kPlane><<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(
+        Dm, rows16, lo, hi, slot, w, shared, sg, bo, T);
     check("moe_combine_rows16");
+}
+void moe_combine_partial(const float* Dm, const uint16_t* part16, const float* part, int32_t lo, int32_t hi,
+                         const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
+                         int64_t T, void* stream) {
+    if (part16 != nullptr)
+        moe_combine_partial_kernel<true><<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(
+            Dm, part16, nullptr, lo, hi, slot, w, shared, sg, bo, T);
+    else
+        moe_combine_partial_kernel<false><<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(
+            Dm, nullptr, part, lo, hi, slot, w, shared, sg, bo, T);
+    check("moe_combine_partial");
+}
+void peer_part_fold(float* part, const uint16_t* rows16, const float* rows, const int32_t* tok, const int32_t* off,
+                    const int32_t* rel, const float* wt, int32_t n_tok, void* stream) {
+    if (n_tok <= 0) return;
+    if (rows16 != nullptr)
+        peer_part_fold_kernel<true><<<blocks_for((int64_t) n_tok * N), 256, 0, (cudaStream_t) stream>>>(
+            part, rows16, nullptr, tok, off, rel, wt, n_tok);
+    else
+        peer_part_fold_kernel<false><<<blocks_for((int64_t) n_tok * N), 256, 0, (cudaStream_t) stream>>>(
+            part, nullptr, rows, tok, off, rel, wt, n_tok);
+    check("peer_part_fold");
+}
+void peer_part_pack(uint16_t* out, const float* part, int64_t n, void* stream) {
+    if (n <= 0) return;
+    peer_part_pack_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(out, part, n);
+    check("peer_part_pack");
 }
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;

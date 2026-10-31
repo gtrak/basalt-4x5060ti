@@ -85,6 +85,21 @@ void moe_combine(const float* D, const int32_t* slot, const float* w, const floa
 /// space are read as BF16 from `rows16` (`rows16[(r - lo) * N + d]`), every other row as FP32 from `D`.
 void moe_combine_rows16(const float* D, const uint16_t* rows16, int32_t lo, int32_t hi, const int32_t* slot,
                         const float* w, const float* shared, const float* sg, float* bo, int64_t T, void* stream);
+/// The lead's half of a partial merge (`--exp peer_partial_merge`): the rows [lo, hi) contribute NOTHING to this
+/// card's chain (the partner summed them and never shipped them), and the partner's one partial a layer is added
+/// to the routed sum before the shared expert's term.  Exactly one of `part16` (the BF16 wire) and `part` (the
+/// FP32 wire) is set; both are `T * N` wide.
+void moe_combine_partial(const float* D, const uint16_t* part16, const float* part, int32_t lo, int32_t hi,
+                         const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
+                         int64_t T, void* stream);
+/// A partner card folds one expert group's rows into its own `T * N` FP32 partial: token `tok[e]` holds rows
+/// `rel[off[e] .. off[e+1])` of the group's staging (`rows16` as BF16 bits, or `rows` as FP32), each weighted by
+/// `wt` at the same index.  One thread per (token, dimension) of the list: no atomics, and the order is the
+/// list's.  `part` must be zeroed for the chunk's tokens before the layer's first group.
+void peer_part_fold(float* part, const uint16_t* rows16, const float* rows, const int32_t* tok, const int32_t* off,
+                    const int32_t* rel, const float* wt, int32_t n_tok, void* stream);
+/// `out[i] = bf16(part[i])` over `n` values: the layer's partial as the pair's link carries it.
+void peer_part_pack(uint16_t* out, const float* part, int64_t n, void* stream);
 
 // ---- QSA helpers
 /// In place: x[r, :] = x[r, :] * rsqrt(mean x^2 + eps) * w  over rows of `cols` (row stride `ld`).
