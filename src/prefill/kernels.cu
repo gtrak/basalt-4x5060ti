@@ -574,11 +574,19 @@ __global__ void split_q_kernel(const float* __restrict__ qf, float* __restrict__
 // rather than made consistent: one contract, no way to get half of it wrong.  `split_q_span` keeps its offset
 // because it genuinely reads wide and writes narrow.
 __global__ void gate_attn_kernel(const float* __restrict__ a, const float* __restrict__ qf, uint16_t* __restrict__ o16,
-                                 int64_t T, int64_t nh, int64_t ld) {
+                                 int64_t T, int64_t nh, int64_t ld_a, int64_t ld_q, int64_t ld_o) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * nh * 256) return;
     const int64_t t = i / (nh * 256), h = (i / 256) % nh, d = i % 256;
-    o16[i] = hf(a[i] * (1.0f / (1.0f + expf(-qf[t * ld + h * 512 + 256 + d]))));
+    // THREE PITCHES, not one. `attn`, `qf` and `out16` each live at their own row stride, and a slice's card can
+    // legitimately hold any of the three WIDER than the `nh` heads it gates: the prompt-attention slice's lead
+    // gates its own head run out of the WHOLE attention (`prompt_attn_kernel` writes `attn` at the model's
+    // `n_head * head_dim`) and hands the product rows at the pitch the product was told to read them at. When
+    // `attn` and `out16` were both walked packed (`nh * 256`) - true only when all three really are shard-width -
+    // the lead read token t's data out of token t-1's tail and wrote rows the product then read one pitch past,
+    // which is scratch that was never written: a nan `o_proj` partial with every input above it finite.
+    o16[t * ld_o + h * 256 + d] = hf(a[t * ld_a + h * 256 + d] *
+                                     (1.0f / (1.0f + expf(-qf[t * ld_q + h * 512 + 256 + d]))));
 }
 
 // one block per (token, kv head, 64-value group); 64 threads. KV streaming: the pool page only if the block is
@@ -936,8 +944,31 @@ void split_q_span(const float* qf, float* q, int64_t T, int64_t h0, int64_t nh, 
 void gate_attn_span(const float* attn, const float* qf, uint16_t* out16, int64_t T, int64_t nh, int64_t ld,
                     void* stream) {
     if (nh <= 0) return;
-    gate_attn_kernel<<<blocks_for(T * nh * 256), 256, 0, (cudaStream_t) stream>>>(attn, qf, out16, T, nh, ld);
+    // The narrow case: `attn` and `out16` are this card's own rows, packed at `nh * 256`, and `ld` is the wide
+    // `qf` stride. Byte-identical to the walk this kernel had before the lead's slice exposed the pitch of the
+    // other two operands.
+    gate_attn_kernel<<<blocks_for(T * nh * 256), 256, 0, (cudaStream_t) stream>>>(attn, qf, out16, T, nh,
+                                                                                  nh * 256, ld, nh * 256);
     check("gate_attn_span");
+}
+
+/// The same gate when any of the three operands lives at a WIDER pitch than the head run being gated. The
+/// prompt-attention slice's lead needs it: its attention, its `qf` and the rows its `o_proj` product reads are
+/// each the model's width, while the heads it owns are a run inside them.
+void gate_attn_span_pitched(const float* attn, const float* qf, uint16_t* out16, int64_t T, int64_t nh,
+                           int64_t ld_attn, int64_t ld_qf, int64_t ld_out, void* stream) {
+    if (nh <= 0 || ld_attn <= 0 || ld_qf <= 0 || ld_out <= 0) return;
+    // A pitch narrower than the heads it carries would alias two heads into one, silently: refuse rather than
+    // multiply a plausible wrong value, which is the RUN 17 class this branch refuses everywhere else.
+    if (ld_attn < nh * 256 || ld_out < nh * 256 || ld_qf < nh * 512) {
+        basalt::log::error("basalt", "gate_attn_span_pitched: a pitch (%lld, %lld, %lld) is narrower than the %lld "
+                                     "heads it carries",
+                           (long long) ld_attn, (long long) ld_qf, (long long) ld_out, (long long) nh);
+        return;
+    }
+    gate_attn_kernel<<<blocks_for(T * nh * 256), 256, 0, (cudaStream_t) stream>>>(attn, qf, out16, T, nh, ld_attn,
+                                                                                  ld_qf, ld_out);
+    check("gate_attn_span_pitched");
 }
 
 }  // namespace basalt::prefill

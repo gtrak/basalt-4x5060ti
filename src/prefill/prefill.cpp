@@ -4589,10 +4589,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                    s, s.n_head_kv, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
                         }
                     if (st.kv_rot || st.kv_hybrid) basalt::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
-                    // the gate over the heads this card owns, at the whole row pitch: the partner's half of the
-                    // `attn_output` columns is what their card multiplies, so the lead's rows beyond its run are
-                    // never read (and the attention above never wrote them)
-                    if (lead_groups > 0) gate_attn_span(m.attn, m.Qf, m.attn_h, T, lead_groups * rep, ZV, m.cs);
+                    // the gate over the heads this card owns.  ALL THREE OPERANDS ARE THE MODEL'S WIDTH HERE, and
+                    // only the head run is the card's: `prompt_attn_kernel` wrote `m.attn` at `n_head * head_dim`,
+                    // `m.Qf` holds every head, and `peer_qsa_finish` reads the gated rows at `lead_ld` = the same
+                    // `ZV`. Gating them as if all three were the narrow shard read token t from token t-1's tail and
+                    // wrote rows the product then read one pitch past its own writes - scratch never written, a nan
+                    // partial with every input above it finite. The partner's own gate stays narrow: its buffers
+                    // really are shard-width, which is why only this card ever NaNed.
+                    if (lead_groups > 0)
+                        gate_attn_span_pitched(m.attn, m.Qf, m.attn_h, T, lead_groups * rep,
+                                               s.n_head * s.head_dim, s.n_head * 2 * s.head_dim,
+                                               s.n_head * s.head_dim, m.cs);
                     else gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
                     // The attention output and the gated rows, the two the `o_proj` product is built from.  Under
                     // the slice the lead's rows past its own run are never written, so what is fingerprinted here

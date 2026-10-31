@@ -274,3 +274,27 @@ argument), `kv_append_kernel` (1: yes, fixed), the three selection kernels (neit
 no head field and refuse a bad `idx_*`), and `kv_span_import_kernel`, which is written against both: it
 takes each side's `nkv` and each side's page table explicitly and resolves the row twice, once per card,
 rather than sharing either.
+
+## The gate's third assumption: a pitch per operand
+
+`gate_attn_kernel` failed question 2 once and was fixed by deleting the offset. It then failed a variant of
+question 1 that neither question covers, so the rule gains a third: **does it assume every operand shares
+one pitch?**
+
+The kernel walked `attn` and `out16` packed at `nh * 256` and used its single `ld` for `qf` only. That is
+three assumptions wearing one argument. The partner satisfies all three — its buffers really are shard-width
+— which is why the partner's partial was finite throughout and the lead's was not. The lead violates all
+three: `prompt_attn_kernel` writes `attn` at the model's `n_head * head_dim`, `m.Qf` holds every head, and
+`peer_qsa_finish` reads the gated rows at `lead_ld` = that same model pitch. Only the head run is the card's.
+
+So the lead's gate gated token `t` with token `t-1`'s tail and wrote rows the product read one pitch past its
+own writes. The mutation reproduces the signature exactly: token 0 correct, token 1 wrong — a pitch error is
+invisible at row 0 by construction, which is why sampling only token 0 clears a broken kernel.
+
+Fixed by `gate_attn_span_pitched`, which takes the three pitches and refuses any below the run it carries.
+`gate_attn_span` is now that call with `ld_attn = ld_out = nh * 256`, so the narrow case is the pitched case
+with the narrow numbers and the two cannot drift. The lead passes `s.n_head * s.head_dim` and
+`s.n_head * 2 * s.head_dim` — the figures `gate_attn()` and `prompt_attn_kernel` use, not literals.
+
+Covered by case 8b of `tp2_head_split_parity`, the lead's geometry, which was absent: case 8 tested a card
+gating its own narrow rows — the partner's situation — and so passed while the lead was broken.

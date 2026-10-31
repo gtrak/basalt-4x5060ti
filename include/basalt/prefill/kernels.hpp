@@ -111,6 +111,14 @@ void split_q_span(const float* qf, float* q, int64_t T, int64_t h0, int64_t nh, 
 void gate_attn_span(const float* attn, const float* qf, uint16_t* out16, int64_t T, int64_t nh, int64_t ld,
                     void* stream);
 
+/// The gate over a head run whose three operands sit at DIFFERENT pitches. `gate_attn_span` is this with
+/// `ld_attn = ld_out = nh * 256`, which is right only when `attn` and `out16` really are the card's own narrow
+/// rows. A card that gates a run out of the WHOLE attention must say so per operand: `attn` and `out16` then carry
+/// the model's `n_head * head_dim` (the attention wrote them, and the `o_proj` product reads them at that pitch),
+/// while `qf` carries its own `heads_in_qf * 512`. A pitch below the run it carries is refused, never walked.
+void gate_attn_span_pitched(const float* attn, const float* qf, uint16_t* out16, int64_t T, int64_t nh,
+                            int64_t ld_attn, int64_t ld_qf, int64_t ld_out, void* stream);
+
 /// K and V of T consecutive cells (positions pos0..pos0+T-1; K normed and rotated) into the paged pools: FP16
 /// (`k_pool`/`v_pool`) or INT8 codes + FP16 scale per 64 (`k_q`...), the decode append's arithmetic.
 /// K, V: [T, 2, 256].

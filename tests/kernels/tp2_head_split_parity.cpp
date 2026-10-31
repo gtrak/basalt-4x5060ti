@@ -858,6 +858,101 @@ int main(int argc, char** argv) {
         cudaFree(qf_d); cudaFree(at_d); cudaFree(qf_whole); cudaFree(g_whole);
     }
 
+    // ---- 8b. the LEAD's gate, at the pitches the lead actually runs it at
+    //
+    // Case 8 covers a card gating its OWN narrow rows. The prompt-attention slice's lead gates something else
+    // entirely: a run of heads taken out of the WHOLE attention, which `prompt_attn_kernel` wrote at the model's
+    // `n_head * head_dim`, with a `qf` that holds every head, writing rows its `o_proj` product then reads back
+    // at that same model pitch. All three operands are wider than the run, and only the head count is the card's.
+    //
+    // This is the case that was missing, and its absence is why the lead's `o_proj` partial came back all-nan with
+    // every input above it finite: gated as if all three operands were shard-width, the gate read token t out of
+    // token t-1's tail and wrote rows the product read one pitch past its own writes - scratch that was never
+    // written. The partner never NaNed because its buffers really are narrow, so the same call was correct there.
+    //
+    // BITWISE against `gate_attn`'s whole run at the same heads, and the negative control is the point: a gate that
+    // walks any one of the three operands packed fails this, because packed and pitched differ for every token but
+    // the first, and a comparison that only sampled token 0 would pass a broken kernel.
+    {
+        const int64_t T7b = 37, nq7b = 2 * 256;
+        const int64_t nhb = r0.nq();   // the lead's run: heads [0, nhb), the ones whose columns it packed
+        std::vector<float> qfb((size_t) T7b * NH * nq7b);
+        for (auto& x : qfb) x = nd(rng);
+        std::vector<float> atb((size_t) T7b * NH * D);
+        for (auto& x : atb) x = nd(rng);
+        float* qfb_d = dalloc<float>(qfb.size());
+        float* atb_d = dalloc<float>(atb.size());
+        up(qfb_d, qfb); up(atb_d, atb);
+
+        uint16_t* g_whole_b = dalloc<uint16_t>((size_t) T7b * NH * D);
+        uint16_t* g_lead_b = dalloc<uint16_t>((size_t) T7b * NH * D);   // model-width: the product reads a window
+        cudaMemset(g_lead_b, 0x7f, (size_t) T7b * NH * D * sizeof(uint16_t));   // never-written cells stay visible
+        pr::gate_attn(atb_d, qfb_d, g_whole_b, T7b, nullptr);
+        pr::gate_attn_span_pitched(atb_d, qfb_d, g_lead_b, T7b, nhb, NH * D, NH * 2 * D, NH * D, nullptr);
+        const std::vector<uint16_t> gwb = down(g_whole_b, (size_t) T7b * NH * D);
+        const std::vector<uint16_t> glb = down(g_lead_b, (size_t) T7b * NH * D);
+
+        bool lead_bitwise = true;
+        int touched_outside = 0, refused = 0;
+        for (int64_t t = 0; t < T7b; ++t)
+            for (int64_t h = 0; h < NH; ++h)
+                for (int64_t d = 0; d < D; ++d) {
+                    const size_t w = (size_t) t * NH * D + h * D + d;
+                    if (h >= nhb) {
+                        // the heads the lead does not own must stay untouched: the product multiplies columns
+                        // [0, nhb * D) only, and a gate that wrote past its run would alias the partner's columns
+                        if (glb[w] != 0x7f7f) ++touched_outside;
+                        continue;
+                    }
+                    if (glb[w] == gwb[w]) continue;
+                    if (lead_bitwise) {
+                        std::printf("FAIL lead-pitch gate t %lld head %lld dim %lld: %u vs %u\n", (long long) t,
+                                    (long long) h, (long long) d, (unsigned) glb[w], (unsigned) gwb[w]);
+                        lead_bitwise = false;
+                    }
+                    ++g_fail;
+                }
+        if (touched_outside > 0) {
+            std::printf("FAIL lead-pitch gate wrote %d cells outside its head run\n", touched_outside);
+            ++g_fail;
+        }
+        std::printf("[lead gate pitches] T %lld x run %lld of %lld heads at pitch %lld/%lld: %s\n", (long long) T7b,
+                    (long long) nhb, (long long) NH, (long long) (NH * D), (long long) (NH * 2 * D),
+                    lead_bitwise ? "bitwise vs the whole run, run-only writes" : "NOT bitwise");
+
+        // the guard: a pitch narrower than the run it carries is refused rather than walked, because it would
+        // alias two heads into one and produce plausible values. Each short pitch is a distinct way to get this
+        // wrong, so all three are checked, and the call must leave the output exactly as it found it.
+        //
+        // STRICTLY narrower, deliberately: `nh * 256` is the legitimate narrow pitch a partner's own card uses, so
+        // a control that used it would be checking the guard rejects a call the engine makes. Each case drops one
+        // pitch by a head, which is the aliasing that actually happens.
+        for (int which = 0; which < 3; ++which) {
+            int64_t la = NH * D, lq = NH * 2 * D, lo = NH * D;
+            if (which == 0) la = nhb * D - D; else if (which == 1) lq = nhb * 2 * D - 256; else lo = nhb * D - D;
+            uint16_t* gd = dalloc<uint16_t>((size_t) T7b * NH * D);
+            cudaMemset(gd, 0x7f, (size_t) T7b * NH * D * sizeof(uint16_t));
+            pr::gate_attn_span_pitched(atb_d, qfb_d, gd, T7b, nhb, la, lq, lo, nullptr);
+            bool untouched = true;
+            const std::vector<uint16_t> gv = down(gd, (size_t) T7b * NH * D);
+            for (auto x : gv) if (x != 0x7f7f) { untouched = false; break; }
+            if (!untouched) {
+                std::printf("FAIL lead gate accepted pitch set %d (%lld, %lld, %lld)\n", which, (long long) la,
+                            (long long) lq, (long long) lo);
+                ++g_fail;
+            }
+            if (untouched) ++refused;
+            cudaFree(gd);
+        }
+        // graded, not asserted: a guard that refused nothing would still print a clean line otherwise
+        if (refused != 3) {
+            std::printf("FAIL lead gate refused only %d of the 3 short pitches\n", refused);
+            ++g_fail;
+        }
+        std::printf("[lead gate pitches] short pitches refused: %d of 3\n", refused);
+        cudaFree(qfb_d); cudaFree(atb_d); cudaFree(g_whole_b); cudaFree(g_lead_b);
+    }
+
     // ---- 9. the SELECTION: a card recomputes it and must return the lead's ids
     //
     // This is the slice's central claim, and it is a different claim from 6's.  Case 6 says a card's attention
