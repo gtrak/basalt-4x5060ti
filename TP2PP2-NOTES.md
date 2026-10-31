@@ -2753,6 +2753,28 @@ wire (50.4 ms at its current share) scales with its rows and cancels the 1.63 us
 row-rate gain. The tp2 prefill is placement-optimal GIVEN the wire; the idle is
 wire-protected, the same class as the slice's dependency-protected idle. The prefill
 levers that remain: full sharding only (whose 4-rank hiding just measured 42.7%).
+(10) **RUN 27 — THE 94.41% WAS VOID: THE ARMS HELD DIFFERENT EXPERT TIERS.** The gate
+hardening (4 commits: the placement-void verdict parsing each arm's engine.log tier
+facts; fp4::cut_pieces relocated inline so the CPU test drives the engine's REAL group
+cutter; the term-set ledger check 7 — 45 real-shaped geometries x mutation battery,
+0 mismatches; the corrected docs) re-verdicted the stored run: **VOID — the arms did not
+place the experts the same way** (CUDA1/CUDA3: 5,429 experts/13.98 GiB on the reference
+arms vs 5,384/13.86 on the gate arm — the placement walk's run-to-run variance). The
+fold's arithmetic is CLEARED at the CPU level (the ledger drives the real cutter: the
+fold's (token,k) multiset == the lead's skipped multiset, every weight its own, 0
+mismatches, mutation-tested). THE RE-GATE ATTEMPT with the verdict's prescribed
+--base-args '--peer-reserve-mib 723' FAILED to align: the flag reached the engines
+(verified) but the reference arms' tier fill STAYED 13.98 — the verdict's +123 MiB
+arithmetic guessed the wrong knob. THE REAL KNOB: Prefill::peer_bytes() — which
+peer_partial_merge ITSELF reads (the flag changes the partner's buffer sizing, so the
+two arms' room computation differs structurally); the alignment fix is a code-read of
+peer_bytes + the ranked-pairs room, then one more three-arm window. THE STATE: the
++34% is real but UNLICENSED (no valid gate run exists — the only verdict is VOID);
+the fold's CPU-level arithmetic is cleared; what remains is either the placement
+alignment (likely, given the VOID) or a device-staging difference the CPU tests cannot
+see (the parity still models P.dm16's contents). The serving: restored flag-off, the
+watchdog logging clean.
+
 (9) **THE RACE FIX: BIT-IDENTICAL RESULT — THE DIVERGENCE IS DETERMINISTIC.** 83d8bdda
 (the ev_used consumption barrier, diff-reviewed clean) changed NOTHING: the gate arm
 re-run at the 512 bucket reproduces the pre-fix numbers TO THE DIGIT (PPL 7.15675, KLD
