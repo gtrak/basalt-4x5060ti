@@ -490,6 +490,9 @@ void usage() {
                  "  --draft-log FILE     one line per decode window for draft-policy study\n"
                  "  --ppl-base FILE      llama.cpp KL-divergence base for ppl= requests\n"
                  "  --ppl-out FILE       where ppl= requests write their per-row lines\n"
+                 "  --ppl-emit FILE      ppl= requests write their own log-probs into FILE's logit rows instead of\n"
+                 "                       reading them (the file's header, tokens and zero rows are laid out first);\n"
+                 "                       a later ppl= run reads it back with --ppl-base\n"
                  "  --gpu-stages         capture the layer as three graphs (mixer / ffn+router / post)\n"
                  "                       and time them from OUTSIDE the capture.  The per-stage table on the\n"
                  "                       real graph that --stage-timing cannot give.  Prints and exits.\n"
@@ -992,7 +995,7 @@ int main(int argc, char** argv) {
     const bool module_loading_set = std::getenv("CUDA_MODULE_LOADING") != nullptr;
     if (!module_loading_set) basalt::platform::set_env("CUDA_MODULE_LOADING", "LAZY");
     Options o;
-    std::string ppl_base, ppl_out;
+    std::string ppl_base, ppl_out, ppl_emit;
     bool have_tokens = false;
     bool have_logits_stride = false;
     for (int i = 1; i < argc; ++i) {
@@ -1235,6 +1238,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--ppl-base") ppl_base = next("--ppl-base");
         else if (a == "--ppl-out") ppl_out = next("--ppl-out");
+        else if (a == "--ppl-emit") ppl_emit = next("--ppl-emit");
         else {
             // An unknown flag is an ERROR and not a warning: a typo'd `--max-neww` that silently generated 16
             // tokens would look like a working run.
@@ -8848,7 +8852,7 @@ int main(int argc, char** argv) {
             basalt::program::PplGate* ppl = nullptr;
             if (req_ppl >= 0) {
                 std::string pe2;
-                basalt::program::PplGate::configure(ppl_base, ppl_out);
+                basalt::program::PplGate::configure(ppl_base, ppl_out, ppl_emit);
                 ppl = &basalt::program::PplGate::get();
                 if (geni || !ppl->begin(req_ppl, ids.data(), n, n_vocab, pe2)) {
                     std::printf("ERR %s\n", geni ? "ppl: text only" : pe2.c_str());

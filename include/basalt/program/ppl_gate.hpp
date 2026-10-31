@@ -6,6 +6,11 @@
 // A serve request with `ppl=K` reads chunk K's first half as its prompt and then teacher-forces the rest through
 // the verify windows; every scored row is compared with the base row here and written as one line to
 // --ppl-out: chunk pos target nll nll_base kld same_top top top_base dlogp_top_base.
+//
+// A base can also come from the engine itself rather than from llama.cpp (`--ppl-emit`): the tool writes a base
+// file whose header, tokens and zero-filled logit rows are already in place, and the emitting run fills those rows
+// with its own log-probs through the SAME layout and the SAME `quantize_row` the reader decodes. A second run then
+// reads it back through the unmodified path above, so the differential gate has one measurement surface, not two.
 #include "basalt/platform/file.hpp"
 
 #include <algorithm>
@@ -15,6 +20,7 @@
 #include <cstring>
 #include <future>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 #include "basalt/log.hpp"
@@ -23,16 +29,18 @@ namespace basalt::program {
 
 class PplGate {
 public:
-    /// the base file and the output file, set from --ppl-base and --ppl-out before the first get()
-    static void configure(const std::string& base, const std::string& out) {
-        paths().first = base;
-        paths().second = out;
+    /// the base file and the output file, set from --ppl-base and --ppl-out before the first get(); `emit` fills an
+    /// existing base file with this run's own log-probs instead of reading it as the reference
+    static void configure(const std::string& base, const std::string& out, const std::string& emit = {}) {
+        paths() = {base, out, emit};
     }
     static PplGate& get() {
         static PplGate g;
         return g;
     }
-    bool available() const { return fd_ >= 0 && out_ != nullptr; }
+    /// emitting: this run writes the base's logit rows; reading: it compares against them
+    bool emitting() const { return emitting_; }
+    bool available() const { return fd_ >= 0 && (emitting_ || out_ != nullptr) && n_vocab_ > 0; }
     int64_t first() const { return n_ctx_ / 2; }
     int64_t end() const { return n_ctx_ - 1; }   // one past the last scored position
     int32_t token(int64_t pos) const { return tok_[(size_t) pos]; }
@@ -68,21 +76,24 @@ public:
     // the chunk is done: flush its lines and let the page cache drop the base rows it read
     bool finish(std::string& err) {
         const bool ok = wait(err);
-        std::fflush(out_);
-        basalt::platform::advise_dontneed(fd_, 0, 0);   // the rows this chunk read need not stay cached
+        if (out_ != nullptr) std::fflush(out_);
+        if (!emitting_) basalt::platform::advise_dontneed(fd_, 0, 0);   // the rows this chunk read need not stay cached
         return ok;
     }
 
 private:
-    static std::pair<std::string, std::string>& paths() {
-        static std::pair<std::string, std::string> p;
+    static std::tuple<std::string, std::string, std::string>& paths() {
+        static std::tuple<std::string, std::string, std::string> p;
         return p;
     }
     PplGate() {
-        const char* base = paths().first.c_str();
-        const char* out = paths().second.c_str();
-        if (paths().first.empty() || paths().second.empty()) return;
-        fd_ = basalt::platform::open_fd_utf8(paths().first);
+        const std::string& emit = std::get<2>(paths());
+        emitting_ = !emit.empty();
+        const std::string& src = emitting_ ? emit : std::get<0>(paths());
+        const char* base = src.c_str();
+        const char* out = std::get<1>(paths()).c_str();
+        if (src.empty() || (!emitting_ && std::get<1>(paths()).empty())) return;
+        fd_ = basalt::platform::open_fd_utf8(src);
         char magic[8];
         uint32_t n_ctx = 0;
         int32_t nv[2] = {0, 0};
@@ -96,9 +107,11 @@ private:
         n_vocab_ = nv[0];
         n_chunk_ = nv[1];
         row_u16_ = 2 * ((n_vocab_ + 1) / 2) + 4;
-        out_ = basalt::platform::open_file_utf8(paths().second, "ab");
+        // emitting fills the logit rows of a file the tool already laid out, so the stream is read-write and the
+        // rows land by seek; reading keeps the rows untouched and only appends the per-row lines
+        out_ = emitting_ ? basalt::platform::open_file_utf8(src, "r+b") : basalt::platform::open_file_utf8(out, "ab");
         if (out_ == nullptr) {
-            basalt::log::error("basalt ppl", "cannot write %s", out);
+            basalt::log::error("basalt ppl", "cannot write %s", emitting_ ? base : out);
             close_fd();
         }
     }
@@ -122,11 +135,67 @@ private:
         return true;
     }
 
+    // sum(exp(lg[i] - m)) over the row; the caller takes the log of it. Subtracting the row's max first keeps the
+    // exponentials in range whatever the head emits
+    static double log_sum_exp(const float* lg, int64_t n_vocab, float m) {
+        double sum = 0.0;
+        for (int64_t i = 0; i < n_vocab; ++i) sum += std::exp(lg[i] - m);
+        return sum;
+    }
+
+public:
+    // the log-prob row of `lg` (the head logits of one position), quantized the way the reader decodes it: one
+    // (scale, min log-prob) pair then n_vocab uint16 over [min, max], padded to an even count. Public because it is
+    // the contract between the emitter and the reader: the emitter calls it, and `ppl_emit_parity_test` decodes
+    // what it produces with the reader's own arithmetic, so the two cannot drift apart unnoticed
+    static void quantize_row(const float* lg, int64_t n_vocab, std::vector<uint16_t>& dst, float& scale,
+                            float& min_lp) {
+        float lo = lg[0], hi = lg[0];
+        for (int64_t i = 1; i < n_vocab; ++i) {
+            if (lg[i] < lo) lo = lg[i];
+            if (lg[i] > hi) hi = lg[i];
+        }
+        const float lse = hi + static_cast<float>(std::log(log_sum_exp(lg, n_vocab, hi)));
+        min_lp = lo - lse;                        // the row's smallest log-prob
+        const float max_lp = hi - lse;            // and its largest; log_softmax is a shift of the logits
+        const double span = static_cast<double>(max_lp) - static_cast<double>(min_lp);
+        scale = span > 0.0 ? static_cast<float>(span / 65535.0) : 0.0f;
+        dst.resize(static_cast<size_t>(2 * ((n_vocab + 1) / 2) + 4), 0);
+        std::memcpy(dst.data(), &scale, 4);
+        std::memcpy(dst.data() + 2, &min_lp, 4);
+        for (int64_t i = 0; i < n_vocab; ++i) {
+            const float lp = lg[i] - lse;
+            double q = scale > 0.0f ? std::lround((static_cast<double>(lp) - min_lp) / scale) : 0.0;
+            if (q < 0.0) q = 0.0;
+            if (q > 65535.0) q = 65535.0;
+            dst[static_cast<size_t>(4 + i)] = static_cast<uint16_t>(q);
+        }
+    }
+
+    private:
+    // the byte offset of a scored row's quantized log-probs, one place so a written row and a read row cannot
+    // disagree about where the row lives
+    uint64_t row_offset(int64_t pos, int64_t rows) const {
+        return 20 + static_cast<uint64_t>(n_chunk_) * n_ctx_ * 4 +
+               (static_cast<uint64_t>(chunk_) * rows + static_cast<uint64_t>(pos - first())) *
+                   static_cast<uint64_t>(row_u16_) * 2;
+    }
+
     // the same arithmetic as llama-perplexity's KL-divergence pass
     bool row(int64_t pos, const std::vector<float>& lg) {
         const int64_t r = pos - first(), rows = n_ctx_ - 1 - first();
-        const uint64_t off = 20 + (uint64_t) n_chunk_ * n_ctx_ * 4 +
-                             ((uint64_t) chunk_ * rows + (uint64_t) r) * (uint64_t) row_u16_ * 2;
+        const uint64_t off = row_offset(pos, rows);
+        if (emitting_) {
+            std::vector<uint16_t> q;
+            float scale, min_lp;
+            quantize_row(lg.data(), n_vocab_, q, scale, min_lp);
+            if (basalt::platform::fseek64(out_, static_cast<int64_t>(off)) != 0 ||
+                std::fwrite(q.data(), sizeof(uint16_t), q.size(), out_) != q.size()) {
+                basalt::log::error("basalt ppl", "writing the emitted row at %llu failed", (unsigned long long) off);
+                return false;
+            }
+            return true;
+        }
         base_.resize((size_t) row_u16_);
         if (!read_at(base_.data(), base_.size() * 2, off)) return false;
         float scale, min_lp;
@@ -138,9 +207,7 @@ private:
         for (int64_t i = 1; i < V; ++i)
             if (lg[(size_t) i] > lg[(size_t) top]) top = i;
         const float maxv = lg[(size_t) top];
-        double sum = 0.0;
-        for (int64_t i = 0; i < V; ++i) sum += std::exp(lg[(size_t) i] - maxv);
-        const float lse = maxv + (float) std::log(sum);
+        const float lse = maxv + (float) std::log(log_sum_exp(lg.data(), V, maxv));
         const int32_t tgt = tok_[(size_t) pos + 1];
         const double nll = lse - lg[(size_t) tgt];
         const double nll_base = -(scale * b[tgt] + min_lp);
@@ -158,6 +225,7 @@ private:
         return true;
     }
 
+    bool emitting_ = false;
     int fd_ = -1;
     std::FILE* out_ = nullptr;
     int64_t n_ctx_ = 0, n_vocab_ = 0, n_chunk_ = 0, row_u16_ = 0;
