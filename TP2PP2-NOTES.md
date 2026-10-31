@@ -2753,6 +2753,19 @@ wire (50.4 ms at its current share) scales with its rows and cancels the 1.63 us
 row-rate gain. The tp2 prefill is placement-optimal GIVEN the wire; the idle is
 wire-protected, the same class as the slice's dependency-protected idle. The prefill
 levers that remain: full sharding only (whose 4-rank hiding just measured 42.7%).
+(13) **DECODE SPEED HUNT (autonomous, flag sweeps on quiet silicon)**: **--adapt-swaps
+96 -> 384 = +10.5% decode** (3-run matched-acceptance A/B: 96 gives 46.8/53.3/57.2 =
+mean 51.0 t/s; 384 gives 52.1/60.7/64.0 = mean 56.4; acceptance 71-75% either side; the
+short-prompt probe agreed 47.6 -> 52.1). THE CURVE HAS A KNEE: 96 -> 384 rises, **768
+COLLAPSES to 19.2** (the swap machinery's own overhead swamps the tier gain past the
+knee). --adapt-swaps 384 is now the serving default in CONTINUATION §7. **--exp
+l2warm_force=1 is a SEVERE REGRESSION: 47.6 -> 15.8 t/s** (acceptance unchanged 67/69% —
+the warm-up steals decode bandwidth); that flag stays dead. THE ACCEPTANCE IS THE BIGGEST
+VARIABLE BY FAR: 64.0 t/s at acc 80% vs 46.8 at acc 71% — same binary, same flags, dl
+2.9 vs 2.5. The remaining decode levers rank: the drafter's acceptance (workload-bound,
+the reseed already helped), the miss-serving wait (12.5-14.4 ms/window), the per-layer
+host (7-10 ms).
+
 (12) **THE GATE IS GREEN — AND THE FLAG STILL CANNOT SHIP (a 122k crash).**
 TWO ONE-LINE FIXES in the charge and the gate passed DECISIVELY: (a) mine — the charge
 walk priced the partial but the charge was never ADDED (log said "unused"; my first fix
