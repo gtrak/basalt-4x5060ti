@@ -147,8 +147,10 @@ COMMON="--model $PACK --prefill 8192 --resident-budget-gib 37 --spec 8 --ple-io 
         --max-context 262144 --resident-experts --peer-reserve-mib 600 --short-read 512
         --tp-size 2 --peer-ram-rows --gpu 0,1,2,3 --batch 2"
 
-python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm emit  $COMMON --base-args '--peer-reserve-mib 723'
-python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm check $COMMON --base-args '--peer-reserve-mib 723'
+python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm emit  $COMMON \
+    --base-args '--exp peer_charge_partial=1'
+python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm check $COMMON \
+    --base-args '--exp peer_charge_partial=1'
 python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm gate  $COMMON \
     --flag peer_partial_merge=1
 python3 tools/quality_gate.py --verdict $OUT
@@ -164,19 +166,51 @@ and 6 chunks; the emitted base is 1.42 GiB each).
 ### The arms must hold the same experts, and the verdict checks that they do
 
 Which card computes a row decides whether it crosses as BF16 bits or stays FP32, so an arm that places the experts
-differently is not measuring the flag. This flag does move placement: `--exp peer_partial_merge=1` is read inside
-`Prefill::peer_bytes()`, which sizes the reserve the partner card keeps free, and its expert tier is filled after
-the peer's prompt and partial buffers are allocated - so the flag-on boot fills the tier into a narrower room and
-holds fewer ranked pairs. `--seed` does not pin placement across different reserves.
+differently is not measuring the flag. This flag does move placement, and the place it moves it is the room the
+partner card fills its expert tier into. `open_partner` (`src/program/generate.cpp`) sizes that room as
+
+```
+room = free(partner) - ( vram_reserve_mib + split_pf_mib + kWindowMib + (pipe ? kPairMibLater : 0)
+                         + ceil(Prefill::peer_bytes(chunk, ...) / 1 MiB) )
+```
+
+and `peer_bytes` is one counting walk of `peer_layout`, the walk that allocates the peer's prompt buffers. So the
+room moves exactly as far as the buffer set that walk prices - and the partial merge's price is one entry in it:
+
+| the flag's own buffers | bytes | at this chunk |
+|---|---|---|
+| `part`, the FP32 partial | `T_p * n_embd * 4` | 80 MiB (`T_p` = 8192) |
+| `part16`, packed for the BF16 wire | `T_p * n_embd * 2` | 40 MiB |
+| `fold_tok`, `fold_off`, `fold_rel`, `fold_w` | `4 * G * 4`, `G = T_max` | 0.1 MiB (`G` = 6143) |
+| **the tier gives up** | | **121 MiB** |
+
+`T_p = max(T_max, t_fp4)` is the same in both arms here: `peer_fp4_ceiling` is 26,891 tokens with the row wire and
+213,072 with the fold, both far above the 8192-token chunk that caps it. 121 MiB is what one run measured as 13.98
+GiB against 13.86, and at 2.77 MiB a ranked pair it is the 5429 against 5384 that run reported. Nothing is
+REMOVED by the flag: the peer still computes its rows into the double-buffered `Dm_b` staging the fold reads, so
+the row wire's buffers are charged in both arms and the charge is legitimate, not stale. The charge pins the arms
+equal only while the two `T_p`s come out equal, which is what the ceiling being far above the chunk buys; a pack
+whose ceiling binds below the chunk would price the two arms at different `T_p`s, and `--verdict` prints that room
+gap rather than passing it.
+
+Two knobs do not move a tp2 partner's tier, and one re-gate was spent on the wrong one. `--peer-reserve-mib`
+prices an EXPERT TIER (`peer_expert_room`, `open_peer`, both gated on `o.peer_device >= 1`) and a `--tp-size 2`
+boot has no such card, so raising it 600 to 723 filled the tier identically. `--vram-reserve-mib` is in the
+formula but shared: raising it shrinks the LEAD cards' tiers beside the partner's and moves the placement again in
+the other direction. The lever is the buffer set itself: **`--exp peer_charge_partial=1`** makes `peer_bytes` price
+the partial's buffers on an arm that does not fold, so the reference arms reach the gate arm's room through the
+same arithmetic the gate arm pays - no MiB figure to re-derive when the chunk changes. The boot prints what the
+charge holds back beside the whole figure it priced for the partner's prompt buffers, and `make_peer` still follows
+`peer_partial_merge` alone, so nothing folds and no weight is read back.
 
 `--verdict` therefore reads each boot's own log - the `experts live in VRAM ...` line, the two
 `(N experts held, M band)` pairings, the `tp2: CUDA%d holds ... ranked pairs ... room` lines, the RAM-band split -
 and prints `VOID` when the `gate` arm or either reference arm disagrees with `check`, naming each disagreement fact.
-It measures the room gap and prints which arm to charge, by how much, and the room to reach. A flag that costs the
-partner card bytes is paid for on the reference arms with `--base-args`, which is withheld from the gate arm;
-`--gate-args` is its mirror for a flag that frees room. For this flag, a first run measured 13.98 GiB and 5429
-ranked pairs against 13.86 GiB and 5384, so the reference arms take `--base-args '--peer-reserve-mib 723'` (the 600
-above plus the ~123 MiB the flag costs) to bring both arms to the same tier.
+It also voids the run when an arm left no `engine.log` or a log with none of those lines in it: an arm whose tier
+cannot be read has not been shown to hold the same experts as any other. It measures the room gap and prints which
+arm to charge, by how much, and the room to reach. A flag that costs the partner card bytes is paid for on the
+reference arms with `--base-args`, which is withheld from the gate arm; `--gate-args` is its mirror for a flag that
+frees room. `--seed` does not pin placement across different reserves.
 
 ## The bounds
 
@@ -217,9 +251,12 @@ report if nothing is wrong, and every bound above is stated relative to it.
 
 Built, unit-tested, **and once run with a confound**: one set of three arms was taken and returned `same top-1
 94.41%` against the 99% bound, but the arms turned out not to have held the same experts (the paragraph above), so
-that verdict is VOID and says nothing about the fold. Treat everything in this page as the arithmetic's bounds
-measured on synthetic rows, and the `+34-35%` prefill figure as a development A/B. **The next run must pass
-`--base-args` to the reference arms and print no placement `VOID` before its numbers mean anything.** The flag
-stays dark (`--exp peer_partial_merge=1`, off by default) until `--verdict` prints PASS on both length buckets and
-the bounds above are replaced by the run's own.
+that verdict is VOID and says nothing about the fold. The re-gate that should have fixed it - `--base-args
+'--peer-reserve-mib 723'` on the reference arms - filled the tier to 13.98 GiB again, because that reserve prices
+an expert tier and a tp2 boot has none: the room the tier fills into is priced by `peer_bytes`, and the paragraph
+above now carries that algebra and the lever that reaches it. Treat everything in this page as the arithmetic's
+bounds measured on synthetic rows, and the `+34-35%` prefill figure as a development A/B. **The next run must pass
+`--base-args '--exp peer_charge_partial=1'` to the reference arms and print no placement `VOID` before its numbers
+mean anything.** The flag stays dark (`--exp peer_partial_merge=1`, off by default) until `--verdict` prints PASS
+on both length buckets and the bounds above are replaced by the run's own.
 
