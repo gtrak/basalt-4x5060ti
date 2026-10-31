@@ -2735,4 +2735,11 @@ on (inert on verbatim tails by construction, active where the sims say it pays).
 - Term-by-term: the model's attn (54.4) and rows (89.5) track the chunk lines (attn
   48.5-50.0, lead-experts 87.8) within ~5-10% - the accounting is honest.
 - blob_mb_ms still unmeasured (the one constant the model admits not knowing).
-- Prefill re-confirmed 2,004 t/s fresh concurrent on this boot.
+- Prefill re-confirmed 2,004 t/s fresh concurrent on this boot.**FIRST MEASURED CONCURRENT DECODE AGGREGATE (live, the worker code-gen class)**: two
+slots' agentic turns interleaving — done-lines acc 68-88%, dl 2.7-4.1, 51-76 t/s per slot;
+the live totals swinging 79 -> 93 t/s, with both-slots-speculating-well bursts crossing
+~114. The drafter reseed's payoff at scale: the acceptance holding high through real
+generations on the target class. The split's CONCURRENT decode was never measured (solo
+74-90 only) — a missing baseline for the topology decision; if the split degrades under
+concurrency the way its prefill slots do, tp2's concurrent aggregate may already exceed it.
+
