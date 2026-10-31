@@ -145,23 +145,26 @@ quantization is `PplGate::quantize_row`, shared by the writer and the reader and
 
 `$PACK` is `models/Qwen3.8-FN-FP4Local.basalt`, `$OUT` a scratch directory. The engine flags are the production
 server's, so the gate measures the shipping configuration; the two arms differ by exactly one word **once they hold
-the same experts** - which is what the next section makes them do.
+the same experts** - which is what the next two sections make them do. `$PIN` is the RAM band's share, pinned to the
+eighths the unpinned boot struck for itself (its `RAM rows` fact) and given to every arm: a band free to move places
+different experts, and the verdict is VOID ([peer-band-pin.md](peer-band-pin.md) carries the limitation).
 
 ```sh
 COMMON="--model $PACK --prefill 8192 --resident-budget-gib 37 --spec 8 --ple-io direct --kv int8
         --max-context 262144 --resident-experts --peer-reserve-mib 600 --short-read 512
         --tp-size 2 --peer-ram-rows --gpu 0,1,2,3 --batch 2"
+PIN=peer_band_pin=3
 
-python3 tools/quality_gate.py --pack $PACK --bucket 16384 --out $OUT --arm emit  $COMMON \
-    --base-args '--exp peer_charge_partial=1'
-python3 tools/quality_gate.py --pack $PACK --bucket 16384 --out $OUT --arm check $COMMON \
-    --base-args '--exp peer_charge_partial=1'
-python3 tools/quality_gate.py --pack $PACK --bucket 16384 --out $OUT --arm gate  $COMMON \
-    --flag peer_partial_merge=1
+python3 tools/quality_gate.py --pack $PACK --bucket 8192 --chunks 2 --out $OUT --arm emit  $COMMON \
+    --base-args "--exp peer_charge_partial=1 --exp $PIN"
+python3 tools/quality_gate.py --pack $PACK --bucket 8192 --chunks 2 --out $OUT --arm check $COMMON \
+    --base-args "--exp peer_charge_partial=1 --exp $PIN"
+python3 tools/quality_gate.py --pack $PACK --bucket 8192 --chunks 2 --out $OUT --arm gate  $COMMON \
+    --flag peer_partial_merge=1 --gate-args "--exp $PIN"
 python3 tools/quality_gate.py --verdict $OUT
 ```
 
-`$COMMON`'s `--prefill 8192` and the 16384-token bucket are what put a chunk inside the leg - see the next section.
+`$COMMON`'s `--prefill 8192` and the 8192-token bucket are what put a chunk inside the leg - see the next section.
 The committed fixture's 512- and 1024-token buckets sit below it and grade only the instrument; a bucket's emitted
 base is `chunks x bucket x ~300 KiB`, so generate a wider one with `tools/quality_fixture.py` when the flag is
 graded for real.
@@ -237,6 +240,11 @@ cannot be read has not been shown to hold the same experts as any other. It meas
 arm to charge, by how much, and the room to reach. A flag that costs the partner card bytes is paid for on the
 reference arms with `--base-args`, which is withheld from the gate arm; `--gate-args` is its mirror for a flag that
 frees room. `--seed` does not pin placement across different reserves.
+
+The RAM band's share moves the placement the same way and moves BY ITSELF: it is struck against the lead card's
+resident fill, which the memory that happens to be free sets, and it picks the band by rank, so one member moving
+shifts every choice above it. `--exp peer_band_pin=N` fixes the share and the membership; a pinned boot's placement
+is canonical, not this pair's, so a pinned `PASS` grades arithmetic and says nothing about production ([peer-band-pin.md](peer-band-pin.md)).
 
 ## The bounds
 
