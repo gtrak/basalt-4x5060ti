@@ -2753,6 +2753,24 @@ wire (50.4 ms at its current share) scales with its rows and cancels the 1.63 us
 row-rate gain. The tp2 prefill is placement-optimal GIVEN the wire; the idle is
 wire-protected, the same class as the slice's dependency-protected idle. The prefill
 levers that remain: full sharding only (whose 4-rank hiding just measured 42.7%).
+(5) **THE GAP IS DEAD — THE HEADLINE FINDING**: the serving (boot C: the clean recipe +
+the gap-instrumented binary) prints the gap term on every window: **gap 0.1 ms =
+between 0.1 + prep 0.0**. The ~17 ms invisible host gap from the kimi #7 anatomy DOES
+NOT EXIST in the current binary — the 19.4+17 drumbeat decomposition is OBSOLETE (the
+binary changed underneath the analysis; the old numbers came from the long-running
+pre-pipeline server). The TRUE anatomy now (the decode-timing line, 872-window and
+115-window samples, consistent): **40.8-44.7 ms/window = verify 33.5-36.4 (GPU-reach
+wait 12.5-14.4 + per-layer host 7.1-7.7 [plan 0.05 actq 0.08 jobs 0.03 CPU 10.3-10.7])
++ draft 2.6-3.6**, dl 3.07-3.49, the solo rate 75.2-78.0 t/s (the drafter's dl gain
+offset the protocol cost — the t/s held). THE LEVER RANKING UPDATES: (1) the GPU-reach
+wait / the peer combine 12.5-14.4 ms — the ring protocol's per-window cost — is the #1
+named term (the decode-cadence bench says the 4-rank protocol floor is ~4 ms/window —
+the gap between the floor and the measured 12-14 is the row-fetch payloads, the new
+lever); (2) the per-layer host 7.1-7.7 (the CPU pool inside the wait — concurrent, the
+lever smaller than #7 ranked it); (3) the slots 2->4 unchanged (the aggregate 2.2-2.8x);
+(4) the host gap: DEAD, struck. Boot C verified SANE and is the RESTORED serving config
+(clean recipe, no re-price flags, the gap-instrumented binary).
+
 (4) THE POWER PROFILE (the owner's proxy method, dmon during live serving): tp2pp2
 draws 24-37% of TDP per card (leads 56-58 W avg, peers 44-47 W of 180 W TDP; SM util
 36-56%) — nothing compute-bound, the whole topology memory/idle-bound, the peers
