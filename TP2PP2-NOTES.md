@@ -2837,24 +2837,26 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
-(22) **WHY THE REBALANCE DID NOT HELP — THE MODEL HAS NO PEER-BLOB TERM.** The boot's
-pricing line prints the peer as `attention 0.0 + rows 46.0 + back 10.1 + acts 2.8` — **no
-blob term at all**. `peer_layer_time` charges `lead_blobs = (band - r) * slot / blob` and
-nothing for the partner. Physically a band expert's blob must be read by WHOEVER holds
-it, and both cards read the same RAM tier over the same host link (the `blob_mb_ms`
-constant is even commented "priced at the pair's link"), so moving a band expert moves
-the read, it does not delete it. THE ARITHMETIC AT THE MEASURED SHARE: 435 experts/layer
-x 2.55 MB = 1,109 MB of blob reads per layer, **264 ms at 4.2 MB/ms, unpriced** — against
-the 115 ms the lead actually saved. The model therefore reported a win that could not
-exist, and the wall agreed with the physics, not the model: **2,728 -> 2,066 t/s**.
-CONSEQUENCES: (a) `--exp peer_share_cap` is ANSWERED AND REJECTED, default-off, with this
-as the reason; (b) the price needs `peer_blobs = (r + held) * slot / blob` to be honest —
-a correctness fix for the placement model, not a perf change; (c) **the "peer idle" was
-never recoverable by rebalancing BAND experts**: what is recoverable is moving experts
-the partner already HOLDS (no read at all), and that is the `held` term, already at its
-limit. This also explains (2) from the other direction: the peer's idle is RAM-bound,
-not wire-bound, which is why both the wire-protection argument and this one point the
-same way.
+(22) **WHY THE REBALANCE DID NOT HELP — AND TWO WRONG ANSWERS I GAVE FIRST, STRUCK.**
+WRONG #1 ("the read follows the expert so the win cancels"): FALSE — each card has its own
+x4 lane to host RAM, and the code says so: the peer reads band blobs "from host RAM over
+its OWN link into a ring of its own slots" (prefill.cpp:800). Moving a band expert moves
+its read to an IDLE lane; it does not contend with the lead's. The owner corrected this.
+WRONG #2 ("the band never engaged, T > ram_top"): FALSE — ram_top = B*n_expert/(K*rb) =
+25,487 tokens and the chunk is 8,192, so the band engages.
+**THE ACTUAL CAUSE: `pp.ring = PeerPrefill::kRing` is a FIXED 48 slots whatever the
+band share** (prefill.cpp:2218). At 1/8 band the partner streams a handful of experts a
+layer through 48 slots and the ring is generously deep ("the peer's copy engine never
+waits on its own compute", kRing's own comment). At 7/8-8/8 band it streams ~435 experts
+a layer through the SAME 48 slots, re-reading a slot as soon as it frees: the copy engine
+serializes on slot reuse and the peer's lane idles waiting for slots. The staging depth,
+not the lane and not the price, is the wall — and it is a cost nothing budgets.
+THE FIX IF ANYONE WANTS IT: size the ring to the share (ring ~ experts-in-flight for the
+band, bounded by VRAM), which is a real memory trade (a slot is 2.4 MiB; 435 in flight is
+~1 GiB of the partner's VRAM, and the partner's tier is already at 13.86 of 13.86 GiB).
+That is why the share cap was rejected on measurement and stays default-off: the honest
+version needs the ring AND the tier reserve re-walked together, which is a placement
+project, not a flag. **`--exp peer_share_cap` remains ANSWERED AND REJECTED as shipped.**
 
 (21) **THE LIMITS, EXHAUSTED — what is left and what is not.** Every lever now has a
 measured verdict:
