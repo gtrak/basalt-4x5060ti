@@ -2753,6 +2753,75 @@ wire (50.4 ms at its current share) scales with its rows and cancels the 1.63 us
 row-rate gain. The tp2 prefill is placement-optimal GIVEN the wire; the idle is
 wire-protected, the same class as the slice's dependency-protected idle. The prefill
 levers that remain: full sharding only (whose 4-rank hiding just measured 42.7%).
+(15) **THE 122k CRASH ROOT-CAUSED: A LEAD-SIDE EVENT CREATED ON THE PARTNER'S CONTEXT.**
+`prefill gr_write: invalid resource handle` was never a graph-capture error and never a
+ring-depth problem: it is `cudaEventRecord(ppc->ev_used, m.cs)` at the layer's combine
+failing. `ev_used` is the LEAD's proof (the combine records it on `m.cs` so the partner's
+next partial may land), but `make_peer` created it AFTER `cudaSetDevice(pp->dev)` - on the
+partner's context. `cudaEventRecord` requires event and stream to share a context, and the
+error it returns (`cudaErrorInvalidResourceHandle`, "invalid resource handle") was PENDING
+because the call is unchecked: the next `check()` to run is `gr_write`'s, three lines
+later, which is why a bad event read as a kernel. THE FIX: create `ev_used` with the other
+lead-side events (beside `ev_in`/`ev_act`/`ev_planes`, before the device switch, the rule
+the file already states for `ev_fwd`) and destroy it under the lead. `ev_part`/`ev_back`
+stay with the partner: they are recorded on ITS streams. A `cudaStreamWaitEvent` on the
+other card's event is legal and stays as it was.
+
+THE THRESHOLD WAS NOT THE DEEP RING. The fold path runs only under `peer_fp4`, which is
+`ppc && stream_all && T_fp4 > 0`, and `stream_all` needs `T >= stream_all_min()` (6144 by
+default; 2560/4096 for a serving boot that gives the partner rows). So the flag dies on
+the FIRST chunk of >= 6144 tokens and is invisible below it - which is why a 512-token
+prompt read sane and 16,890 did not. **It also means the GREEN gate was void: its 512-
+token bucket reads a 257-token prompt, so neither arm ever folded** (see
+docs/precision/moe-partial-merge.md, "The fold only runs on a streamed chunk"). Same
+class of error as the placement confound: an instrument that passes when the mode is dead.
+
+LANDED: the event fix; `--exp peer_part_debug=1` (names the call site of every CUDA call
+the fold makes - its records/waits/copies were unchecked, which is what hid this behind
+`gr_write`; the error stays pending so the run still stops where it would); the partial's
+buffer widths single-sourced into `moe_part.hpp` (`peer_part_accum_bytes`,
+`peer_part_pack_bytes`, `peer_part_wire_bytes`, `peer_part_landing_bytes`,
+`peer_fold_table_bytes`) with `carve`/`bytes_needed`/`peer_layout` all allocating from
+them - which HALVED the lead's landing buffer (it was 2x the FP32 wire it covers, 80 MiB
+of loaned region at chunk 8192, a memory-only change, no numerics); test 8 of
+`moe_part_parity` (270 (Tp,T,G) geometries, 5 mutations each FAILED, covering relations
+against what the kernels touch); `quality_gate` now refuses a `gate` arm whose chunks
+cannot reach the floor, and `--verdict` VOIDs a run whose boot never printed `peer partial
+merge on:` or whose share bound sits under the run's pinned `--prefill` (10 new tests, 45
+OK, 6 mutations each caught). CHECKS: `moe_part_parity` OK, `ctest -L cpu` 71/72 (the one
+failure is `expert_multi_test`, this host having no AVX-512), `tools/test_quality_gate.py`
+OK, `check_platform_boundary.sh` + `check_stderr_logging.sh` ok, `prefill` target builds
+clean. NO BOOT, NO GPU, the server on :8000 untouched.
+
+WHAT IT DOES NOT PROVE: the fold's numerics still have no valid gate run - the fix makes
+the mode RUNNABLE at a streamed chunk, and the gate now refuses to call a dead-mode
+agreement a PASS, but the verdict still has to be earned at a bucket whose chunks reach
+the floor (16384 with `--prefill 8192`), with `--base-args '--exp peer_charge_partial=1'`
+on the reference arms. Verification boots for the supervisor: the flag on with
+`--exp peer_part_debug=1` and a ~17k-token prompt (was: dies); then the three-arm gate at
+the wider bucket. No speed number claimed - a flag-on prefill A/B was never taken here.
+
+(15) **THE REGRESSION WAS MINE: --adapt-swaps 384 IS 22% SLOWER ON REAL SESSIONS.**
+The owner was right and my (13)/(14) were WRONG. Corrected analysis, weighted by the
+engine's own window counts across 78 boots: the established boots (77,79,84,86,88,89,95)
+all run **12.3-13.0 ms GPU-reach wait + 5.1-6.4 ms per-layer host at 38-40 ms/window
+(73-85 t/s)**; the current boot 102 measures **15.6 ms wait + 7.16 ms host at 46.6
+ms/window (65.9 t/s)** — the same tok/window (3.07 vs 2.9-3.0), ~22% slower per window.
+THE CAUSE: boot 102 is the only one with **--adapt-swaps 384** — my change. My A/B was
+run on 1800-token probes where the adaptive swap machinery barely engages; on the
+workers' long agentic sessions the higher swap budget raises the miss-serving wait and
+the per-layer host. **THE FOUR MEASUREMENT ERRORS I MADE, all now rules**: (a) graded
+t/s from short done-lines (cold draft policy) — (14) already covers this; (b) ran an A/B
+on probes whose regime did not exercise the changed machinery — **a flag that touches
+tier/swap behavior must be A/B'd on a >=8k-token session, not a 1.8k probe**; (c)
+trusted an awk parse that silently mismatched fields ("mean 80.5" was fabricated by the
+parser; the true figure was 62.4) — **never quote a derived number whose parse was not
+printed and eyeballed**; (d) shipped a default change before the real-workload check.
+REVERTED: CONTINUATION §7 back to --adapt-swaps 96. The engine is UNCHANGED (the flag
+was config-only), so the previous 74-76 t/s is restored by the boot, not by a build.
+THE AUDIT STANDS: no engine-code regression exists — every commit since the 75 t/s era is
+instrumentation or flag-gated.
+
 (14) **NO REGRESSION — THE 80 t/s IS STILL THERE (owner asked; the engine is cleared).**
 The engine-side audit: every commit since the 80 t/s era is instrumentation or
 FLAG-GATED (partial-merge, peer_charge_partial, ppl-emit — all default OFF); nothing on
@@ -2768,7 +2837,7 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
-(13) **DECODE SPEED HUNT (autonomous, flag sweeps on quiet silicon)**: **--adapt-swaps
+(13) **DECODE SPEED HUNT [WITHDRAWN — see (15)] (autonomous, flag sweeps on quiet silicon)**: **--adapt-swaps
 96 -> 384 = +10.5% decode** (3-run matched-acceptance A/B: 96 gives 46.8/53.3/57.2 =
 mean 51.0 t/s; 384 gives 52.1/60.7/64.0 = mean 56.4; acceptance 71-75% either side; the
 short-prompt probe agreed 47.6 -> 52.1). THE CURVE HAS A KNEE: 96 -> 384 rises, **768

@@ -279,7 +279,7 @@ In-flight at this writing (all blind-on-GPU, predictions filed):
   --model /home/gary/opt/basalt/models/Qwen3.8-FN-FP4Local.basalt --alias local
   --host 127.0.0.1 --port 8000 --gpu 0,1,2,3 --parallel 2 --slot-full-context
   --prefill 8192 --resident-budget-gib 37 --prompt-cache 8 --spec 8 --ple-io direct
-  --kv int8 --max-context 262144 --adapt-swaps 384 --resident-experts
+  --kv int8 --max-context 262144 --adapt-swaps 96 --resident-experts
   --peer-reserve-mib 600 --decode-timing --suffix-draft 8 --grammar --short-read 512
   --tp-size 2 --peer-ram-rows --exp decode_profile=1`
   (--peer-rows-fp32 / --peer-acts-fp32 / --exp mtp_preswap=1 / --exp batch_lines=0 /

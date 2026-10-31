@@ -86,4 +86,61 @@ BF16_HD inline float moe_combine_out(float routed, float part, float shared_term
     return (routed + part) + shared_term;
 }
 
+// ---------------------------------------------------------------- the partial's buffers
+//
+// The mode moves one `T x n_embd` vector a layer from the partner to the lead, plus the tables that tell the fold
+// which rows to add.  Every one of them is allocated from the figures below and read back through them, so the
+// arithmetic that decides whether a chunk fits lives in one place and a test can grade it: the partner's
+// accumulator (FP32, what the fold adds into and the pack reads), its packed image for the BF16 wire, the same
+// vector as it crosses the link (`peer_part_wire_bytes`, one row wide exactly as the rows themselves would have
+// been), the lead's landing buffer (the WIDER wire's bytes, so either fits with no branch on the format), and one
+// group's fold tables (`G` rows and at most `G` tokens, since a token has at least one row).
+//
+// The partner's leg is funded for `Tp` tokens and its groups for `G` rows; the fold, the pack, the copies and the
+// combine then use a chunk's `T` and a group's `nr`.  An allocation below its widest use is a device-side overrun,
+// not a wrong answer, so `tests/kernels/moe_part_parity.cpp` pins these covering relations over the geometry the
+// pair can actually be given.
+
+/// The partner's accumulator: the layer's partial, FP32, one row per token of the chunk.
+inline uint64_t peer_part_accum_bytes(int64_t T, int64_t n_embd) {
+    return (uint64_t) T * (uint64_t) n_embd * 4u;
+}
+
+/// The accumulator packed for the BF16 wire: one BF16 a value.
+inline uint64_t peer_part_pack_bytes(int64_t T, int64_t n_embd) {
+    return (uint64_t) T * (uint64_t) n_embd * 2u;
+}
+
+/// The layer's partial on the pair's link: the width the rows themselves would have crossed in, so
+/// `--peer-rows-fp32` keeps its meaning on this leg too.
+inline uint64_t peer_part_wire_bytes(int64_t T, int64_t n_embd, bool rows_bf16) {
+    return rows_bf16 ? peer_part_pack_bytes(T, n_embd) : peer_part_accum_bytes(T, n_embd);
+}
+
+/// The lead's landing buffer: the wider (FP32) wire's bytes, so either wire lands without the layout asking which
+/// one the pair was given.
+inline uint64_t peer_part_landing_bytes(int64_t T, int64_t n_embd) {
+    return peer_part_accum_bytes(T, n_embd);
+}
+
+/// One expert group's fold tables: `G` rows and at most `G` tokens (a token the group touches has at least one row
+/// of its own), `off` carrying the terminating run end.
+struct PeerFoldTableBytes {
+    uint64_t tok = 0, off = 0, rel = 0, wt = 0;
+};
+inline PeerFoldTableBytes peer_fold_table_bytes(int64_t G) {
+    PeerFoldTableBytes b;
+    b.tok = (uint64_t) G * 4u;
+    b.off = (uint64_t) (G + 1) * 4u;
+    b.rel = (uint64_t) G * 4u;
+    b.wt = (uint64_t) G * 4u;
+    return b;
+}
+
+/// The per-token scratch the fold's counting sort needs: one count and one cursor per token of the chunk, the sort
+/// indexing them by token id.  `moe_fold_scratch` is the side that allocates it; this is the side that grades it.
+inline uint64_t peer_fold_scratch_bytes(int64_t T) {
+    return (uint64_t) (T + 1) * 4u * 2u;
+}
+
 }  // namespace basalt::prefill

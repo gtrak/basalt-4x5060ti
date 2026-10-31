@@ -44,7 +44,14 @@ using basalt::kernels::f32_from_bf16;
 using basalt::prefill::kMoeK;
 using basalt::prefill::moe_fold_tables;
 using basalt::prefill::MoeFoldTables;
+using basalt::prefill::PeerFoldTableBytes;
 using basalt::prefill::PeerRows;
+using basalt::prefill::peer_fold_scratch_bytes;
+using basalt::prefill::peer_fold_table_bytes;
+using basalt::prefill::peer_part_accum_bytes;
+using basalt::prefill::peer_part_landing_bytes;
+using basalt::prefill::peer_part_pack_bytes;
+using basalt::prefill::peer_part_wire_bytes;
 namespace fp4 = basalt::prefill::fp4;   // only for the group cutter the prefill thread itself calls
 
 constexpr int64_t T = 97;             // a chunk, deliberately not a round number
@@ -590,6 +597,88 @@ int main() {
                     "fp4::cut_pieces (%d groups, %d multi-piece, %d empty): mismatches=%d\n",
                     groups_seen, split_experts, empty_groups, ledger_bad);
         if (ledger_bad) ++fails;
+    }
+
+    // 8. the partial's buffers cover their widest use.  The partner's accumulator, its packed image, the link's
+    //    return leg, the lead's landing buffer and one group's fold tables are each allocated ONCE, at the funding
+    //    the leg was given (`Tp` tokens, `G` rows a group), and then read at a chunk's `T` and a group's `nr`/`nt`.
+    //    An allocation narrower than its widest use is a device-side overrun rather than a wrong answer, so the
+    //    covering relation is graded here - with the engine's own figures (`moe_part.hpp`, which `peer_layout` and
+    //    `carve` allocate from) against the bytes the kernels touch, written out from their sources:
+    //    `peer_part_fold_kernel`'s `part[tok[e] * N + d]`, `peer_part_pack_kernel`'s `out[i]`,
+    //    `moe_combine_partial_kernel`'s `part[i]` / `part16[i]`, and `moe_fold_tables`' per-token `cnt`/`cur`.
+    {
+        constexpr int64_t NE = 2560;      // the pack's n_embd, what the prefill path's N is
+        int sizing_bad = 0, sized = 0;
+        // chunks either side of the streaming floor and of the deep-ring switch, the repro's width, and the edges
+        const int64_t chunks[] = {1, 255, 6143, 6144, 8192, 16383, 16384, 16890, 32768};
+        // a group's rows: the staging caps `fp4::cut_pieces` is driven with, the engine's own G, and the edges
+        const int64_t groups[] = {1, 64, 256, 6143, 8192, 65536};
+        for (const int64_t Tp : chunks)
+            for (const int64_t T : chunks)
+                for (const int64_t G : groups) {
+                    if (T > Tp) continue;   // the leg is never handed a chunk wider than its funding
+                    ++sized;
+                    // the fold's accumulator and the combine's read of it: every (token, dimension) of the chunk,
+                    // four bytes apiece, on either wire
+                    const uint64_t use_accum = (uint64_t) T * (uint64_t) NE * 4u;
+                    if (peer_part_accum_bytes(Tp, NE) < use_accum) {
+                        ++sizing_bad;
+                        std::printf("   FAIL: accumulator %llu B funded below the combine's %llu B "
+                                    "(Tp %lld, T %lld)\n",
+                                    (unsigned long long) peer_part_accum_bytes(Tp, NE),
+                                    (unsigned long long) use_accum, (long long) Tp, (long long) T);
+                    }
+                    // the packed image: the pack writes one BF16 per value of the run it is handed
+                    const uint64_t use_pack = (uint64_t) T * (uint64_t) NE * 2u;
+                    if (peer_part_pack_bytes(Tp, NE) < use_pack) {
+                        ++sizing_bad;
+                        std::printf("   FAIL: packed image %llu B below the pack's %llu B (Tp %lld, T %lld)\n",
+                                    (unsigned long long) peer_part_pack_bytes(Tp, NE),
+                                    (unsigned long long) use_pack, (long long) Tp, (long long) T);
+                    }
+                    // the lead's landing buffer takes either wire's copy of a chunk, and the link carries exactly
+                    // the wire's bytes: one row wide as the rows themselves were
+                    for (const bool bf16 : {true, false}) {
+                        const uint64_t wire = peer_part_wire_bytes(T, NE, bf16);
+                        if (peer_part_landing_bytes(Tp, NE) < wire) {
+                            ++sizing_bad;
+                            std::printf("   FAIL: landing %llu B below the %s wire's %llu B (Tp %lld, T %lld)\n",
+                                        (unsigned long long) peer_part_landing_bytes(Tp, NE),
+                                        bf16 ? "BF16" : "FP32", (unsigned long long) wire,
+                                        (long long) Tp, (long long) T);
+                        }
+                        if (wire != (bf16 ? peer_part_pack_bytes(T, NE) : peer_part_accum_bytes(T, NE))) {
+                            ++sizing_bad;
+                            std::printf("   FAIL: the %s wire is neither the packed image nor the accumulator "
+                                        "(T %lld): %llu B\n", bf16 ? "BF16" : "FP32", (long long) T,
+                                        (unsigned long long) wire);
+                        }
+                    }
+                    // the fold's tables: a group holds at most G rows, and no more tokens than rows (a token it
+                    // touches owns at least one of them), so nt <= nr <= G is the widest list it can be handed
+                    const PeerFoldTableBytes ft = peer_fold_table_bytes(G);
+                    const uint64_t nt = (uint64_t) G, nr = (uint64_t) G;
+                    if (ft.tok < nt * 4u || ft.off < (nt + 1) * 4u || ft.rel < nr * 4u || ft.wt < nr * 4u) {
+                        ++sizing_bad;
+                        std::printf("   FAIL: %lld-row group's tables do not cover its widest list (tok %llu off "
+                                    "%llu rel %llu wt %llu)\n", (long long) G,
+                                    (unsigned long long) ft.tok, (unsigned long long) ft.off,
+                                    (unsigned long long) ft.rel, (unsigned long long) ft.wt);
+                    }
+                    // the counting sort indexes its scratch by token id, so a chunk's highest token must land
+                    const uint64_t scratch = peer_fold_scratch_bytes(Tp);
+                    const uint64_t use_scratch = ((uint64_t) (T - 1) + 1u) * 4u * 2u;   // cnt and cur, through T-1
+                    if (scratch < use_scratch) {
+                        ++sizing_bad;
+                        std::printf("   FAIL: scratch %llu B below the sort's %llu B (Tp %lld, T %lld)\n",
+                                    (unsigned long long) scratch, (unsigned long long) use_scratch,
+                                    (long long) Tp, (long long) T);
+                    }
+                }
+        std::printf("8. the partial's buffers cover their widest use over %d funded (Tp, T, G) geometries: "
+                    "failures=%d\n", sized, sizing_bad);
+        if (sizing_bad) ++fails;
     }
 
     std::printf("%s\n", fails == 0 ? "moe_part_parity: OK" : "moe_part_parity: FAILED");

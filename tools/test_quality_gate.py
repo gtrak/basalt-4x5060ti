@@ -9,6 +9,8 @@ synthetic rows, and the verdict against synthetic runs whose numbers were chosen
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import math
 import pathlib
@@ -321,6 +323,128 @@ class Placement(unittest.TestCase):
             self.assertEqual(len(bad), 3, "one line naming each arm whose log is missing")
             self.assertTrue(all("no engine.log" in m for m in bad))
             self.assertEqual(QG.verdict(root), 1)
+
+
+class FoldLeg(unittest.TestCase):
+    """The fold rides the partner's FP4 leg, which takes only a streamed chunk up to its crossover. A bucket whose
+    prompt misses it leaves BOTH arms on the row wire: they then agree exactly, every bound is met, and the verdict
+    would print PASS over a run that never ran the flag - which is how one 512-token-chunk run came home GREEN."""
+
+    ARMED = "basalt prefill: peer partial merge on: the layer's return leg is one 8192 x 2560 BF16 partial\n"
+    SHARE = ("basalt prefill: peer fp4 crossover 8192 tokens: 621 MiB of activations and rows per 1024 tokens "
+             "over 24 layers; the share is on, chunks of 8192 tokens or less; rows cross as the layer's summed "
+             "BF16 partial\n")
+
+    def arms(self, root: pathlib.Path, flag="peer_partial_merge=1", bucket=16382, lines=None,
+             engine_args=("--prefill", "8192")):
+        write_rows(root / "check" / "rows.tsv", 40, kld=0.00007, same_top1=100.0)
+        write_rows(root / "gate" / "rows.tsv", 40, kld=0.0002, same_top1=99.5)
+        for arm in ("emit", "check"):
+            write_log(root / arm / "engine.log")
+        (root / "gate").mkdir(parents=True, exist_ok=True)
+        (root / "gate" / "args.json").write_text(json.dumps({"arm": "gate", "bucket": bucket, "flag": flag,
+                                                             "engine_args": list(engine_args)}),
+                                                 encoding="utf-8")
+        write_log(root / "gate" / "engine.log", BOOT_LINES["same"] + (lines if lines is not None
+                                                                       else [self.ARMED, self.SHARE]))
+
+    def test_a_run_whose_boot_armed_the_fold_for_this_chunk_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            self.arms(root)                       # an 8192-token prompt against an 8192-token leg
+            self.assertEqual(QG.fold_mismatch(root), [])
+            self.assertEqual(QG.verdict(root), 0)
+
+    def test_a_boot_that_never_armed_the_fold_voids_the_run(self):
+        """The flag was refused at boot: both arms ran the row wire, and their agreement is not a verdict."""
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            self.arms(root, lines=[self.SHARE])   # the leg is on, but the fold line never printed
+            self.assertIn("never armed the partial merge", "\n".join(QG.fold_mismatch(root)))
+            self.assertEqual(QG.verdict(root), 1)
+
+    def test_a_chunk_the_leg_never_takes_voids_the_run(self):
+        """The boot armed the fold for chunks up to 8192 and the operator pinned `--prefill` wider: every chunk is
+        then above the leg, so it was never handed to the partner and neither arm folded."""
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            self.arms(root, bucket=32768, engine_args=("--prefill", "32768"))
+            self.assertIn("both arms ran the row wire", "\n".join(QG.fold_mismatch(root)))
+            self.assertEqual(QG.verdict(root), 1)
+
+    def test_an_unpinned_chunk_is_left_to_the_engine(self):
+        """Without `--prefill` the engine's own chunker sets the width; the verdict does not guess it."""
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            self.arms(root, bucket=32768, engine_args=())
+            self.assertEqual(QG.fold_mismatch(root), [])
+
+    def test_a_run_whose_every_chunk_is_below_any_streaming_floor_voids(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            self.arms(root, bucket=4096)         # a 2049-token prompt: under the lowest floor
+            self.assertIn("under any boot's streaming floor", "\n".join(QG.fold_mismatch(root)))
+            self.assertEqual(QG.verdict(root), 1)
+
+    def test_a_gate_over_another_flag_owes_the_fold_no_account(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            self.arms(root, flag="decode_profile=1", lines=[])   # no fold line at all, and none owed
+            self.assertEqual(QG.fold_mismatch(root), [])
+            self.assertEqual(QG.verdict(root), 0)
+
+    def _main(self, argv):
+        """Drive main() as far as the point where it would boot the engine, over a fixture holding one chunk of the
+        bucket under test (the committed fixture only has 512 and 1024). Returns the exit message, or None."""
+        real_boot, real_mf = QG.boot, QG.ModelFile
+
+        class StubModelFile:
+            def __init__(self, path):
+                pass
+
+            def read(self, name):
+                return json.dumps({f"t{i}": i for i in range(64)})
+
+        def fake_boot(bin_, got, log):
+            raise SystemExit(0)
+
+        QG.boot, QG.ModelFile = fake_boot, StubModelFile
+        saved = sys.argv
+        msg = None
+        bucket = int(argv[argv.index("--bucket") + 1])
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                fx = pathlib.Path(d) / "fx.jsonl"
+                fx.write_text("".join(json.dumps(c) + "\n" for c in chunks(1, bucket)), encoding="utf-8")
+                QG.write_base(pathlib.Path(d) / f"base-{bucket}.kld", chunks(1, bucket), bucket, 64)
+                sys.argv = ["quality_gate.py", "--pack", "p", "--out", d, "--fixture", str(fx),
+                            "--model", "/m/pack.basalt", *argv]
+                with self.assertRaises(SystemExit) as cm:
+                    QG.main()
+                if cm.exception.code not in (0, None):
+                    msg = str(cm.exception.code)
+        finally:
+            sys.argv, QG.boot, QG.ModelFile = saved, real_boot, real_mf
+        return msg
+
+    def test_a_bucket_below_any_folding_chunk_is_refused(self):
+        msg = self._main(["--bucket", "512", "--arm", "gate"])
+        self.assertIsNotNone(msg, "a 257-token prompt cannot reach the fold; the tool must say so, not grade it")
+        self.assertIn("streaming floor", msg)
+
+    def test_a_bucket_that_only_a_lowered_floor_reaches_runs_with_a_note(self):
+        """2560 is the floor a peer-prefilled serving boot may reach: the boot decides, and the verdict reads its
+        log, so the run proceeds with the note rather than being refused on the tool's own guess."""
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            msg = self._main(["--bucket", "6144", "--arm", "gate"])
+        self.assertIsNone(msg)
+        self.assertIn("under the default 6144-token streaming floor", err.getvalue())
+
+    def test_a_bucket_over_the_default_floor_is_not_held_to_it(self):
+        self.assertIsNone(self._main(["--bucket", "16384", "--arm", "gate"]))
+
+    def test_the_floor_only_binds_the_flag_that_needs_the_leg(self):
+        self.assertIsNone(self._main(["--bucket", "512", "--arm", "gate", "--flag", "decode_profile=1"]))
 
 
 class ArgHandling(unittest.TestCase):

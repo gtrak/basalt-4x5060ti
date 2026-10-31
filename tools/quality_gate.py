@@ -57,6 +57,23 @@ BOUND_DLOGP_MAX = 0.05      # nats: the base's own top-1 must not fall this far 
 SELF_CHECK_KLD_MEAN = 0.001  # above this, the emitter and the reader disagree and the run is VOID
 SELF_CHECK_SAME_TOP1 = 100.0  # below this, likewise
 
+# The fold only runs on a STREAMED chunk.  `--exp peer_partial_merge` rides the partner's FP4 leg, and the prompt
+# path hands that leg a chunk only from its streaming floor on: `peer_fp4` is gated on `stream_all`, which needs
+# `T >= stream_all_min()` (`src/prefill/prefill.cpp`).  The gate scores a chunk of `n_ctx` tokens whose prompt is
+# `n_ctx // 2 + 1` of them, read as one chunk, so a bucket below twice the floor boots an arm on which the flag can
+# never run - and the two arms then agree because NEITHER folded, which reads as a PASS and means nothing.  The
+# default floor is 6144; a serving boot whose partner takes rows lowers it (`set_stream_all_min` in
+# `src/program/generate.cpp`, 2560 or 4096), and `--verdict` refuses a gate arm whose boot said the fold was off.
+STREAM_FLOOR = 6144
+STREAM_FLOOR_LOWEST = 2560   # the floor a serving boot that gives the partner rows may reach
+
+# What the boot says when the fold is funded and armed (`set_peer`, `src/prefill/prefill.cpp`).  Its absence from
+# the gate arm's log means the flag was refused, or the FP4 leg never opened: an arm graded on the row wire.  The
+# same boot's own bound on the chunk width the FP4 leg takes follows: a prompt wider than it is read on the row
+# wire whatever the flag says, so a run whose bucket exceeds it graded nothing.
+FOLD_ARMED = re.compile(r"peer partial merge on:")
+SHARE_CHUNKS = re.compile(r"the share is on, chunks of (\d+) tokens or less")
+
 # The placement the two arms must agree on.  The gate's premise is that the arms differ by one word; a word that
 # also moves the expert tier moves WHICH ROWS CROSS AS BF16 (a row the partner computes crosses as BF16 bits, the
 # same row the lead computes stays FP32), and then the arms are not measuring one change.  `--exp
@@ -382,6 +399,54 @@ def run_arm(a, bucket: int, chunks: list[dict], n_ctx: int, n_vocab: int, base: 
     print("\n".join(lines))
 
 
+def fold_mismatch(out: pathlib.Path) -> list:
+    """Why the gate arm may have run the row wire while the operator read it as the fold, or empty when its own boot
+    said the fold was armed for a chunk this wide.  The mode rides the partner's FP4 leg and that leg takes only a
+    STREAMED chunk, and only up to its crossover: a run whose every chunk falls outside that window leaves both arms
+    summing rows, they then agree exactly, every bound is met, and the verdict would print PASS over a run that
+    never tested the flag.  Both figures come from the gate arm's log, not from this tool's idea of the engine."""
+    try:
+        arm = json.loads((out / "gate" / "args.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []                      # placement_mismatch already refuses an arm with no args or log
+    if not arm or str(arm.get("flag") or "").split("=", 1)[0] != "peer_partial_merge":
+        return []                      # a gate over some other flag owes the fold no account
+    log = out / "gate" / "engine.log"
+    text = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
+    if not FOLD_ARMED.search(text):
+        return ["the gate arm's boot never armed the partial merge: its log holds no 'peer partial merge on:' "
+                f"line ({log}), so the flag was refused and both arms ran the row wire - the arms agreeing "
+                "proves nothing about the fold"]
+    if not arm.get("bucket"):
+        return []                      # no bucket recorded: nothing to place the run's chunks against
+    # The widest chunk the run can read: the prompt is `n_ctx // 2 + 1` tokens, cut at the operator's `--prefill`.
+    # Every chunk but the tail is that wide, so the window is against it, not against the whole prompt.
+    prompt = int(arm["bucket"]) // 2 + 1
+    ea = [str(x) for x in (arm.get("engine_args") or [])]
+    cap = prompt
+    if "--prefill" in ea:
+        try:
+            cap = max(1, int(ea[ea.index("--prefill") + 1]))
+        except (IndexError, ValueError):
+            pass
+    widest = min(prompt, cap)
+    bad = []
+    share = SHARE_CHUNKS.search(text)
+    # Only against a chunk the operator pinned: without `--prefill` the engine's own chunker decides the width and
+    # the boot's crossover line is the only figure that says what it chose.
+    if share and "--prefill" in ea and widest > int(share.group(1)):
+        bad.append(f"the gate arm's FP4 leg takes chunks of up to {share.group(1)} tokens and this run reads chunks "
+                   f"of {widest} ({arm['bucket']} bucket, --prefill {cap}): none was ever handed to the partner to "
+                   "fold, so both arms ran the row wire - lower --prefill into the leg or widen the share, or the "
+                   "arms agree because neither folded")
+    if widest < STREAM_FLOOR_LOWEST:
+        bad.append(f"this run's widest chunk is {widest} tokens, under any boot's streaming floor "
+                   f"({STREAM_FLOOR_LOWEST} at the lowest, {STREAM_FLOOR} by default): no chunk is streamed, so "
+                   "the "
+                   "partner was given nothing to fold and the arms agree because neither did")
+    return bad
+
+
 def verdict(out: pathlib.Path) -> int:
     """The PASS/FAIL table over the three arms' rows.tsv."""
     s = {arm: summarize(out / arm / "rows.tsv") for arm in ("emit", "check", "gate")}
@@ -407,6 +472,7 @@ def verdict(out: pathlib.Path) -> int:
           f"PPL {gt['PPL']:.4f} against the reference {chk['PPL']:.4f}")
 
     fails = []
+    fails += fold_mismatch(out)
     moved = placement_mismatch(out)
     if moved:
         fails.append("VOID: the arms did not place the experts the same way, so the gate arm measured a different "
@@ -463,7 +529,25 @@ def main() -> int:
         ap.error("--pack, --bucket, --out and --arm are required (or --verdict DIR)")
     if not a.engine_bin:
         ap.error("no engine binary: pass --engine-bin")
-
+    if a.flag.split("=", 1)[0] == "peer_partial_merge":
+        # The mode is worth grading only on a chunk its leg can actually take: below the prompt path's streaming
+        # floor no chunk is handed to the partner to fold, both arms run the row wire, and they agree for a reason
+        # that has nothing to do with the flag - which is how one 512-token-chunk run came home GREEN. The floor is
+        # 6144 by default; a serving boot that gives the partner rows lowers it (`set_stream_all_min`), so under
+        # the lowest floor it may reach no boot folds at all and the graded arm is refused; between the two the run
+        # proceeds on the operator's word and `--verdict` reads the boot's own log rather than trusting it.
+        prompt = a.bucket // 2 + 1
+        if prompt < STREAM_FLOOR:
+            print(f"note: a {a.bucket}-token bucket reads a {prompt}-token prompt, under the default "
+                  f"{STREAM_FLOOR}-token streaming floor: the fold runs only if this boot lowered the floor "
+                  f"(a serving boot that gives the partner rows does). --verdict refuses the run if its boot "
+                  f"says the fold is off", file=sys.stderr)
+        if a.arm == "gate" and prompt < STREAM_FLOOR_LOWEST:
+            sys.exit(f"--bucket {a.bucket}: its {prompt}-token prompt is below any boot's streaming floor "
+                     f"({STREAM_FLOOR_LOWEST} at the lowest, {STREAM_FLOOR} by default), so no chunk reaches "
+                     f"the "
+                     f"partner's FP4 leg and the partial merge never runs - the two arms would agree because "
+                     f"neither folded. Gate at --bucket {2 * STREAM_FLOOR} for the default floor")
     chunks = read_fixture(pathlib.Path(a.fixture), a.bucket)
     if a.chunks:
         chunks = chunks[:a.chunks]

@@ -52,7 +52,11 @@ Three properties make this a reduction-order change and nothing else:
 
 All of it lives in `include/basalt/prefill/moe_part.hpp` (`moe_term`, `moe_routed_sum`, `moe_fold_rows`,
 `moe_part_pack`, `moe_combine_out`), which the device kernels and the CPU test both call: no path writes the chain
-again by hand.
+again by hand. The same header holds the **figures the mode's buffers are allocated from** - the partner's FP32
+accumulator, its packed BF16 image, the partial as it crosses the link, the lead's landing buffer (the wider wire's
+bytes, so either fits) and one group's fold tables. `peer_layout` and `carve` take them and the fold, the pack and
+the combine read them, so check 8 of the test grades the covering relation directly: an allocation below the bytes
+its widest use touches is a device-side overrun, not a wrong answer.
 
 ## The wire's one extra rounding
 
@@ -81,6 +85,7 @@ the engine's own cutter:
 | fold's per-token list vs the routing table | max abs difference 0 (same chain, same order) |
 | a packed partial unpacked again | 0 of 65,282 bf16 values changed |
 | term set under the engine's own group cut, 45 geometries | 0 mismatched cases, 276 groups |
+| the partial's buffers cover their widest use, 270 (Tp, T, G) geometries | 0 failures |
 
 The last row is the one that grades the fold rather than a transcription of it. The peer's groups come from
 `fp4::cut_pieces` (`include/basalt/prefill/moe_fp4.hpp`, host code kept in the header for exactly this reason), over
@@ -147,21 +152,42 @@ COMMON="--model $PACK --prefill 8192 --resident-budget-gib 37 --spec 8 --ple-io 
         --max-context 262144 --resident-experts --peer-reserve-mib 600 --short-read 512
         --tp-size 2 --peer-ram-rows --gpu 0,1,2,3 --batch 2"
 
-python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm emit  $COMMON \
+python3 tools/quality_gate.py --pack $PACK --bucket 16384 --out $OUT --arm emit  $COMMON \
     --base-args '--exp peer_charge_partial=1'
-python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm check $COMMON \
+python3 tools/quality_gate.py --pack $PACK --bucket 16384 --out $OUT --arm check $COMMON \
     --base-args '--exp peer_charge_partial=1'
-python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm gate  $COMMON \
+python3 tools/quality_gate.py --pack $PACK --bucket 16384 --out $OUT --arm gate  $COMMON \
     --flag peer_partial_merge=1
 python3 tools/quality_gate.py --verdict $OUT
 ```
+
+`$COMMON`'s `--prefill 8192` and the 16384-token bucket are what put a chunk inside the leg - see the next section.
+The committed fixture's 512- and 1024-token buckets sit below it and grade only the instrument; a bucket's emitted
+base is `chunks x bucket x ~300 KiB`, so generate a wider one with `tools/quality_fixture.py` when the flag is
+graded for real.
 
 Flags the tool does not know go to the engine as they are, the way `tools/ppl_gate.py` passes them; an engine flag
 given here replaces the tool's default for that flag. The tool boots its own engine and drives it over its stdin
 (`ppl=K ppl_t=T` is an engine protocol key, not part of the server's HTTP API); it never connects to a running
 server. `--adapt-swaps 0 --peer-adapt-swaps 0` are forced on both arms so the adaptive tier cannot differ between
-them, and `--max-context` must clear the chunk plus its window. Run both length buckets (512 and 1024 tokens, 12
-and 6 chunks; the emitted base is 1.42 GiB each).
+them, and `--max-context` must clear the chunk plus its window.
+
+### The fold only runs on a streamed chunk, and a bucket below it grades nothing
+
+The mode rides the partner's FP4 leg. The prompt path hands a chunk to that leg only when the chunk is streamed:
+`peer_fp4` is gated on `stream_all`, and `stream_all` on `T >= stream_all_min()` (`src/prefill/prefill.cpp`) - 6144
+tokens by default, 2560 or 4096 for a serving boot whose partner takes rows (`set_stream_all_min`,
+`src/program/generate.cpp`). The gate reads a chunk of `n_ctx` tokens as one prompt of `n_ctx // 2 + 1` of them, so
+**a bucket under twice the floor boots an arm on which the flag can never run**: both arms then compute their rows
+and send them, agree exactly, sit inside every bound, and `--verdict` would print PASS over a run that graded the
+row wire against the row wire. That is how one 512-token-chunk run came home GREEN.
+
+The tool refuses a `gate` arm whose prompt cannot reach the floor and notes the rest; `--verdict` reads the gate
+arm's own log and VOIDs a run whose boot never printed `peer partial merge on:`, or whose `the share is on, chunks
+of N tokens or less` bound sits below the run's prompt - the two figures the engine itself reports, rather than this
+tool's idea of them. `--exp peer_part_debug=1` reports the return of every CUDA call the fold makes, at its call
+site: its copies, packs and events run on three streams across two cards and only the launches report themselves,
+so a failed record or wait otherwise surfaces at the next launch's `check` - naming an unrelated kernel.
 
 ### The arms must hold the same experts, and the verdict checks that they do
 
@@ -257,6 +283,10 @@ an expert tier and a tp2 boot has none: the room the tier fills into is priced b
 above now carries that algebra and the lever that reaches it. Treat everything in this page as the arithmetic's
 bounds measured on synthetic rows, and the `+34-35%` prefill figure as a development A/B. **The next run must pass
 `--base-args '--exp peer_charge_partial=1'` to the reference arms and print no placement `VOID` before its numbers
-mean anything.** The flag stays dark (`--exp peer_partial_merge=1`, off by default) until `--verdict` prints PASS
-on both length buckets and the bounds above are replaced by the run's own.
+mean anything.** A later three-arm run did print PASS - KLD mean 6.49e-07, same top-1 100% - at the committed
+512-token bucket, and that verdict is void for the other reason this page now carries: at that width no chunk
+reaches the FP4 leg, so neither arm folded and the two sides of the gate measured the same code. **The flag stays
+dark (`--exp peer_partial_merge=1`, off by default) until `--verdict` prints PASS on a bucket whose chunks reach the
+streaming floor, with no placement `VOID` and the boot's own `peer partial merge on:` line in its log, and the
+bounds above are replaced by the run's own.**
 
