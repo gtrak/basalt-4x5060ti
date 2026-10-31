@@ -2938,7 +2938,7 @@ ok; `ninja basalt` links. Docs: the flag is documented in `docs/precision/peer-b
 under "Telling two boots apart". **No GPU was touched, nothing was booted, the server on
 :8000 (PID 858228) was not signalled.**
 
-(25) **THE NONDETERMINISM IS FOUND: THE CPU EXPERT POOL SPLITS ITS REDUCTION BY THE
+(25) **[PARTIALLY RETRACTED — see (26)] THE CPU EXPERT POOL SPLITS ITS REDUCTION BY THE
 LIVE THREAD COUNT.** `ExpertPool::run_split_multi_native` (src/kernels/cpu/pool.cpp:469)
 computes `threads = active_.load()` and then
     fused_gu_parts_ = lround(kTasksPerThread * threads * gu_share / nb);
