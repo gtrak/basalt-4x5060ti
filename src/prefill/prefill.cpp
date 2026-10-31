@@ -643,6 +643,22 @@ static uint64_t peer_act_bytes(bool acts_planes) {
     return acts_planes ? (uint64_t) fp4::token_bytes(1, N) + 4 : (uint64_t) N * 4;
 }
 
+/// The width of one token's share of a layer's PARTIAL-MERGE return (`--exp peer_partial_merge`): instead of the
+/// rows of the experts it holds, the peer sums them into one `T x n_embd` vector a layer and ships that, so the
+/// return leg is this many bytes a token whatever the share - where the row wire's was `K` rows a token.  The same
+/// widths as the rows themselves, so `--peer-rows-fp32` keeps its meaning: the summed partial crosses in the
+/// format the rows would have crossed in (`PeerPrefill::rows_bf16`).
+static uint64_t peer_part_bytes(bool rows_bf16) { return peer_row_bytes(rows_bf16); }
+
+/// The fold's own tables on the peer's leg, per row-visit: the row's index in its group and its router weight.
+/// Small, but it does scale with the share, so the price bills it instead of pretending the return leg is free.
+static uint64_t peer_fold_bytes() { return 2 * sizeof(int32_t); }
+
+/// `--exp peer_partial_merge`: the peer folds its rows into one summed partial a layer instead of shipping them.
+/// Read in the two places that must agree (the partner's tier reserve and its allocation) and nowhere else, so a
+/// boot cannot fund the buffers for one mode and run the other.  Only ever active with the FP4 leg.
+static bool peer_partial_merge() { return core::exp_flag("peer_partial_merge", 0.0) != 0.0; }
+
 struct PeerPrefill {
     core::PeerExperts* peer = nullptr;
     int dev = -1;
@@ -670,6 +686,34 @@ struct PeerPrefill {
     bool acts_planes = false;       // the FP4 leg's activations cross as the lead's FP4 planes (`set_peer`)
     /// Bytes of one token of the chunk's activations on the link, in the wire this card was given.
     size_t act_bytes() const { return (size_t) peer_act_bytes(acts_planes); }
+    // ===================== the partial merge (--exp peer_partial_merge) =====================
+    // The row wire costs the pair's link `K` rows a token a layer whether or not the lead needed them, which is
+    // what keeps the share's model from moving rows (a moved row saves the lead more lead time than the wire it
+    // adds costs, until the wire's own rate makes it a loss).  Under the flag the peer keeps its rows on its own
+    // card and folds them, weighted, into a partial of its own (`part`), and one `T x n_embd` vector a layer
+    // crosses instead - constant, so the placement balances on the two cards' COMPUTE.  The lead adds the partial
+    // in the combine and never reads the peer's rows (`moe_combine_partial`); the fold is per expert group, one
+    // thread per (token, dimension) of that group's token list, so no atomics and a reproducible order.  The
+    // reduction order is not the single-card one: docs/precision/moe-partial-merge.md.
+    bool partial_merge = false;     // the FP4 leg's rows come back as the layer's partial (`set_peer`)
+    float* part = nullptr;          // the layer's partial, FP32, one row per token of the chunk
+    uint16_t* part16 = nullptr;     // ... packed for the BF16 wire (null on the FP32 wire, which sends `part`)
+    /// One group's fold tables: `fold_tok[e]` a token it holds rows of, `fold_off[e..e+1]` the run of rows in
+    /// `fold_rel` (the row's index in the group's staging) and `fold_w` (its router weight).
+    int32_t *fold_tok = nullptr, *fold_off = nullptr, *fold_rel = nullptr;
+    float* fold_w = nullptr;
+    uint16_t* hpart = nullptr;      // pinned: the layer's partial on its way back (the relay)
+    cudaEvent_t ev_part = nullptr;  // peer: the partial is packed, its copy may start
+    cudaEvent_t ev_back = nullptr;  // peer: the partial has left this card (the next layer's zeroing waits for it)
+    cudaEvent_t ev_fwd = nullptr;   // primary: the relay's partial has reached the lead's landing buffer
+    bool part_live = false;         // a copy of `part`/`part16` may still be in flight
+    /// Host scratch of the fold tables, and the per-layer counting sort's token arrays (cleared as it goes).
+    std::vector<int32_t> fold_tok_h, fold_off_h, fold_rel_h, fold_cnt, fold_cur, fold_k_h;
+    std::vector<float> fold_w_h;
+    std::vector<float> w_row_h;     // the router weight of each of this card's rows, in its row order
+    /// Bytes the layer's partial costs on the link, for a chunk of `T` tokens.
+    size_t part_bytes(int64_t T) const { return (size_t) T * peer_part_bytes(rows_bf16); }
+
     /// The staging of group `b` as BF16 bits (its rows are written there by the FP4 down product's epilogue).
     uint16_t* dm16(int b) const { return (uint16_t*) Dm_b[b]; }
     /// Where a group's rows land in the primary's Dm.  BF16 rows share the FP32 block's bytes: the block's first
@@ -918,6 +962,8 @@ struct PeerPrefill {
         if (span_copy) cudaStreamDestroy(span_copy);
         for (cudaEvent_t e : ev_grp) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : ev_dm) if (e) cudaEventDestroy(e);
+        if (ev_part) cudaEventDestroy(ev_part);
+        if (ev_back) cudaEventDestroy(ev_back);
         if (ev_hx_free) cudaEventDestroy(ev_hx_free);
         for (cudaEvent_t e : ev_d2h) if (e) cudaEventDestroy(e);
         if (s_out) cudaStreamDestroy(s_out);
@@ -927,11 +973,13 @@ struct PeerPrefill {
             if (st) { cudaStreamSynchronize(st); cudaStreamDestroy(st); }
         for (cudaEvent_t e : {ev_hx, ev_res}) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : ev_h2d) if (e) cudaEventDestroy(e);
+        if (ev_fwd) cudaEventDestroy(ev_fwd);
         if (ev_in) cudaEventDestroy(ev_in);
         if (ev_act) cudaEventDestroy(ev_act);
         if (ev_planes) cudaEventDestroy(ev_planes);
         if (hx) cudaFreeHost(hx);
         for (float* h : hres) if (h) cudaFreeHost(h);
+        if (hpart) cudaFreeHost(hpart);
         cudaSetDevice(prev);
     }
 };
@@ -1076,6 +1124,12 @@ struct Prefill::Impl {
     std::vector<int32_t> bounds_host;
     std::unique_ptr<mmq::Context> mmq_ctx;
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
+    /// The router weights read back beside `ids_host` - only what the PARTIAL MERGE needs, for the weights of the
+    /// rows the peer folds (the peer has no router of its own).  Empty while the flag is off.
+    std::vector<float> w_host;
+    /// The peer's layer partial, as its copy left it: `T * N` BF16 bits, or FP32 on the FP32 row wire.  Sized
+    /// with the chunk by `carve`, and only at all with `--exp peer_partial_merge` on.
+    uint16_t* peer_part = nullptr;
     // The CPU share of a small chunk's experts: the layer's normalized activations and the pool's output rows (pinned),
     // the pool's per-token activations and jobs, the stream and events that bring the activations to the host, and the
     // running per-expert costs the share is balanced from.
@@ -1508,6 +1562,9 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     m.steps_host.resize(T * basalt::kernels::kStepCount);
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
+    // the router weights only ever leave the device for the partial merge, which weights the peer's rows with them
+    m.w_host.clear();
+    if (peer_partial_merge()) m.w_host.resize(T * K);
     {
         const size_t need = 3 * T * K + (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2));
         if (m.grp_n < need) {
@@ -1672,6 +1729,10 @@ bool Prefill::carve(size_t T, void* alloc) {
     }
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) basalt::kernels::NG_HC_DIM, ok);
+    // The PARTIAL MERGE's landing buffer on the lead's card: the partner's one summed partial a layer, sized for
+    // the wider (FP32) wire so either wire's bytes fit.  With the flag off nothing here is taken and the layout is
+    // the one it always was.
+    if (peer_partial_merge()) m.peer_part = o.take<uint16_t>(T * N * 4, ok);
     take_stage(o, ss, s, m.stage, ok);
     m.T = (int64_t) T;
     return ok;
@@ -1925,6 +1986,7 @@ struct PeerTimePrice {
     double peer_row_us = 1.09;    ///< ... and on the peer card, whose rows come from its own memory
     double link_mb_ms = 4.2;      ///< the pair's link: the activations out and the result rows back
     double blob_mb_ms = 4.2;      ///< the lead's own read of a RAM blob, priced at the pair's link
+    double part_fold_us = 0.06;   ///< one row-visit folded into the layer's partial, on the peer (`--exp peer_partial_merge`)
     double attn_lead_ms = 0;      ///< the stage's attention the lead card runs
     double attn_peer_ms = 0;      ///< ... and the peer's: 0 while the prompt attention has no peer caller
 };
@@ -1938,6 +2000,10 @@ static PeerTimePrice peer_time_price(bool stage_a) {
     p.peer_row_us = core::exp_flag("qsa_peer_row_us", p.peer_row_us);
     p.link_mb_ms = core::exp_flag("qsa_link_mb_ms", p.link_mb_ms);
     p.blob_mb_ms = core::exp_flag("qsa_blob_mb_ms", p.blob_mb_ms);
+    // The fold's own rate is DERIVED, not measured: a row-visit touches its row (2 B a value), and reads and writes
+    // the partial (8 B a value), so `n_embd * 10` bytes of the peer's memory.  `--exp qsa_peer_fold_us` re-prices
+    // it; the boot line prints the figure it was struck at, and a measurement replaces the default.
+    p.part_fold_us = core::exp_flag("qsa_peer_fold_us", (double) N * 10.0 / 400000.0);
     p.attn_lead_ms = core::exp_flag(stage_a ? "qsa_attn_ms_stage_a" : "qsa_attn_ms_stage_b",
                                     stage_a ? 54.4 : 49.0);
     p.attn_peer_ms = core::exp_flag(stage_a ? "qsa_attn_peer_ms_stage_a" : "qsa_attn_peer_ms_stage_b", 0.0);
@@ -1945,6 +2011,7 @@ static PeerTimePrice peer_time_price(bool stage_a) {
     if (!(p.peer_row_us > 0)) p.peer_row_us = 1e-9;
     if (!(p.link_mb_ms > 0)) p.link_mb_ms = 1e-9;
     if (!(p.blob_mb_ms > 0)) p.blob_mb_ms = 1e-9;
+    if (!(p.part_fold_us >= 0)) p.part_fold_us = 0;
     if (!(p.attn_lead_ms >= 0)) p.attn_lead_ms = 0;
     if (!(p.attn_peer_ms >= 0)) p.attn_peer_ms = 0;
     return p;
@@ -1954,7 +2021,8 @@ static PeerTimePrice peer_time_price(bool stage_a) {
 /// and the rest the lead's, and the chunk's `K` rows a token go to one card or the other, so the two row terms
 /// always add up to the whole chunk's walk.
 static PeerLayerTime peer_layer_time(const PeerTimePrice& p, int64_t chunk, int64_t n_expert, int64_t held,
-                                    int64_t band, int64_t r, uint64_t rb, uint64_t acts, uint64_t slot) {
+                                    int64_t band, int64_t r, uint64_t rb, uint64_t acts, uint64_t slot,
+                                    bool partial_merge) {
     const double wr = (double) chunk * (double) K / (double) n_expert;   // the row-visits of one expert
     const double rows_peer = (double) (held + r) * wr;
     const double rows_lead = (double) chunk * (double) K - rows_peer;
@@ -1966,10 +2034,20 @@ static PeerLayerTime peer_layer_time(const PeerTimePrice& p, int64_t chunk, int6
     t.lead_blobs = (double) (band - r) * (double) slot / blob;
     t.peer_attn = p.attn_peer_ms;
     t.peer_comp = rows_peer * p.peer_row_us / 1000.0;
-    t.peer_rows = rows_peer * (double) rb / link;
     t.peer_acts = (double) acts / link;
     t.d_lead = wr * p.lead_row_us / 1000.0 + (double) slot / blob;
-    t.d_peer = wr * p.peer_row_us / 1000.0 + wr * (double) rb / link;
+    if (!partial_merge) {   // the row wire: every row the peer holds crosses, so the return leg scales with the share
+        t.peer_rows = rows_peer * (double) rb / link;
+        t.d_peer = wr * p.peer_row_us / 1000.0 + wr * (double) rb / link;
+        return t;
+    }
+    // The partial merge: the layer's return leg is ONE `chunk x n_embd` vector whatever the share - a token's
+    // partial is exactly one row wide (`peer_part_bytes` is `peer_row_bytes`) - plus the small tables the fold
+    // needs per row.  A row the peer takes therefore costs the peer its compute and the fold, and costs the LEAD
+    // nothing on the link - which is the point: the placement balances on the two cards' compute instead of
+    // stopping where the row wire says it must (`peer_link` bills the crossover the same way).
+    t.peer_rows = ((double) chunk * (double) rb + rows_peer * (double) peer_fold_bytes()) / link;
+    t.d_peer = wr * (p.peer_row_us + p.part_fold_us) / 1000.0 + wr * (double) peer_fold_bytes() / link;
     return t;
 }
 
@@ -2004,7 +2082,7 @@ struct PeerRamShare {
 
 static PeerRamShare peer_ram_share(const RamView& v, const core::PeerExperts& peer, int64_t lb, int64_t le,
                                    int64_t n_expert, int64_t chunk, bool rows_bf16, bool acts_planes,
-                                   const PeerTimePrice& price, bool time_objective) {
+                                   bool partial_merge, const PeerTimePrice& price, bool time_objective) {
     PeerRamShare pr;
     if (n_expert <= 0 || chunk <= 0) return pr;
     const uint64_t rb = peer_row_bytes(rows_bf16);
@@ -2018,7 +2096,7 @@ static PeerRamShare peer_ram_share(const RamView& v, const core::PeerExperts& pe
         if (band == 0) continue;
         const uint64_t B = core::PeerExperts::slot_bytes(l);
         const uint64_t w = (uint64_t) chunk * (uint64_t) K / (uint64_t) n_expert * rb;
-        const PeerLayerTime t0 = peer_layer_time(price, chunk, n_expert, held, band, 0, rb, acts, B);
+        const PeerLayerTime t0 = peer_layer_time(price, chunk, n_expert, held, band, 0, rb, acts, B, partial_merge);
         // a band whose move costs more than it saves, in whichever currency the balance is struck in, stays whole
         if (w >= B || (time_objective && t0.d_peer >= t0.d_lead)) { ++pr.heavy; continue; }
         ++pr.layers;
@@ -2040,7 +2118,7 @@ static PeerRamShare peer_ram_share(const RamView& v, const core::PeerExperts& pe
         pr.take += r;
         pr.lead += (uint64_t) (band - r) * B;
         pr.pair += acts + (uint64_t) (held + r) * w;
-        const PeerLayerTime t = peer_layer_time(price, chunk, n_expert, held, band, r, rb, acts, B);
+        const PeerLayerTime t = peer_layer_time(price, chunk, n_expert, held, band, r, rb, acts, B, partial_merge);
         pr.sum.lead_attn += t.lead_attn;
         pr.sum.lead_rows += t.lead_rows;
         pr.sum.lead_blobs += t.lead_blobs;
@@ -2088,6 +2166,15 @@ static void peer_layout(PeerPrefill& pp, int64_t Tp, int64_t tf, const MmqPlan& 
         // a piece per expert and one per whole tile run cut off a long one, and per group one bound more
         pp.f_rel_cap = (size_t) 2 * (NE + Tp * K / fp4::kTileTokens + 1);
         pp.f_rel = (int32_t*) take(pp.f_rel_cap * 4);
+        if (pp.partial_merge) {   // the layer's summed partial, and one group's fold tables
+            pp.part = (float*) take((size_t) Tp * N * 4);
+            pp.part16 = pp.rows_bf16 ? (uint16_t*) take((size_t) Tp * N * 2) : nullptr;
+            const int64_t Gp = pp.G;   // a group holds at most G rows, and no more tokens than rows
+            pp.fold_tok = (int32_t*) take((size_t) Gp * 4);
+            pp.fold_off = (int32_t*) take((size_t) (Gp + 1) * 4);
+            pp.fold_rel = (int32_t*) take((size_t) Gp * 4);
+            pp.fold_w = (float*) take((size_t) Gp * 4);
+        }
     }
     if (pp.ram_rows) {   // the RAM band this card reads for itself: one blob slot per ring and span slot
         pp.ring = PeerPrefill::kRing;
@@ -3068,12 +3155,18 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
     // products are the MMQ ones, which store FP32 and are quantized from the activations themselves.
     pp->rows_bf16 = tf > 0 && !rows_fp32;
     pp->acts_planes = tf > 0 && !acts_fp32;
+    // the partial merge rides the same leg, and the SAME rule `Prefill::peer_bytes` sizes the reserve with
+    pp->partial_merge = tf > 0 && peer_partial_merge();
     pp->ram_rows = ram != nullptr && tf > 0;   // the RAM band only ever rides the FP4 leg
     if (pp->ram_rows) {
         pp->ram_num = ram->num;
         pp->ram_top = ram->top;
     }
     const int64_t Tp = std::max(pp->T_max, tf);   // the longest chunk the peer takes
+    if (pp->partial_merge) {   // the fold's counting sort, sized for the widest chunk the leg takes
+        pp->fold_cnt.assign((size_t) Tp + 1, 0);
+        pp->fold_cur.assign((size_t) Tp + 1, 0);
+    }
     pp->cap_rows = std::max<int64_t>(1, std::min<int64_t>(cap_rows, Tp * K));
     const MmqPlan& mp = mmq_plan();
     cudaGetDevice(&pp->prim);
@@ -3112,6 +3205,10 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
              cudaEventCreateWithFlags(&pp->ev_res, cudaEventDisableTiming) == cudaSuccess;
         for (int b = 0; ok && b < PeerPrefill::kRes; ++b)
             ok = cudaEventCreateWithFlags(&pp->ev_h2d[b], cudaEventDisableTiming) == cudaSuccess;
+        // the relay's partial reaches the lead's landing buffer on `res_in`, so its event is the primary's, like
+        // the rows' (`cudaEventRecord` needs the event and the stream to share a context)
+        if (ok && pp->partial_merge)
+            ok = cudaEventCreateWithFlags(&pp->ev_fwd, cudaEventDisableTiming) == cudaSuccess;
     }
     cudaSetDevice(pp->dev);
     ok = ok && cudaStreamCreateWithFlags(&pp->s, cudaStreamNonBlocking) == cudaSuccess &&
@@ -3153,6 +3250,9 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
                  cudaEventCreateWithFlags(&pp->used[i], cudaEventDisableTiming) == cudaSuccess;
     }
     for (int b = 0; b < 2 && ok; ++b) ok = cudaEventCreateWithFlags(&pp->ev_dm[b], cudaEventDisableTiming) == cudaSuccess;
+    if (pp->partial_merge)
+        ok = ok && cudaEventCreateWithFlags(&pp->ev_part, cudaEventDisableTiming) == cudaSuccess &&
+             cudaEventCreateWithFlags(&pp->ev_back, cudaEventDisableTiming) == cudaSuccess;
     if (relay) {
         ok = ok && cudaEventCreateWithFlags(&pp->ev_hx_free, cudaEventDisableTiming) == cudaSuccess;
         for (int b = 0; ok && b < PeerPrefill::kRes; ++b)
@@ -3171,6 +3271,8 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
         ok = cudaHostAlloc((void**) &pp->hx, (size_t) Tp * N * 4, cudaHostAllocPortable) == cudaSuccess;
         for (int b = 0; ok && b < PeerPrefill::kRes; ++b)
             ok = cudaHostAlloc((void**) &pp->hres[b], (size_t) pp->G * pp->row_bytes(), cudaHostAllocPortable) == cudaSuccess;
+        if (ok && pp->partial_merge)   // the layer's partial, on its way back over the same relay
+            ok = cudaHostAlloc((void**) &pp->hpart, pp->part_bytes(Tp), cudaHostAllocPortable) == cudaSuccess;
     }
     if (!ok) {
         cudaGetLastError();
@@ -3215,7 +3317,7 @@ struct PeerLink {
 /// so the share's crossover widens with the coverage it buys.  The rows back are billed at the wire's width
 /// (`peer_row_bytes`) and the activations out at theirs (`peer_act_bytes`).
 static PeerLink peer_link(const core::PeerExperts& peer, const RamView* v, int64_t lb, int64_t le, int64_t n_expert,
-                          int ram_num, bool rows_bf16, bool acts_planes) {
+                          int ram_num, bool rows_bf16, bool acts_planes, bool partial_merge) {
     PeerLink pl;
     if (n_expert <= 0) return pl;
     const uint64_t rb = peer_row_bytes(rows_bf16), ab = peer_act_bytes(acts_planes);
@@ -3231,7 +3333,11 @@ static PeerLink peer_link(const core::PeerExperts& peer, const RamView* v, int64
         pl.held += held;
         pl.ram += moved;   // of the bill, the ones only the partner's own link feeds
         pl.blobs += (uint64_t) (held + moved) * core::PeerExperts::slot_bytes(l);
-        num += ab * (uint64_t) n_expert + (uint64_t) K * (uint64_t) (held + moved) * rb;
+        // the return leg: every row of a partner-held expert crosses (`K` rows a token, billed over the share),
+        // or one row-wide partial a layer does and the fold's tables follow the share at a tenth of a row
+        num += ab * (uint64_t) n_expert +
+               (partial_merge ? rb * (uint64_t) n_expert + (uint64_t) K * (uint64_t) (held + moved) * peer_fold_bytes()
+                              : (uint64_t) K * (uint64_t) (held + moved) * rb);
     }
     pl.per_token = num / (uint64_t) n_expert;
     pl.tokens = pl.per_token ? (int64_t) (pl.blobs / pl.per_token) : 0;
@@ -3241,9 +3347,12 @@ static PeerLink peer_link(const core::PeerExperts& peer, const RamView* v, int64
 /// The greatest crossover any placement of this pack can reach: a whole layer on the peer, every expert held.  The
 /// share's gate never opens wider than this, so the tier's reserve - taken before the peer is filled, with no
 /// residency to read - sizes its buffers for it.
-static int64_t peer_fp4_ceiling(int64_t lb, int64_t le, int64_t n_expert, bool rows_bf16, bool acts_planes) {
-    // one token out (its activations, on their wire) and back (its rows)
-    const uint64_t round = peer_act_bytes(acts_planes) + (uint64_t) K * peer_row_bytes(rows_bf16);
+static int64_t peer_fp4_ceiling(int64_t lb, int64_t le, int64_t n_expert, bool rows_bf16, bool acts_planes,
+                                bool partial_merge) {
+    // one token out (its activations, on their wire) and back (its rows, or the one partial and its tables)
+    const uint64_t round = peer_act_bytes(acts_planes) +
+                           (partial_merge ? peer_part_bytes(rows_bf16) + (uint64_t) K * peer_fold_bytes()
+                                          : (uint64_t) K * peer_row_bytes(rows_bf16));
     int64_t top = 0;
     for (int64_t l = lb; l < le; ++l)
         top = std::max(top, (int64_t) ((uint64_t) n_expert * core::PeerExperts::slot_bytes(l) / round));
@@ -3264,6 +3373,57 @@ static const char* peer_fp4_gate(bool streamed_share) {
 /// Whether the peer can take a streamed chunk's rows at all, before the placement decides how long one may be.
 static bool peer_fp4_possible(bool streamed_share) {
     return peer_fp4_gate(streamed_share) == nullptr;
+}
+
+/// One expert group's fold tables for the partial merge (`PeerPrefill::partial_merge`): which of the chunk's tokens
+/// this card holds rows of, which rows, and what each is worth.  The lead has them already - the row tables it
+/// built to split the layer - and the peer has no router to rebuild them from, so they are counted here, on the
+/// host, and uploaded beside the group's other tables.
+///
+/// A counting sort over the tokens the group touches: the cost is the group's rows, and the tokens it did not
+/// touch are left at zero for the next group.  A token's rows come out in k order, the order the single-card
+/// combine adds them in, which keeps the two chains as close as a split one can (`moe_part.hpp`).  Fills
+/// `P.fold_*_h` and returns the number of tokens; `r0`/`nr` are the group's first row and row count, relative to
+/// this card's block, and `src_h` the lead's token-of-row table (its rows begin at `rows_local`).
+static int32_t peer_fold_tables(PeerPrefill& P, const int32_t* src_h, int64_t rows_local, int64_t r0, int64_t nr) {
+    if (nr <= 0) return 0;
+    const int32_t* tok = src_h + rows_local + r0;   // the token of each of the group's rows
+    P.fold_tok_h.clear();
+    for (int64_t q = 0; q < nr; ++q)
+        if (P.fold_cnt[(size_t) tok[q]]++ == 0) P.fold_tok_h.push_back(tok[q]);
+    const int32_t nt = (int32_t) P.fold_tok_h.size();
+    P.fold_off_h.resize((size_t) nt + 1);
+    P.fold_rel_h.resize((size_t) nr);
+    P.fold_w_h.resize((size_t) nr);
+    int32_t run = 0;
+    for (int32_t e = 0; e < nt; ++e) {
+        const int32_t t = P.fold_tok_h[(size_t) e];
+        P.fold_off_h[(size_t) e] = run;
+        P.fold_cur[(size_t) t] = run;
+        run += P.fold_cnt[(size_t) t];
+    }
+    P.fold_off_h[(size_t) nt] = run;
+    for (int64_t q = 0; q < nr; ++q) {
+        const int32_t p = P.fold_cur[(size_t) tok[q]]++;
+        P.fold_rel_h[(size_t) p] = (int32_t) q;              // the row's index in the group's staging
+        P.fold_w_h[(size_t) p] = P.w_row_h[(size_t) (r0 + q)];
+    }
+    for (int32_t e = 0; e < nt; ++e) {   // the run is one token's rows: at most K of them, so sort them by k
+        int32_t* rel = P.fold_rel_h.data() + P.fold_off_h[(size_t) e];
+        float* wt = P.fold_w_h.data() + P.fold_off_h[(size_t) e];
+        const int32_t n = P.fold_off_h[(size_t) e + 1] - P.fold_off_h[(size_t) e];
+        for (int32_t i = 1; i < n; ++i) {
+            const int32_t r = rel[i];
+            const float v = wt[i];
+            const int32_t key = P.fold_k_h[(size_t) (r0 + r)];
+            int32_t j = i - 1;
+            while (j >= 0 && P.fold_k_h[(size_t) (r0 + rel[j])] > key) { rel[j + 1] = rel[j]; wt[j + 1] = wt[j]; --j; }
+            rel[j + 1] = r;
+            wt[j + 1] = v;
+        }
+        P.fold_cnt[(size_t) P.fold_tok_h[(size_t) e]] = 0;   // clean for the next group
+    }
+    return nt;
 }
 
 /// How many staging sets a pair's collective needs at this boot — the SAME figure that decides how many `o_proj`
@@ -3432,12 +3592,14 @@ uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, bool peer_ram_r
     // the widest the share's gate can open: the placement that sets the crossover is not known until the tier is filled
     const bool rows_bf16 = !peer_rows_fp32, acts_planes = !peer_acts_fp32;
     const int64_t t_fp4 = peer_fp4_possible(streamed_share)
-                              ? std::min(chunk, peer_fp4_ceiling(0, lay.n_layers, lay.n_expert, rows_bf16, acts_planes))
+                              ? std::min(chunk, peer_fp4_ceiling(0, lay.n_layers, lay.n_expert, rows_bf16,
+                                                                 acts_planes, peer_partial_merge()))
                               : 0;
     const int64_t tf = t_fp4 >= stream_all_min() ? t_fp4 : 0;
     const int64_t Tp = std::max(pp.T_max, tf);
     pp.rows_bf16 = tf > 0 && rows_bf16;   // the same rules `make_peer` follows, so no wire ever outgrows the reserve
     pp.acts_planes = tf > 0 && acts_planes;
+    pp.partial_merge = tf > 0 && peer_partial_merge();
     // the same reserve rule for the band's ring: with the flag on and the share able to open, the tier leaves the
     // ring's slots free whether or not this run's placement ends up reading it - under-reserving would fail the
     // allocation, over-reserving only costs the partner a few tier slots the boot line reports
@@ -3522,26 +3684,47 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
     const RamView rv{m.host_res, m.cache, m.ring_peer, m.src};
     const bool rows_bf16 = !peer_rows_fp32;   // the width of the peer's rows on the pair's link (`PeerPrefill::rows_bf16`)
     const bool acts_planes = !peer_acts_fp32; // ... and of its activations (`PeerPrefill::acts_planes`)
+    // `--exp peer_partial_merge`: the peer returns the layer's summed partial instead of its rows.  Refused, not
+    // ignored, when it was asked for and cannot run: an operator who set it and got the row wire would otherwise
+    // read the resulting wall as the mode working.  Only the FP4 leg can fold, so that leg's own gates decide.
+    const double pm_flag = core::exp_flag("peer_partial_merge", 0.0);
+    if (pm_flag != 0 && pm_flag != 1) {
+        err = "prefill peer: --exp peer_partial_merge=" + std::to_string(pm_flag) +
+              " is refused: the gate is 1";
+        return false;
+    }
+    const bool partial = pm_flag != 0 && peer_fp4_possible(streamed_share);
+    if (pm_flag != 0 && !partial)
+        basalt::log::warn("basalt prefill",
+                          "peer partial merge off: %s, and only the FP4 share's rows can be folded",
+                          peer_fp4_gate(streamed_share));
     // The share's objective: the two cards' layer TIMES by default, the two links' bytes with
     // `--exp qsa_share_bytes=1` (the earlier objective, kept as the A/B and the fallback).
     const PeerTimePrice price = peer_time_price(lb == 0);
     const bool time_objective = core::exp_flag("qsa_share_bytes", 0.0) == 0;
     const PeerRamShare prs = peer_ram_rows && !peer_fp4_gate(streamed_share)
-                                 ? peer_ram_share(rv, *peer, lb, le, ne, m.T_max, rows_bf16, acts_planes, price,
-                                                  time_objective)
+                                 ? peer_ram_share(rv, *peer, lb, le, ne, m.T_max, rows_bf16, acts_planes, partial,
+                                                  price, time_objective)
                                  : PeerRamShare{};
     // The head cut the ratio names for this stage.  It changes no work here - the prompt attention runs whole on
     // the lead - so it is carried for the line below, which prices the pair's two cards at it.
     const double ratio = core::exp_flag(lb == 0 ? "qsa_ratio_stage_a" : "qsa_ratio_stage_b", 0.5);
     const int64_t heads = m.g ? m.g->n_head : 0;
-    const PeerLink pl = peer_link(*peer, prs.num > 0 ? &rv : nullptr, lb, le, ne, prs.num, rows_bf16, acts_planes);
+    const PeerLink pl = peer_link(*peer, prs.num > 0 ? &rv : nullptr, lb, le, ne, prs.num, rows_bf16, acts_planes,
+                                  partial);
     // capped by the ceiling `peer_bytes` sized its buffers for, so the allocation always fits the reserve
     const int64_t t_fp4 = peer_fp4_possible(streamed_share)
                               ? std::min({m.T_max, pl.tokens,
-                                          peer_fp4_ceiling(lb, le, ne, rows_bf16, acts_planes)})
+                                          peer_fp4_ceiling(lb, le, ne, rows_bf16, acts_planes, partial)})
                               : 0;
     const int64_t t_routed = streamed_share ? m.T_max : std::min<int64_t>(m.T_max, kPeerSlowRows);
     const int64_t tf = t_fp4 >= stream_all_min() ? t_fp4 : 0;   // what `make_peer` is actually given
+    if (partial && tf == 0) {   // the fold rides the FP4 leg alone: asked for, funded for, and never reached
+        const std::string why = "peer partial merge off: the FP4 share's crossover is under the " +
+                                std::to_string(stream_all_min()) + "-token streaming floor, so no chunk is given "
+                                "to the partner to fold";
+        basalt::log::warn("basalt prefill", "%s", why.c_str());
+    }
     const bool ram_on = prs.num > 0 && tf > 0;
     // The one line that says what this pair's prompt share is: the crossover, whether the FP4 share is on and if not
     // which gate shut, the routed-only share with the derate an unlike partner carries, and the RAM band's verdict.
@@ -3576,9 +3759,25 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
                       "%s; rows cross as %s; acts cross as %s; RAM rows %s",
                       (long long) t_fp4, (unsigned long long) (pl.per_token * 1024 >> 20),
                       (unsigned long long) (pl.blobs >> 20), (long long) pl.layers, (long long) pl.held,
-                      (long long) pl.ram, share.c_str(), rows_bf16 ? "BF16" : "FP32 (--peer-rows-fp32)",
+                      (long long) pl.ram, share.c_str(),
+                      partial ? (rows_bf16 ? "the layer's summed BF16 partial (--exp peer_partial_merge)"
+                                            : "the layer's summed FP32 partial (--exp peer_partial_merge, "
+                                              "--peer-rows-fp32)")
+                              : (rows_bf16 ? "BF16" : "FP32 (--peer-rows-fp32)"),
                       acts_planes ? "the lead's FP4 planes" : "FP32 (--peer-acts-fp32)",
                       band.c_str());
+    // The partial merge's own verdict: the return leg it prices, which no longer moves with the share, and the one
+    // rate of it that is a derivation rather than a measurement.  Nothing prints with the flag off.
+    if (partial && tf > 0) {
+        const double link = price.link_mb_ms * 1e6;
+        basalt::log::info("basalt prefill",
+                          "peer partial merge on: the layer's return leg is one %lld x %d %s partial, %llu MiB per "
+                          "1024 tokens, %.1f ms at the %lld-token share whatever the rows it carries; the fold "
+                          "prices at %.2f us a row-visit on the peer (--exp qsa_peer_fold_us)",
+                          (long long) tf, (int) N, rows_bf16 ? "BF16" : "FP32",
+                          (unsigned long long) (peer_part_bytes(rows_bf16) * 1024 >> 20),
+                          (double) tf * peer_part_bytes(rows_bf16) / link, (long long) tf, price.part_fold_us);
+    }
     // The model's own balance, in milliseconds a layer, next to the byte lanes it was struck against: what each
     // card of the pair spends a layer on at the share this boot chose, and which side of the pair is therefore
     // the critical one.  The peer's attention term is 0.0 and stays 0.0 - prompt attention has no peer caller - so
@@ -3739,6 +3938,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     for (int i = 0; i < ring_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
     f(T * N);
     f((size_t) basalt::kernels::NG_HC_DIM);
+    if (peer_partial_merge()) o.take<uint16_t>(T * N * 4, ok);   // `carve`'s partial-merge landing buffer
     basalt::kernels::KvHostPools stage;
     take_stage(o, ss, s, stage, ok);
     return o.used + kSizingSlack;
@@ -4858,6 +5058,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         int32_t* src_h = grp_mapped ? m.grp_host + 2 * m.grp_tk : m.src_host.data();
                         if (grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
                         else cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
+                        // the partial merge weights the peer's rows with the lead's router weights, so this layer's
+                        // row needs its weight read back beside its id (the sync below covers both reads)
+                        if (ppc && ppc->partial_merge && peer_fp4)
+                            cudaMemcpyAsync(m.w_host.data(), m.w, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
                         // CPU share (small chunks, experts with a host copy): the layer's activations go to the host on
                         // their own stream while the routing is read
                         const bool cpu_maybe = cpu_pool_ != nullptr && !stream_all && m.src != nullptr && lay.native &&
@@ -5157,6 +5361,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             cudaSetDevice(P.dev);
                             cudaMemcpyAsync(P.src, src_h + rows_local, (size_t) rows_peer * 4, cudaMemcpyHostToDevice, ps);
                             cudaMemcpyAsync(P.f_rel, P.f_rel_host.data(), P.f_rel_host.size() * 4, cudaMemcpyHostToDevice, ps);
+                            if (P.partial_merge) {
+                                // the peer holds no router of its own: each of its rows needs its routing weight to
+                                // fold itself into the partial, and the layer's partial starts empty - once the last
+                                // layer's copy has finished READING it, which is the one hazard the accumulator has
+                                if (P.part_live) cudaStreamWaitEvent(ps, P.ev_back, 0);
+                                P.w_row_h.resize((size_t) rows_peer);
+                                P.fold_k_h.resize((size_t) rows_peer);
+                                for (int64_t i = 0; i < T * K; ++i) {
+                                    const int64_t p = (int64_t) slot_h[(size_t) i] - rows_local;
+                                    if (p < 0 || p >= rows_peer) continue;
+                                    P.w_row_h[(size_t) p] = m.w_host[(size_t) i];
+                                    P.fold_k_h[(size_t) p] = (int32_t) (i - (int64_t) (i / K) * K);   // the row order
+                                }
+                                cudaMemsetAsync(P.part, 0, (size_t) T * N * 4, ps);
+                            }
                             m.tm.groups(ngr);
                             const auto& f = lay.fmt[(size_t) l];
                             // The group that reads each of the peer's experts last: a hot expert's rows are cut into
@@ -5271,6 +5490,28 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 for (int i = 0; i < p_n; ++i)   // an expert cut across groups keeps its slot till the last
                                     if (last_grp[(size_t) p_oj[i]] == g2) p_give((size_t) p_ent[i]);
                                 p_publish();
+                                if (P.partial_merge) {
+                                    // The rows stay on this card: the group's fold adds them, weighted, into the
+                                    // layer's partial.  Its tables are built from the lead's own row tables and
+                                    // uploaded into one scratch, which is safe because the uploads and the fold all
+                                    // run on `ps`, in this loop's order; the staging the fold reads is recycled by
+                                    // a later group on the same stream, so no return event guards it.
+                                    const int32_t nt = peer_fold_tables(P, src_h, rows_local, r0, nr);
+                                    if (nt > 0) {
+                                        cudaMemcpyAsync(P.fold_tok, P.fold_tok_h.data(), (size_t) nt * 4,
+                                                        cudaMemcpyHostToDevice, ps);
+                                        cudaMemcpyAsync(P.fold_off, P.fold_off_h.data(), (size_t) (nt + 1) * 4,
+                                                        cudaMemcpyHostToDevice, ps);
+                                        cudaMemcpyAsync(P.fold_rel, P.fold_rel_h.data(), (size_t) nr * 4,
+                                                        cudaMemcpyHostToDevice, ps);
+                                        cudaMemcpyAsync(P.fold_w, P.fold_w_h.data(), (size_t) nr * 4,
+                                                        cudaMemcpyHostToDevice, ps);
+                                        peer_part_fold(P.part, P.rows_bf16 ? P.dm16(b) : nullptr,
+                                                       P.rows_bf16 ? nullptr : P.Dm_b[b], P.fold_tok, P.fold_off,
+                                                       P.fold_rel, P.fold_w, nt, ps);
+                                    }
+                                    continue;
+                                }
                                 // the rows back to the primary's Dm: across the link on the copy stream, or through
                                 // a host buffer whose last rows have already reached Dm
                                 cudaEventRecord(P.ev_grp[g2 % PeerPrefill::kGrpEv], ps);
@@ -5299,6 +5540,35 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             // the entries of the band experts this layer's routing did not pick come back too
                             p_release(pseq_end);
+                            // The partial merge's one return leg: the layer's summed partial, packed to the wire's
+                            // width and put on the link once, whatever the share.  Its own event, because the next
+                            // layer's zeroing of the accumulator must wait for this copy to have read it.
+                            if (P.partial_merge) {
+                                // the pack overwrites `part16` and the copy overwrites the lead's landing buffer, so
+                                // both wait for the previous layer's copies to have drained: `ev_back` on this
+                                // card's side, `ev_fwd` on the lead's upload (the memset above already ordered the
+                                // accumulator itself against `ev_back`, `ps` being in order)
+                                if (P.rows_bf16) peer_part_pack(P.part16, P.part, T * N, ps);   // one rounding, the run
+                                cudaEventRecord(P.ev_part, ps);
+                                cudaStreamWaitEvent(P.s_out, P.ev_part, 0);
+                                m.tm.pmark(tl, ChunkTiming::kPRowsA, P.s_out);   // the partial's own span, not a group's
+                                const size_t bytes = P.part_bytes(T);
+                                const void* src = P.rows_bf16 ? (const void*) P.part16 : (const void*) P.part;
+                                if (P.p2p) {
+                                    cudaMemcpyPeerAsync(m.peer_part, prevd, src, P.dev, bytes, P.s_out);
+                                } else {
+                                    if (P.part_live) cudaStreamWaitEvent(P.s_out, P.ev_fwd, 0);   // its last upload
+                                    cudaMemcpyAsync(P.hpart, src, bytes, cudaMemcpyDeviceToHost, P.s_out);
+                                    cudaEventRecord(P.ev_back, P.s_out);
+                                    cudaSetDevice(prevd);
+                                    cudaStreamWaitEvent(P.res_in, P.ev_back, 0);
+                                    cudaMemcpyAsync(m.peer_part, P.hpart, bytes, cudaMemcpyHostToDevice, P.res_in);
+                                    cudaEventRecord(P.ev_fwd, P.res_in);
+                                    cudaSetDevice(P.dev);
+                                }
+                                if (P.p2p) cudaEventRecord(P.ev_back, P.s_out);
+                                P.part_live = true;
+                            }
                             // the layer's peer rows have all landed in Dm: on the copy stream across the link, or
                             // on the upload stream after the last host buffer
                             m.tm.pmark(tl, ChunkTiming::kPComp, ps);
@@ -5706,9 +5976,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // The peer's rows of this layer, when the FP4 leg sent them as BF16 bits: they sit in the first
                     // half of the bytes their block of Dm would take as FP32, and the combine reads each row from the
                     // plane it is in (the routed leg's MMQ products store FP32, so their rows come back that way).
-                    const uint16_t* back16 = peer_now && peer_fp4 && ppc->rows_bf16
+                    const uint16_t* back16 = peer_now && peer_fp4 && ppc->rows_bf16 && !ppc->partial_merge
                                                  ? ppc->rows16(m.Dm, peer_lo) : nullptr;
-                    if (back16 != nullptr)
+                    if (ppc && peer_now && peer_fp4 && ppc->partial_merge) {
+                        // the peer's rows never crossed: its summed partial joins the routed sum (null `part16`
+                        // is the FP32 wire, which sends the accumulator as it stands)
+                        moe_combine_partial(m.Dm, ppc->rows_bf16 ? m.peer_part : nullptr,
+                                            ppc->rows_bf16 ? nullptr : (const float*) m.peer_part,
+                                            (int32_t) peer_lo, (int32_t) (peer_lo + peer_n),
+                                            m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                    } else if (back16 != nullptr)
                         moe_combine_rows16(m.Dm, back16, (int32_t) peer_lo, (int32_t) (peer_lo + peer_n),
                                            m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                     else
