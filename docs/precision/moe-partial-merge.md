@@ -68,8 +68,9 @@ summed run. bf16 keeps eight significant bits, so that rounding is at worst half
 ## What the CPU test measures
 
 `tests/kernels/moe_part_parity.cpp` (CPU-only, `ctest -L cpu`) builds synthetic layers at the model's `K = 10` with
-a shuffled routing, a two-thirds partner share and expert groups of 7 rows, and compares the split combine against
-the flag-off combine over every `(token, d)`:
+a shuffled routing and a two-thirds partner share, and compares the split combine against the flag-off combine over
+every `(token, d)`. The first six checks cut the peer's rows into fixed groups of 7; the last hands the same rows to
+the engine's own cutter:
 
 | Check | Measured |
 |---|---|
@@ -79,6 +80,16 @@ the flag-off combine over every `(token, d)`:
 | fold grouped per expert group vs one chain | 0 of 3,880 partial cells differ |
 | fold's per-token list vs the routing table | max abs difference 0 (same chain, same order) |
 | a packed partial unpacked again | 0 of 65,282 bf16 values changed |
+| term set under the engine's own group cut, 45 geometries | 0 mismatched cases, 276 groups |
+
+The last row is the one that grades the fold rather than a transcription of it. The peer's groups come from
+`fp4::cut_pieces` (`include/basalt/prefill/moe_fp4.hpp`, host code kept in the header for exactly this reason), over
+expert runs that mix cold single-row experts, long hot runs the staging cap splits at whole tiles, and experts
+holding no rows at all; the row space is `lead | peer | CPU tier`, so the combine reads an FP32 tail above the
+peer's block that the fold never sees. Per geometry it asserts the fold's multiset of (token, k) equals the lead's
+skipped multiset, that every folded row carries its own router weight, and that the pieces tile the block in order -
+a row read at another row's weight passes a row count and is still a wrong sum. Five mutations of the fold's lists
+each turn it FAILED.
 
 The bound the BF16 row is graded against is half a bf16 ulp **of the partial** (`2^-8` relative) plus 32 fp32 ulps of
 the terms' magnitudes: the partial's rounding is relative to the partial, not to the token's whole routed sum, which
@@ -128,16 +139,17 @@ quantization is `PplGate::quantize_row`, shared by the writer and the reader and
 ### The three runs
 
 `$PACK` is `models/Qwen3.8-FN-FP4Local.basalt`, `$OUT` a scratch directory. The engine flags are the production
-server's, so the gate measures the shipping configuration; the two arms differ by exactly one word.
+server's, so the gate measures the shipping configuration; the two arms differ by exactly one word **once they hold
+the same experts** - which is what the next section makes them do.
 
 ```sh
 COMMON="--model $PACK --prefill 8192 --resident-budget-gib 37 --spec 8 --ple-io direct --kv int8
         --max-context 262144 --resident-experts --peer-reserve-mib 600 --short-read 512
         --tp-size 2 --peer-ram-rows --gpu 0,1,2,3 --batch 2"
 
-python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm emit $COMMON
-python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm check $COMMON
-python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm gate $COMMON \
+python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm emit  $COMMON --base-args '--peer-reserve-mib 723'
+python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm check $COMMON --base-args '--peer-reserve-mib 723'
+python3 tools/quality_gate.py --pack $PACK --bucket 512 --out $OUT --arm gate  $COMMON \
     --flag peer_partial_merge=1
 python3 tools/quality_gate.py --verdict $OUT
 ```
@@ -148,6 +160,23 @@ given here replaces the tool's default for that flag. The tool boots its own eng
 server. `--adapt-swaps 0 --peer-adapt-swaps 0` are forced on both arms so the adaptive tier cannot differ between
 them, and `--max-context` must clear the chunk plus its window. Run both length buckets (512 and 1024 tokens, 12
 and 6 chunks; the emitted base is 1.42 GiB each).
+
+### The arms must hold the same experts, and the verdict checks that they do
+
+Which card computes a row decides whether it crosses as BF16 bits or stays FP32, so an arm that places the experts
+differently is not measuring the flag. This flag does move placement: `--exp peer_partial_merge=1` is read inside
+`Prefill::peer_bytes()`, which sizes the reserve the partner card keeps free, and its expert tier is filled after
+the peer's prompt and partial buffers are allocated - so the flag-on boot fills the tier into a narrower room and
+holds fewer ranked pairs. `--seed` does not pin placement across different reserves.
+
+`--verdict` therefore reads each boot's own log - the `experts live in VRAM ...` line, the two
+`(N experts held, M band)` pairings, the `tp2: CUDA%d holds ... ranked pairs ... room` lines, the RAM-band split -
+and prints `VOID` when the `gate` arm or either reference arm disagrees with `check`, naming each disagreement fact.
+It measures the room gap and prints which arm to charge, by how much, and the room to reach. A flag that costs the
+partner card bytes is paid for on the reference arms with `--base-args`, which is withheld from the gate arm;
+`--gate-args` is its mirror for a flag that frees room. For this flag, a first run measured 13.98 GiB and 5429
+ranked pairs against 13.86 GiB and 5384, so the reference arms take `--base-args '--peer-reserve-mib 723'` (the 600
+above plus the ~123 MiB the flag costs) to bring both arms to the same tier.
 
 ## The bounds
 
@@ -186,8 +215,11 @@ report if nothing is wrong, and every bound above is stated relative to it.
 
 ## Status of the gate
 
-Built, unit-tested, **not yet run**: the three arms need the pack on the cards, so the boots are the operator's.
-Until a run exists, treat everything in this page as the arithmetic's bounds measured on synthetic rows, and the
-`+34-35%` prefill figure as a development A/B - the flag stays dark (`--exp peer_partial_merge=1`, off by default)
-until `--verdict` prints PASS on both length buckets and the numbers above are replaced by the run's own.
+Built, unit-tested, **and once run with a confound**: one set of three arms was taken and returned `same top-1
+94.41%` against the 99% bound, but the arms turned out not to have held the same experts (the paragraph above), so
+that verdict is VOID and says nothing about the fold. Treat everything in this page as the arithmetic's bounds
+measured on synthetic rows, and the `+34-35%` prefill figure as a development A/B. **The next run must pass
+`--base-args` to the reference arms and print no placement `VOID` before its numbers mean anything.** The flag
+stays dark (`--exp peer_partial_merge=1`, off by default) until `--verdict` prints PASS on both length buckets and
+the bounds above are replaced by the run's own.
 
