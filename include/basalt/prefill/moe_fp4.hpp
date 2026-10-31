@@ -5,6 +5,7 @@
 // (each expert's rows padded to whole tiles), so a tile's codes and scales are one contiguous, bank-swizzled run.
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -105,6 +106,31 @@ struct Pieces {
     std::vector<int32_t> bounds;   ///< per piece its first row, then the last piece's end
     std::vector<int32_t> group;    ///< per group its first piece, then the piece count
 };
-void cut_pieces(const int32_t* bounds, int n, int64_t cap, Pieces& out);
+/// Host-only, and inline in the header rather than in the `.cu` beside the kernels, for the same reason
+/// `moe_fold.hpp` is: the fold's group boundaries come from here, and `tests/kernels/moe_part_parity.cpp` must
+/// group the peer's rows the way the engine does - a test that re-cuts them by hand proves the transcription.
+inline void cut_pieces(const int32_t* bounds, int n, int64_t cap, Pieces& out) {
+    out.expert.clear();
+    out.bounds.clear();
+    out.group.clear();
+    const int64_t step = std::max<int64_t>(kTileTokens, cap / kTileTokens * kTileTokens);
+    for (int j = 0; j < n; ++j)
+        for (int64_t r = bounds[j]; r < bounds[j + 1]; r += step) {   // an expert without rows has no piece
+            out.expert.push_back(j);
+            out.bounds.push_back((int32_t) r);
+        }
+    out.bounds.push_back(n > 0 ? bounds[n] : 0);
+    const int np = (int) out.expert.size();
+    int64_t rows = 0;
+    for (int i = 0; i < np; ++i) {
+        const int64_t c = out.bounds[(size_t) i + 1] - out.bounds[(size_t) i];
+        if (out.group.empty() || i - out.group.back() == kMaxExperts || rows + c > cap) {
+            out.group.push_back(i);
+            rows = 0;
+        }
+        rows += c;
+    }
+    out.group.push_back(np);
+}
 
 }  // namespace basalt::prefill::fp4

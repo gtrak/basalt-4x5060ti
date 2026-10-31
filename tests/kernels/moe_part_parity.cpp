@@ -22,6 +22,7 @@
 // engine's chain and the engine's own table builder, not transcriptions of them.
 #include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/prefill/moe_fold.hpp"
+#include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/prefill/moe_part.hpp"
 
 #include <algorithm>
@@ -29,6 +30,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <map>
 #include <random>
 #include <vector>
 
@@ -42,6 +45,7 @@ using basalt::prefill::kMoeK;
 using basalt::prefill::moe_fold_tables;
 using basalt::prefill::MoeFoldTables;
 using basalt::prefill::PeerRows;
+namespace fp4 = basalt::prefill::fp4;   // only for the group cutter the prefill thread itself calls
 
 constexpr int64_t T = 97;             // a chunk, deliberately not a round number
 constexpr int64_t ND = 40;            // the test's n_embd: the functions price it as a parameter
@@ -179,18 +183,22 @@ struct Group {
     std::vector<float> wt;
 };
 
-/// Describe the group's rows as the prefill thread does - group-relative - and let the shared builder sort them.
-/// `k_of_row`/`w_of_row` stand in for `PeerPrefill::fold_k_h`/`w_row_h`, which the lead fills from its router.
-std::vector<Group> make_groups(const Layer& L, int32_t lo, int32_t hi) {
+/// The same, with the group's row count chosen by `cut(first, remaining)` - which is how the engine's own group cut
+/// (`fp4::cut_pieces`) works: contiguous runs of the peer's block, each bounded by the staging's cap, an expert's
+/// run split at whole tiles, and a group of at most `kMaxExperts` pieces. A fixed 7 can miss what a real cut does,
+/// so the tests hand it the shapes the FP4 leg actually produces.
+std::vector<Group> make_groups_cut(const Layer& L, int32_t lo, int32_t hi,
+                                   std::function<int32_t(int32_t, int32_t)> cut) {
     std::vector<Group> gs;
     MoeFoldTables scratch;
     scratch.cnt.assign((size_t) T + 1, 0);
     scratch.cur.assign((size_t) T + 1, 0);
-    for (int32_t g0 = lo; g0 < hi; g0 += GROUP_ROWS) {
+    for (int32_t g0 = lo; g0 < hi;) {
         Group g;
         g.lo = g0;
-        g.hi = std::min(hi, g0 + GROUP_ROWS);
+        g.hi = std::min(hi, g0 + std::max<int32_t>(1, cut(g0, hi - g0)));
         g.base = lo;
+        g0 = g.hi;
         const int32_t nr = g.hi - g.lo;
         std::vector<int32_t> tok_of_row((size_t) nr), k_of_row((size_t) nr);
         std::vector<float> w_of_row((size_t) nr);
@@ -208,6 +216,12 @@ std::vector<Group> make_groups(const Layer& L, int32_t lo, int32_t hi) {
         gs.push_back(std::move(g));
     }
     return gs;
+}
+
+/// Describe the group's rows as the prefill thread does - group-relative - and let the shared builder sort them.
+/// `k_of_row`/`w_of_row` stand in for `PeerPrefill::fold_k_h`/`w_row_h`, which the lead fills from its router.
+std::vector<Group> make_groups(const Layer& L, int32_t lo, int32_t hi) {
+    return make_groups_cut(L, lo, hi, [](int32_t, int32_t) { return GROUP_ROWS; });
 }
 
 /// The group's rows as the block's BF16 staging numbers them. The peer folds out of its OWN per-group staging,
@@ -265,8 +279,7 @@ struct Bound {
     double worst_vs_partial = 0;   // ... and as a fraction of the partial it rounds
 };
 
-void check(const Layer& L, int32_t lo, int32_t hi, bool bf16_wire, Bound& b) {
-    const std::vector<Group> gs = make_groups(L, lo, hi);
+void check_groups(const Layer& L, int32_t lo, int32_t hi, bool bf16_wire, const std::vector<Group>& gs, Bound& b) {
     const std::vector<uint16_t> plane = bf16_plane(L, lo, hi);
     const uint16_t* rows16 = bf16_wire ? plane.data() : nullptr;
     const std::vector<float> part = fold_partial(L, gs, rows16, bf16_wire);
@@ -290,6 +303,10 @@ void check(const Layer& L, int32_t lo, int32_t hi, bool bf16_wire, Bound& b) {
             // that cancelled to nothing has an ulp of its own to no purpose, and the fp32 chain's ulps dominate
             if (p > 0.1 * terms) b.worst_vs_partial = std::max(b.worst_vs_partial, err / p);
         }
+}
+
+void check(const Layer& L, int32_t lo, int32_t hi, bool bf16_wire, Bound& b) {
+    check_groups(L, lo, hi, bf16_wire, make_groups(L, lo, hi), b);
 }
 
 /// Two floats the same bits, or both zero: `-0.0 + 0.0` is `+0.0`, and a sum that happens to land on zero must
@@ -446,6 +463,133 @@ int main() {
         std::printf("6. fold coverage over 4 block placements x 3 seeds (half skewed): missed=%d doubled=%d malformed=%d\n",
                     rows_missed, rows_doubled, list_broken);
         if (rows_missed || rows_doubled || list_broken) ++fails;
+    }
+
+    // 7. the TERM SET, not just the row count. The partner's fold must read exactly the rows the lead skips, each
+    //    at its own router weight: a row read at another row's weight passes a coverage count and is still a wrong
+    //    sum, which is the failure the gate saw and this test could not. Three things real routing does and the
+    //    checks above hold fixed:
+    //      - the peer's block is NOT the top of the row space. The row space is lead | peer | CPU tier, so the
+    //        combine reads an FP32 tail above the peer's block that the fold never sees;
+    //      - the groups come from the engine's own cutter (`fp4::cut_pieces`) over real expert runs - hot experts
+    //        with long runs cut at whole tiles, cold ones with one piece, groups the cap and the kMaxExperts limit
+    //        split - rather than fixed sevens;
+    //      - a token's K routings straddle several of those groups, so its chain is joined group by group.
+    {
+        int ledger_bad = 0, empty_groups = 0, split_experts = 0, groups_seen = 0;
+        // (peer share, CPU tier) as row counts, and the staging cap the group is cut to
+        const std::pair<int32_t, int32_t> splits[] = {
+            {(int32_t) (ROWS / 2), (int32_t) (ROWS / 4)},   // lead | peer | cpu, the running case
+            {(int32_t) (ROWS / 3), (int32_t) (ROWS / 3)},   // the 50% clamp's neighbourhood, a fat CPU tier
+            {(int32_t) (ROWS / 8), (int32_t) (ROWS / 2)},   // a thin peer share under a fat CPU tier
+            {(int32_t) (ROWS - ROWS / 16), 0},              // no CPU tier: the peer flush with the top
+            {0, (int32_t) (ROWS / 3)},                       // an empty peer block: nothing to fold, nothing to skip
+        };
+        const int64_t caps[] = {64, 256, (int64_t) ROWS};   // a tile, a small staging, the whole block
+        for (const auto& sp : splits)
+            for (uint32_t seed = 0; seed < 3; ++seed)
+                for (const int64_t cap : caps) {
+                    const Layer L = (seed & 1) ? make_layer_skewed(31000 + seed, 5) : make_layer(31000 + seed);
+                    const int32_t lo = (int32_t) (ROWS - sp.first - sp.second), hi = lo + sp.first;
+
+                    // The peer's experts in the order the lead's split puts them, each with its own run: the runs
+                    // are contiguous over the block exactly as `m.off` lays them out, and the run lengths mix short
+                    // cold experts with a few long hot ones, which is what gives the cutter something to cut.
+                    // Every 5th is cold enough to hold no rows at all: a run of nothing, the geometry
+                    // `moe_fold_tables` guards against and `cut_pieces` must skip without shifting a later piece.
+                    int32_t n_expert = std::min<int32_t>(512, std::max<int32_t>(1, sp.first / 4));
+                    if (sp.first == 0) n_expert = 0;   // no expert holds a row of an empty block
+                    std::vector<int32_t> cnt((size_t) n_expert, 1);
+                    for (int32_t left = sp.first - n_expert, e = 0; left > 0; ++e) {
+                        const int32_t take = std::min(left, (e % 7 == 6) ? 24 : 3);   // every 7th expert runs long
+                        cnt[(size_t) (e % n_expert)] += take;
+                        left -= take;
+                    }
+                    for (int32_t e = 4; e < n_expert; e += 5) {   // the cold experts, their rows to a hot one
+                        cnt[(size_t) 0] += cnt[(size_t) e];
+                        cnt[(size_t) e] = 0;
+                    }
+                    std::vector<int32_t> bounds((size_t) n_expert + 1);
+                    bounds[(size_t) 0] = 0;   // the cutter sees the peer's block-relative rows, as `m.off` gives them
+                    for (int32_t e = 0; e < n_expert; ++e)
+                        bounds[(size_t) e + 1] = bounds[(size_t) e] + cnt[(size_t) e];
+                    if (bounds.back() != sp.first) {   // the rows above must conserve exactly, or the case is moot
+                        ++ledger_bad;
+                        std::printf("   FAIL: peer %d cpu %d seed %u cap %lld: the expert runs hold %d rows, not %d\n",
+                                    sp.first, sp.second, seed, (long long) cap, bounds.back(), sp.first);
+                        continue;
+                    }
+                    fp4::Pieces pc;
+                    fp4::cut_pieces(bounds.data(), (int) n_expert, cap, pc);
+                    const int ngr = (int) pc.group.size() - 1;
+                    // the pieces must tile the peer's block exactly, in order, with no piece for a cold expert
+                    if (!pc.expert.empty() && (pc.bounds.front() != 0 || pc.bounds[pc.expert.size()] != sp.first))
+                        ++ledger_bad;
+                    for (size_t j = 0; j + 1 < pc.bounds.size(); ++j)
+                        if (pc.bounds[j] > pc.bounds[j + 1]) ++ledger_bad;   // a cutter that shuffles the runs
+
+                    std::vector<Group> gs;
+                    for (int g2 = 0; g2 < ngr; ++g2) {
+                        const int i0 = pc.group[(size_t) g2], ns = pc.group[(size_t) g2 + 1] - i0;
+                        const int32_t r0 = lo + pc.bounds[(size_t) i0];   // the group's first row, absolute
+                        const int32_t nr = pc.bounds[(size_t) i0 + ns] - pc.bounds[(size_t) i0];
+                        if (ns > 1) ++split_experts;   // a group whose pieces came from more than one expert
+                        if (nr == 0) ++empty_groups;
+                        ++groups_seen;
+                        Group g;
+                        g.lo = r0; g.hi = r0 + nr; g.base = lo;
+                        std::vector<int32_t> tok_of_row((size_t) nr), k_of_row((size_t) nr);
+                        std::vector<float> w_of_row((size_t) nr);
+                        for (int32_t q = 0; q < nr; ++q) {
+                            const int32_t i = L.inv[(size_t) (r0 + q)];
+                            tok_of_row[(size_t) q] = i / kMoeK;
+                            k_of_row[(size_t) q] = i % kMoeK;
+                            w_of_row[(size_t) q] = L.w[(size_t) i];
+                        }
+                        MoeFoldTables scratch;
+                        scratch.cnt.assign((size_t) T + 1, 0);
+                        scratch.cur.assign((size_t) T + 1, 0);
+                        moe_fold_tables(scratch, tok_of_row.data(), k_of_row.data(), w_of_row.data(), nr);
+                        g.tok = scratch.tok; g.off = scratch.off; g.rel = scratch.rel; g.wt = scratch.wt;
+                        gs.push_back(std::move(g));
+                    }
+
+                    // What the lead skips, per token: exactly its routings whose rows sit in the peer's block.
+                    std::map<int64_t, std::map<int64_t, int>> skipped, folded;
+                    for (int64_t t = 0; t < T; ++t)
+                        for (int k = 0; k < kMoeK; ++k) {
+                            const int64_t i = t * kMoeK + k;
+                            const int32_t r = L.slot[(size_t) i];
+                            if (r >= lo && r < hi) ++skipped[t][i % kMoeK];
+                        }
+                    for (const Group& g : gs)
+                        for (size_t e = 0; e < g.tok.size(); ++e)
+                            for (int32_t q = g.off[e]; q < g.off[e + 1]; ++q) {
+                                const int32_t r = g.lo + g.rel[(size_t) q];
+                                const int64_t i = L.inv[(size_t) r];
+                                folded[(int64_t) g.tok[e]][i % kMoeK] += 1;
+                                if (g.wt[(size_t) q] != L.w[(size_t) i]) ++ledger_bad;   // the wrong row's weight
+                                if (r < lo || r >= hi) ++ledger_bad;                     // a row outside the block
+                            }
+                    if (skipped != folded) {
+                        ++ledger_bad;
+                        std::printf("   FAIL: peer %d cpu %d seed %u cap %lld: the fold read a different term set "
+                                    "than the lead skipped\n", sp.first, sp.second, seed, (long long) cap);
+                    }
+                    // and the sum on the FP32 wire: a term out of place is more than reassociation can absorb
+                    Bound b;
+                    check_groups(L, lo, hi, false, gs, b);
+                    if (!(b.worst_ratio <= 1.0)) {
+                        ++ledger_bad;
+                        std::printf("   FAIL: peer %d cpu %d seed %u cap %lld exceeded the reassociation bound "
+                                    "(%.3f of it, max |diff| %.3e)\n",
+                                    sp.first, sp.second, seed, (long long) cap, b.worst_ratio, b.max_abs);
+                    }
+                }
+        std::printf("7. term-set ledger over 5 lead/peer/cpu splits x 3 seeds x 3 staging caps, cut by "
+                    "fp4::cut_pieces (%d groups, %d multi-piece, %d empty): mismatches=%d\n",
+                    groups_seen, split_experts, empty_groups, ledger_bad);
+        if (ledger_bad) ++fails;
     }
 
     std::printf("%s\n", fails == 0 ? "moe_part_parity: OK" : "moe_part_parity: FAILED");
