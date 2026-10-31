@@ -2520,7 +2520,8 @@ static void qsa_chain_put(basalt::kernels::QsaChainFp* card, int64_t layer, int 
     if (base == nullptr || rows <= 0 || stride_words <= 0) return;   // a component this mode never reached
     std::string e;
     if (!basalt::kernels::qsa_chain_record(
-            card + (size_t) layer * basalt::kernels::kChainCount + slot, base, rows, stride_words, stream, e))
+            card + (size_t) layer * basalt::kernels::kChainCount + slot, base, rows, stride_words, stream, e,
+            !basalt::kernels::qsa_chain_slot_is_bytes(slot)))
         basalt::log::error("basalt", "qsa chain: layer %lld slot %s: %s", (long long) layer,
                            basalt::kernels::qsa_chain_slot_name(slot), e.c_str());
 }
@@ -2528,9 +2529,10 @@ static void qsa_chain_put(basalt::kernels::QsaChainFp* card, int64_t layer, int 
 /// A card's packed `attn_output` columns as its own `o_proj` product is about to read them.  ONE row of the whole
 /// image, so the fingerprint covers every byte: a packed weight poisons a partial from a single bad block (the
 /// product sums over the whole input axis), and the row sampler that suits activations would see 32 of the image's
-/// `n_embd` rows and report the buffer innocent beside a partial of nan.  A view with no native image is not
-/// fingerprinted - the slot then reads `--------`, an absence, never a zero - and so is an image that is not a
-/// whole number of words, which cannot be walked wordwise.
+/// `n_embd` rows and report the buffer innocent beside a partial of nan.  Only its hash is printed and only its
+/// hash is read - `qsa_chain_slot_is_bytes` - and the figure to compare it with is the one the pack logs when it
+/// writes the buffer.  A view with no native image is not fingerprinted - the slot then reads `--------`, an
+/// absence, never a zero - and so is an image that is not a whole number of words, which cannot be walked wordwise.
 static void qsa_chain_cols(basalt::kernels::QsaChainFp* card, int64_t layer, int slot,
                            const basalt::core::QsaShardWeight& w, cudaStream_t stream) {
     if (w.native == nullptr || w.native_bytes == 0 || w.native_bytes % 4 != 0) return;
@@ -2854,8 +2856,8 @@ bool peer_qsa_finish(PeerPrefill& P, Gemm& lead_gemm, cudaStream_t lead_cs, cons
     // THE CHAIN, the pack inputs: what each card's product is about to dequantize, on the card that holds it.
     // Everything else the arm fingerprints is an activation, and an activation that is wrong has somewhere
     // upstream to look; a weight that is wrong has only these bytes and the geometry handed to the dequantizer.
-    // `colsl` nan while `partl` is nan names the bytes; `colsl` finite while `partl` is nan leaves the pitch,
-    // the type or the scratch, and says so in one boot rather than in one hypothesis at a time.
+    // Only the hash is printed and only the hash means anything here (`qsa_chain_slot_is_bytes`): read it against
+    // the figure the pack logged when it wrote this buffer, and the two agree until something overwrites them.
     if (qs.chain[0] != nullptr || qs.chain[1] != nullptr) {
         { const core::OnDevice on_lead(P.prim);
           qsa_chain_cols(qs.chain[0], layer, basalt::kernels::kChainColsL, lc, lead_cs); }

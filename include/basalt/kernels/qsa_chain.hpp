@@ -78,13 +78,11 @@ enum QsaChainSlot : int {
     kChainCount
 };
 
-// THE TWO COLUMN SLOTS ARE FINGERPRINTED WHOLE, not row-sampled like every other component. They are the only
-// weights in the chain - everything else is an activation - and a packed `attn_output` column image is a buffer
-// where ONE bad block poisons every element of the partial it feeds: the product sums over the whole input axis,
-// so a single non-finite weight value arrives as a whole buffer of nan, from bytes 32/2560ths of the way through
-// the ones the row sampler would have looked at. Sampling 32 rows there would report the buffer innocent while
-// the partial went nan, which is the one answer this instrument must not be able to give. `rows` is therefore 1
-// and the stride the whole image, so the window is every byte.
+// THE TWO COLUMN SLOTS are the only weights in the chain - everything else is an activation - and they are
+// fingerprinted WHOLE (`rows` = 1, stride the whole image) and printed as bits only. One bad block poisons every
+// element of the partial a product feeds (its sum runs over the whole input axis), so a row sample could report
+// the image innocent beside a partial of nan; and their float figures are meaningless, which
+// `qsa_chain_slot_is_bytes` explains where it is enforced.
 
 /// One component's fingerprint.  Three figures, because they answer different questions: `hash` says whether the
 /// bits moved at all, `sum` says by how much when they did (which is what separates a rounding drift from a wrong
@@ -176,11 +174,35 @@ QSA_CHAIN_HD inline float qsa_chain_max(float a, float b) {
 /// `qsa_chain_parity` can hold both and compare.
 QsaChainFp qsa_chain_ref(const uint32_t* words, int64_t rows, int64_t stride_words);
 
+// THE TWO COLUMN SLOTS FINGERPRINT OPAQUE BYTES, not an array of floats, so only their `hash` is a claim about
+// anything.  A packed Q6_K image is codes and quantized scales: read as fp32 words it contains NaN bit patterns
+// in every image that ever was packed correctly, so its `sum`, its `maxabs` and its sketch are garbage BY
+// CONSTRUCTION - a finite `partp` beside a nan `colsp` is exactly what a correct pair prints, and reading that
+// nan as "unwritten memory" sends the hunt to the wrong card.  `qsa_chain_field` prints those slots hash-only,
+// and `qsa_chain_record` is asked not to compute the sketch for them: the walk that produces the hash is the
+// only one that has to happen.  A slot that cannot say "the bytes are wrong" AND "the bytes are right" is worse
+// than no slot, because the first reading of the second answer is the one that wastes the boot.
+inline bool qsa_chain_slot_is_bytes(int slot) {
+    return slot == kChainColsL || slot == kChainColsP;
+}
+
+/// What the whole-buffer byte slots hash, computed where the bytes were made.  Exactly the window the kernel
+/// accumulates for `rows` = 1 - same mix, same positions, and integer addition is associative so the block split
+/// cannot move it - which makes a packer's own figure and the device-side slot comparable across a boot.  Equal
+/// figures mean the card holds the bytes that were packed; unequal ones mean something between them is lying.
+inline uint32_t qsa_chain_bytes_hash(const uint32_t* words, int64_t words_count) {
+    uint32_t h = 0;
+    for (int64_t c = 0; c < words_count; ++c) h += qsa_chain_mix(words[c], 0u, (uint32_t) c);
+    return h;
+}
+
 /// Fingerprint `rows` rows of `stride_words` 4-byte words at `base` into `dst`, on `stream`.  `base` must be
 /// 4-byte aligned (everything this engine fingerprints comes off `cudaMalloc`, which over-aligns); anything else
-/// is refused rather than read unaligned.  The caller's device must be current, as everywhere in the arm.
+/// is refused rather than read unaligned.  `sketch` is the projection pass, which only a component made of floats
+/// has a use for; with it off `proj` is left zero and the window is walked once.  The caller's device must be
+/// current, as everywhere in the arm.
 bool qsa_chain_record(QsaChainFp* dst, const void* base, int64_t rows, int64_t stride_words, void* stream,
-                      std::string& err);
+                      std::string& err, bool sketch = true);
 
 /// One slot as it appears in a chain line: `mix=9f3a12c4/0.12345679/1.5`, or `mix=--------` when the slot was
 /// never recorded.  Fixed width hex so two lines diff by eye.

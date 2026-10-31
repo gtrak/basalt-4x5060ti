@@ -171,20 +171,44 @@ The two hypotheses that needed no hardware were run down against the pack's own 
   zero-initialized host vector, the `QsaPair` is never copied (`PeerPrefill` lives in a `unique_ptr`),
   `qsa_pair_free` runs only at teardown and on refusal paths, and `cudaMalloc` cannot alias the expert tier.
 
-What survives is the runtime state of the lead's twelve buffers, which no CPU test can see. Two changes make one
-boot decide it:
+What survives is the runtime state of the lead's twelve buffers, which no CPU test can see.
 
-- **The chain now fingerprints the weights.** `colsl` and `colsp` are each card's whole packed `attn_output`
-  column image, hashed as ONE row of `native_bytes / 4` words so the window is every byte - not the 32-of-2560
-  row sample the activations use, because a single bad block poisons an entire partial (the product sums over the
-  whole input axis), and a sampled slot could have reported the buffer innocent beside a partial of nan. Read it
-  as: `colsl` nan names the bytes (packing, copy, or something written over them); `colsl` finite with `partl`
-  nan names the pitch, the type or the scratch, with every byte of the image already accounted for.
-- **The pack now says where its bytes landed.** `qsa_pair_prepare` refused on rank, on the pair and on the layer
-  range, but never on the card: a column buffer that ended up on the other card of the pair still "works", since
-  the pair has peer access - the product just walks a peer's memory all layer, and any mistake in where the bytes
-  came from hides behind the same nan. One `cudaPointerGetAttributes` per buffer at boot, naming both cards in
-  the refusal; a query that itself fails warns and continues, because the observer must not be able to stop a run.
+### 5b. A correction: the column slot's `nan` was the instrument, not the corruption
+
+The first boot with `colsl`/`colsp` printed `colsl=.../nan/nan` on all twelve of the lead's buffers, which read as
+"the columns were never written". It was not that. **A packed weight image is opaque bytes**: Q6_K codes and
+quantized scales, and read as fp32 words they contain NaN bit patterns in every image that was ever packed
+correctly. The chain's `sum`, `maxabs` and sketch interpret the window as floats, so for these two slots those
+figures are garbage by construction, and `nan` was what correct looks like. The proof was in the same line: the
+PARTNER's `colsp` was `nan` too while its `partp` was finite - a card that computes the right answer from bytes
+my slot called poisoned. One boot and one round of hunting went into an instrument that could not say "the bytes
+are right".
+
+What that instrument should have been saying, and now does:
+
+- **A byte slot prints its bits and nothing else.** `qsa_chain_slot_is_bytes` names the two column slots;
+  `qsa_chain_field` prints `colsl=3a598a69` for them - no sum, no maxabs, no sketch, because those three
+  interpret code bytes as floats. The kernel is also asked to skip the sketch pass for them (`sketch = false`),
+  which halves what the two heaviest slots cost: the walk that produces the hash is the only one that has to
+  happen. `qsa_chain_parity` grades the shape of the line and refuses a byte slot that would print a float.
+- **The pack prints the same figure from the bytes it wrote.** `qsa_prepare_one` logs
+  `CUDA0 layer 3 ... packed hash 3a598a69` at boot, through `qsa_chain_bytes_hash` - the kernel's own window rule
+  (`rows` = 1 of `native_bytes / 4` words), same header inline on both sides, pinned by a parity case that holds
+  the host figure, the reference and the device kernel at the pack's real 6 451 200 B. Equal figures across a boot
+  mean the card still holds what was packed; unequal ones mean something wrote over them between the copy and the
+  product.
+- **The fill is now proved at boot, before any inference.** Reading the buffer back and comparing it byte for
+  byte against the packer's own vector, in `qsa_prepare_one`, once per buffer: a copy that reported `cudaSuccess`
+  and delivered something else cannot survive it, and the refusal names the first differing offset and both
+  bytes. That is the question the last boot was spent failing to ask - *did the bytes get there* - and it is
+  unconditional, not behind `--exp qsa_dump_chain`.
+
+The deduction that survives the correction is worth keeping, because it narrows what the next boot can mean. A NaN
+in the weight operand reaches every row of the partial (the product sums over the whole input axis); a NaN in the
+activation operand reaches only its own row. `partl`'s sampled 32 rows - spread by `qsa_chain_row` to include the
+first and the last row of the chunk - are ALL NaN, while the lead's `gated` slot covers the whole 6144-half row of
+those same rows and is finite. So the activation operand is accounted for and the weight operand or the product's
+setup is what is left. `colsl` no longer adjudicates between them; the boot's two hash lines and the read-back do.
 
 ## 6. Notes for whoever runs it
 
@@ -198,10 +222,20 @@ boot decide it:
   hash (reduction order is not deterministic across launches), so cross-boot comparisons are evidence only
   where a value goes from finite to nan - which is how this section reads them.
 - The chain is now 24 components a layer (`colsl`, `colsp`), and those two are the expensive ones: they walk every
-  byte of a 6.45 MB image on one 256-thread block, per sliced layer per card. That is the price of not being able
-  to miss a block, and it is behind `--exp qsa_dump_chain`; read `colsl`/`colsp` first, they answer the question
-  the other 22 have been circling.
-- CPU gates at `548e2c07` + this work: 69/70 with the count at 70 (`expert_multi_test` pre-existing),
-  `qsa_chain_parity` 0 failures, `tp2_shard_weights_test` ok with the new decode-contract case, platform boundary
-  and stderr logging ok. No numerics change: the two chain slots are behind `--exp qsa_dump_chain`, the pack's new
-  card check only refuses a layout that was already wrong, and the test is a test.
+  byte of a 6.45 MB image on one 256-thread block, per sliced layer per card - once, not twice, since a byte slot
+  is asked to skip the sketch. That is the price of not being able to miss a block, and it is behind
+  `--exp qsa_dump_chain`.
+- **What to read on the next boot, in order.** (1) If the boot refuses with "the packed columns on CUDAx are not
+  what was written (byte N: the card holds ab, the pack wrote cd)", the fill is the defect and N says where it
+  starts. (2) Otherwise compare each card's `packed hash` line against that card's `colsl`/`colsp` figure:
+  unequal means something wrote over the columns between boot and product, and the layer where they first diverge
+  is the layer that did it. (3) Equal figures with `partl` still nan leave the decode and the product: the
+  geometry the pair's columns must satisfy is already guarded at boot (both `ne1` are `N`, the two `ne0` tile
+  `n_head * 256`, the partner's shard starts where the lead's ends), both products dequantize into the same
+  `GEMM_SCRATCH` by the same call, and both `beta` are zero - so the cut to make there is the one-line one: point
+  the lead's product at `qs.peer_cols.o_cols[layer].native` and see whether the nan follows the bytes or stays on
+  the card.
+- CPU gates at this commit: 69/70 with the count at 70 (`expert_multi_test` pre-existing), `qsa_chain_parity` 0
+  failures including the device cases at the pack's real column width, `tp2_shard_weights_test` ok, platform
+  boundary and stderr logging ok. No numerics change: the chain slots are behind `--exp qsa_dump_chain`, the
+  read-back and the card check only refuse a layout that was already wrong, and the rest is tests.

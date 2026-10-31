@@ -282,6 +282,52 @@ void names_and_fields() {
     CHECK(slashes == 3);   // hash / sum / maxabs / the sketch
 }
 
+// ---- the byte slots: the figure the pack prints and the figure the card prints must be one number --------------
+
+// A packed weight image is opaque code bytes, so the chain compares its bits and nothing else.  The pack computes
+// a hash on the host from the bytes it wrote and logs it; the device slot hashes the same window on the card; the
+// two are comparable only because both are the kernel's own rule.  If they drift - a change to the sampler, to the
+// `rows` = 1 window, to the sketch switch - the boot's two lines stop answering each other, and the hunt is back
+// to reading a nan as a verdict.  The width is one card's real `attn_output` columns: half of a 6144-column Q6_K
+// image over 2560 rows, which is 6 451 200 B - the buffer the arm ships and the product reads.
+void byte_slots_carry_the_packs_own_number() {
+    const int64_t words = 6451200 / 4;
+    std::vector<uint32_t> img((size_t) words);
+    std::mt19937 rng(20261030u);
+    for (size_t i = 0; i < img.size(); ++i) img[i] = rng();   // arbitrary bits: codes and scales, not floats
+
+    // (a) no block hides: one word changed anywhere in 6.45 MB moves the figure.  This is the whole reason the
+    // slot walks the image instead of sampling rows of it, so it is graded, not asserted.
+    std::vector<uint32_t> poisoned = img;
+    poisoned[words - 7] = 0x7fc00000u;   // a NaN word: the shape a poisoned weight block arrives as
+    CHECK(qsa_chain_bytes_hash(poisoned.data(), words) != qsa_chain_bytes_hash(img.data(), words));
+    std::vector<uint32_t> swapped = img;
+    std::swap(swapped[17], swapped[19]);   // same multiset, wrong place
+    CHECK(qsa_chain_bytes_hash(swapped.data(), words) != qsa_chain_bytes_hash(img.data(), words));
+
+    // (b) the host figure IS the kernel's window: `rows` = 1 of `stride` words, per the slot's put.
+    CHECK(qsa_chain_bytes_hash(img.data(), words) == qsa_chain_ref(img.data(), 1, words).hash);
+    CHECK(qsa_chain_bytes_hash(poisoned.data(), words) == qsa_chain_ref(poisoned.data(), 1, words).hash);
+
+    // (c) a byte slot prints its bits and nothing else.  A correctly packed Q6_K image is FULL of NaN bit
+    // patterns, so a `nan` in its line is what correct looks like - and a reader who took it for unwritten memory
+    // would send the hunt to the wrong card, which is the mistake this line shape makes impossible.
+    const QsaChainFp fp = qsa_chain_ref(img.data(), 1, words);
+    char hb[16];
+    std::snprintf(hb, sizeof hb, "%08x", fp.hash);
+    CHECK(qsa_chain_field(kChainColsL, fp) == std::string("colsl=") + hb);
+    CHECK(qsa_chain_field(kChainColsL, fp).find('/') == std::string::npos);
+    CHECK(qsa_chain_field(kChainColsP, fp).rfind("colsp=", 0) == 0);
+    QsaChainFp absent;
+    CHECK(qsa_chain_field(kChainColsL, absent) == "colsl=--------");   // an absence still reads as an absence
+
+    // (d) only the two column slots are bytes: an activation keeps its sum, its maxabs and its sketch.
+    CHECK(qsa_chain_slot_is_bytes(kChainColsL) && qsa_chain_slot_is_bytes(kChainColsP));
+    CHECK(!qsa_chain_slot_is_bytes(kChainGated) && !qsa_chain_slot_is_bytes(kChainPartL) &&
+          !qsa_chain_slot_is_bytes(kChainBo) && !qsa_chain_slot_is_bytes(kChainSumL));
+    CHECK(!qsa_chain_slot_is_bytes(-1) && !qsa_chain_slot_is_bytes(kChainCount));
+}
+
 // ---- the device kernel against the host rule ----------------------------------------------------------
 
 int device_parity() {
@@ -334,6 +380,34 @@ int device_parity() {
         CHECK(again.hash == want.hash && again.sum == want.sum);
     }
 
+    // The byte slot's device side, at the pack's real size: the kernel's hash must be the figure the pack printed
+    // from the same bytes, and the sketch must be left zero rather than computed from code bits (a byte slot's
+    // projections are not a quantity, and a caller must not pay a second walk of 6.45 MB for nothing).
+    {
+        const int64_t words = 6451200 / 4;
+        std::vector<uint32_t> img((size_t) words);
+        std::mt19937 rng(4242u);
+        for (size_t i = 0; i < img.size(); ++i) img[i] = rng();
+        CHECK(words <= (int64_t) cap_words);
+        CHECK(cudaMemcpyAsync(dev, img.data(), (size_t) words * 4, cudaMemcpyHostToDevice, stream) == cudaSuccess);
+        CHECK(cudaStreamSynchronize(stream) == cudaSuccess);
+        std::string berr;
+        CHECK(qsa_chain_record(slot, dev, 1, words, stream, berr, /*sketch*/ false));
+        CHECK(cudaStreamSynchronize(stream) == cudaSuccess);
+        QsaChainFp bytes;
+        CHECK(cudaMemcpy(&bytes, slot, sizeof bytes, cudaMemcpyDeviceToHost) == cudaSuccess);
+        CHECK(bytes.hash == qsa_chain_bytes_hash(img.data(), words));
+        CHECK(bytes.hash == qsa_chain_ref(img.data(), 1, words).hash);
+        for (int p = 0; p < kChainProj; ++p) CHECK(bytes.proj[p] == 0.0f);
+        // And the same window with the sketch on still agrees on the hash: the switch costs the projections, never
+        // the figure the two sides of a boot are read from.
+        CHECK(qsa_chain_record(slot, dev, 1, words, stream, berr, /*sketch*/ true));
+        CHECK(cudaStreamSynchronize(stream) == cudaSuccess);
+        QsaChainFp with_sketch;
+        CHECK(cudaMemcpy(&with_sketch, slot, sizeof with_sketch, cudaMemcpyDeviceToHost) == cudaSuccess);
+        CHECK(with_sketch.hash == bytes.hash);
+    }
+
     // A slot cleared to the sentinel reads as absent until a record lands in it - the state a chunk starts in.
     CHECK(cudaMemset(slot, 0xFF, sizeof(QsaChainFp)) == cudaSuccess);
     CHECK(cudaMemcpy(&host, slot, sizeof host, cudaMemcpyDeviceToHost) == cudaSuccess);
@@ -383,6 +457,7 @@ int main(int argc, char** argv) {
     reference_contract();
     sketch_contract();
     names_and_fields();
+    byte_slots_carry_the_packs_own_number();
     if (g_fail) {
         std::printf("qsa chain parity: %d failures\n", g_fail);
         return 1;

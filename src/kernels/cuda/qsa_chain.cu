@@ -12,7 +12,7 @@ namespace basalt::kernels {
 namespace {
 
 __global__ void qsa_chain_kernel(QsaChainFp* __restrict__ dst, const uint32_t* __restrict__ w, int64_t rows,
-                                 int64_t stride_words) {
+                                 int64_t stride_words, int sketch) {
     __shared__ uint32_t sh[kChainBlock];
     __shared__ float sf[kChainBlock];
     __shared__ float sm[kChainBlock];
@@ -57,6 +57,12 @@ __global__ void qsa_chain_kernel(QsaChainFp* __restrict__ dst, const uint32_t* _
     // THE SKETCH, in one walk of the window. `kChainProj` register accumulators per thread keep the window read
     // once however large the sketch is (re-walking it per chunk of projections cost 5x the base fingerprint, which
     // a debug flag may not); the tree then reduces it `kChainProjChunk` rows at a time to bound shared memory.
+    // A component of opaque bytes is asked to skip it - `qsa_chain_slot_is_bytes` - because its projections would
+    // interpret code bytes as floats, and the hash above is the only figure of that record which means anything.
+    if (!sketch) {
+        if (tid < kChainProj) dst->proj[tid] = 0.0f;
+        return;
+    }
     float pr[kChainProj];
     for (int p = 0; p < kChainProj; ++p) pr[p] = 0.0f;
     for (int64_t e = tid; e < total; e += kChainBlock) {
@@ -150,7 +156,7 @@ QsaChainFp qsa_chain_ref(const uint32_t* words, int64_t rows, int64_t stride_wor
 }
 
 bool qsa_chain_record(QsaChainFp* dst, const void* base, int64_t rows, int64_t stride_words, void* stream,
-                      std::string& err) {
+                      std::string& err, bool sketch) {
     if (dst == nullptr || base == nullptr || stream == nullptr) {
         err = "qsa chain: no slot, no component or no stream";
         return false;
@@ -165,7 +171,7 @@ bool qsa_chain_record(QsaChainFp* dst, const void* base, int64_t rows, int64_t s
         return false;
     }
     qsa_chain_kernel<<<1, kChainBlock, 0, (cudaStream_t) stream>>>(
-        dst, reinterpret_cast<const uint32_t*>(base), rows, stride_words);
+        dst, reinterpret_cast<const uint32_t*>(base), rows, stride_words, sketch ? 1 : 0);
     if (const cudaError_t le = cudaGetLastError(); le != cudaSuccess) {
         err = std::string("qsa chain: the fingerprint kernel did not launch: ") + cudaGetErrorString(le);
         return false;
@@ -178,6 +184,14 @@ std::string qsa_chain_field(int slot, const QsaChainFp& fp) {
     out += '=';
     if (fp.hash == kChainUnrecorded) {
         out += "--------";   // nobody recorded this component: a mode that never reached it, not a buffer of zeros
+        return out;
+    }
+    if (qsa_chain_slot_is_bytes(slot)) {
+        // A byte slot prints its bits and nothing else: see `qsa_chain_slot_is_bytes`.  The figure is the packer's
+        // own, printed by the pack at boot, so the two sides of one buffer meet in one grep.
+        char hb[16];
+        std::snprintf(hb, sizeof hb, "%08x", fp.hash);
+        out += hb;
         return out;
     }
     char buf[64];

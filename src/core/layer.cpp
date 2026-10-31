@@ -31,6 +31,7 @@
 #include "basalt/kernels/qsa_decode_attn.hpp"
 #include "basalt/kernels/fused_gdn.hpp"
 #include "basalt/kernels/qsa_select.hpp"
+#include "basalt/kernels/qsa_chain.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <exception>
@@ -689,6 +690,39 @@ static bool qsa_prepare_one(QsaPair& p, const WeightRef& w, const std::string& n
             basalt::log::warn("basalt tp2", "%s: the packed columns' card could not be read", name.c_str());
         }
     }
+    // WHAT IS ON THE CARD IS WHAT THE PACKER WROTE, or the boot says so here.  The pack's arithmetic is graded on
+    // the CPU against the whole image; what nothing graded was the FILL - that those bytes reached this card and
+    // stayed.  A weight is the input whose corruption looks like every other: one bad block in a column image
+    // reaches the product through a sum over the whole input axis, so it arrives as a buffer that is entirely nan
+    // with every activation beside it finite.  So come back down and compare, byte for byte, once per buffer at
+    // boot - the whole split of one projection, on the order of a hundred MB, against the load's gigabytes - and
+    // the first difference names the offset and both sides.  A copy that reported success and delivered something
+    // else is exactly what a checked copy cannot catch by itself.
+    std::vector<uint8_t> back((size_t) want);
+    {
+        const OnDevice on(dev);
+        if (cudaMemcpy(back.data(), d, (size_t) want, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            err = name + ": the packed columns would not come back down to be checked";
+            cudaFree(d);
+            return false;
+        }
+    }
+    for (size_t i = 0; i < back.size(); ++i) {
+        if (back[i] == packed[i]) continue;
+        char db[96];   // room for a 64-bit offset in both decimal and hex, with the text around it
+        std::snprintf(db, sizeof db, "byte %zu: the card holds %02x, the pack wrote %02x", i, back[i], packed[i]);
+        err = name + ": the packed columns on CUDA" + std::to_string(dev) + " are not what was written (" + db + ")";
+        cudaFree(d);
+        return false;
+    }
+    // The figure the chain's `colsl`/`colsp` slot must print for this buffer, taken from the bytes as they were
+    // packed: equal figures mean the card still holds them, unequal ones mean something wrote over them between
+    // here and the product.  Same function on both sides, so the comparison is the kernel's own window (`qsa_chain_bytes_hash`).
+    uint32_t packed_hash = 0;
+    if (view.native_bytes % 4 == 0)
+        packed_hash = basalt::kernels::qsa_chain_bytes_hash(
+            (const uint32_t*) (packed.data() + view.codes_bytes + view.scales_bytes + view.offset_bytes),
+            (int64_t) (view.native_bytes / 4));
     // re-describe the view over the DEVICE copy: the sizes are the packer's, the pointers are the card's
     const uint8_t* base = (const uint8_t*) d;
     view.codes = view.codes_bytes ? base : nullptr;
@@ -697,6 +731,9 @@ static bool qsa_prepare_one(QsaPair& p, const WeightRef& w, const std::string& n
     view.native = nb ? (const void*) (base + view.codes_bytes + view.scales_bytes + view.offset_bytes) : nullptr;
     p.owned.push_back(d);
     p.o_cols[(size_t) layer] = view;
+    basalt::log::info("basalt tp2", "CUDA%d layer %lld %s: %llu B of columns on the card, packed hash %08x, type %d",
+                      dev, (long long) layer, name.c_str(), (unsigned long long) want, packed_hash,
+                      (int) w.native_type);
     return true;
 }
 
