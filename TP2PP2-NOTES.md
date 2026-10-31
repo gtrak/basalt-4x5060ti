@@ -3013,3 +3013,67 @@ window should re-run the gate; if top-1 does not reach the >=99% bound, the dump
 rel/wt` plus `peer_lo/peer_n` for one (chunk, layer) beside a second flag-off `moe_combine` over the same inputs,
 keyed by token — the CPU ledger says where it CANNOT be, which narrows the dump to the copy ordering and the
 staging the fold reads (`P.dm16(b)` at the moment of the fold).
+
+## RUN 27 — the partial merge's gate was not an A/B: the two arms placed different experts (gate VOID; the parity test now cuts groups the way the engine does)
+
+**The recorded gate (`/tmp/qgate`) graded a placement change, not the flag.** Read out of the arms' own
+`engine.log`, the reference and gate boots did not hold the same experts:
+
+| boot | ranked pairs a partner card held | room it filled | band | experts in VRAM |
+|---|---|---|---|---|
+| `emit`, `check` | 5429 | 13.98 GiB | 584 / 697 | 37.3 GiB (59%) |
+| `gate` | 5384 | 13.86 GiB | 591 / 703 | 37.1 GiB (59%) |
+
+45 experts a card, ~123 MiB of room. That is enough on its own to change which card computes a row, and therefore
+whether its rows cross the wire as BF16 bits or stay FP32 — which is exactly what the gate measures. So **top-1
+94.41% against the 99% bound is not attributable to the fold until a run holds placement fixed.** The `same_top1=0`
+rows (171 of 3060, 5.59%) sat evenly across chunks and both parities, which is what a placement shift looks like
+and not what the "half of every other token" signature of the parity bug would have been.
+
+**Why the flag moves placement.** `--exp peer_partial_merge=1` is read inside `Prefill::peer_bytes()`
+(`src/prefill/prefill.cpp:3560`), and `peer_fp4_ceiling()` (`:3356`) reserves `peer_part_bytes + K *
+peer_fold_bytes` instead of `K * peer_row_bytes`. The partner card's expert tier is filled AFTER its peer prompt and
+partial buffers are allocated, so a bigger reserve leaves the tier less room and it fills fewer ranked pairs. The
+flag is not placement-neutral, and `--seed 1234` does not pin placement across different reserves.
+
+**The gate now refuses to grade a moved tier** (`tools/quality_gate.py`). `placement_facts()` reads the boot's own
+log — `experts live in VRAM ...`, the two `(N experts held, M band)` pairings, the `tp2: CUDA%d holds ... ranked
+pairs ...` lines, the RAM-band split — and `--verdict` prints `VOID` if the gate arm or either reference arm
+disagrees with the `check` arm on any of them, naming the disagreement fact by fact. `--base-args` is the lever: it
+charges the `emit`/`check` arms the bytes the tested flag costs a card and is deliberately withheld from the gate
+arm; `--gate-args` is its mirror, for a flag that frees room. The verdict measures the room gap and prints which
+arm to charge, by how much, and the room to reach. Re-running the reference arms with `--base-args
+'--peer-reserve-mib 723'` (the 600 default plus the ~123 MiB the verdict measured) should land both arms at 5384;
+if the figure is not close enough the verdict prints what it saw and the number is adjusted.
+`tools/test_quality_gate.py` covers it — 31 tests, OK — including synthetic log pairs whose tiers differ in either
+direction, so the advice cannot point at the wrong arm.
+
+**The CPU ledger now uses the engine's own group cutter.** `fp4::cut_pieces` was pure host code stranded in
+`src/prefill/fp4/moe_fp4.cu`, so the parity test had to re-implement the cut and could only grade its own
+transcription. It moved to `include/basalt/prefill/moe_fp4.hpp` as `inline`, the same reason `moe_fold.hpp` exists.
+`moe_part_parity` test 7 then drives it over real geometry: 5 lead/peer/CPU splits (the row space as
+`lead | peer | CPU tier`, i.e. a CPU tail ABOVE the peer's block that the combine reads FP32 and the fold never
+sees — including an empty peer block and the 50%-clamp neighbourhood) x 3 seeds (one a skewed routing with heavy
+hitters) x 3 staging caps, with expert runs mixing cold single-row experts, long hot runs the cap splits at whole
+tiles, and every 5th expert cold enough to hold no rows at all. Per case it asserts a TERM-SET LEDGER — the fold's
+multiset of (token, k) equals the lead's skipped multiset, every folded row carries its OWN router weight, no
+folded row leaves `[lo, hi)` — plus that the pieces tile the block in order, plus the FP32-wire reassociation
+bound. 45 cases run (none skipped by an arithmetic guard), 276 groups, 255 of them cut across more than one piece,
+0 ledger mismatches.
+
+**The test is not vacuous**: five mutations of the fold's lists (a token's run shortened by one row, two rows'
+weights swapped, the last weight nudged, the first `rel` nudged, a token dropped from the list) each turn it FAILED.
+
+**What that leaves.** The fold's bookkeeping is now graded against the engine's real cutter over CPU-tier-topped
+geometry and is clean, so a dropped or mis-weighted row is not in the group/token list, the k-sort, the clamp or the
+cut. What the CPU still cannot see is the CONTENT of the staging the fold reads — `P.dm16(b)` at the moment of the
+fold, whose rows are the block's BF16 staging numbered from 0 while the fold indexes them group-relative. The next
+window: re-gate with `--base-args` FIRST (a moved tier explains the whole failure on its own), and only if it still
+misses, dump `P.fold.tok/off/rel/wt`, `peer_lo/peer_n`, `pc.bounds/r0/nr` and the staging rows for one
+(chunk, layer) beside a flag-off combine over the same inputs.
+
+**Checks run**: `moe_part_parity` OK; `ctest -L cpu` 71/72 — the one failure, `expert_multi_test`, is this host
+having no AVX-512 at all and has no dependency on any file here; `nvcc -c -gencode arch=compute_120a,code=sm_120a`
+on `moe_fp4.cu` clean; `prefill.cpp` syntax-clean; `tools/check_platform_boundary.sh` and
+`tools/check_stderr_logging.sh` ok; `tools/test_quality_gate.py` OK (31). `tools/test_quality_fixture.py` cannot
+run here — `tools/tokenizer.py` imports `regex`, which is not installed; it fails identically on a clean tree.
