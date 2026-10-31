@@ -77,3 +77,24 @@ partner rather than being claimed by the lead; the row split routes a band exper
 lead's tier holds it, so its rows follow its blob instead of being computed twice; and a layer whose experts a
 pinned band has taken runs the MMQ path, which is the one that honours the row split - the fused path walks every
 expert of the layer and would compute the partner's rows here as well.
+
+## Telling two boots apart: `--exp chunk_dump=1`
+
+A pinned band makes the band's MEMBERSHIP canonical; it does not make the rest of what a chunk decides visible.
+`--exp chunk_dump=1` prints one line per layer of a prompt chunk, naming the expert kernel the layer ran on
+(`fp16`, `mmq`, `fp4`, `fused`, `fused-nat`), the gates that picked it (`ring`, `stream_all`, `peer_fp4`, the band's
+`ram` count and `canon`, `T_fp4`/`T_max`, `bf16`, `merge`, `p2p`, `native`, `fused`), who served the layer's rows
+(`lead`/`peer`/`band`/`cpu` expert and row counts, `stream`, and `holds` - what each card's tier held that layer),
+and two fingerprints: `ids` over the routing as the host read it, `split` over which card each expert's rows went
+to. Boot the same command twice, diff the lines, and the first layer whose line differs names the decision that
+parted the runs - `ids` differing means a router's input had already parted upstream of that layer, `split`
+differing while `ids` agrees means the row division moved, which is a numerics change because a partner's rows
+cross the link as BF16 bits and this card's stay FP32. A layer on the fused path prints no routing fingerprint (the
+path keeps the routing on the card, which is its point) and no division, because it makes none.
+
+Nothing in the dump reads the device: a fingerprint that needed one would add a sync to the window whose scheduling
+is being examined, and hide what it was built to find. The classification and the fingerprints are
+`include/basalt/prefill/chunk_dump.hpp`, which the engine calls and `tests/prefill/chunk_dump_parity.cpp`
+(`ctest -L cpu`) grades. Unset - the default - allocates nothing, prints nothing, and the layer loop runs the code
+it ran before the flag existed.
+

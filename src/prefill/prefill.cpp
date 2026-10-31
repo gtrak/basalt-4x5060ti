@@ -33,6 +33,7 @@
 #include "basalt/prefill/moe_part.hpp"   // the partial's widths, which the fold's buffers are allocated from
 #include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/prefill/peer_band.hpp"   // the RAM band's share, which the price and the stream count together
+#include "basalt/prefill/chunk_dump.hpp"   // `--exp chunk_dump`: the per-layer record of which path ran and who served it
 #include "basalt/ggml/ggml.h"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/platform/file.hpp"
@@ -115,6 +116,28 @@ inline int ring_slots(size_t T) {
 }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
+/// One `--exp chunk_dump` line, from the record the layer filled in on its way through the expert walk.  Out of the
+/// layer loop so the two paths (fused, and the MMQ one with its row split) leave through one door and two boots
+/// print one format; what a path never decided stands at the record's own zero, so it reads as nothing rather than
+/// as a number that happened to be zero.  The two words at the end are the fingerprints: `ids` of the routing as
+/// the host read it, `split` of which card each expert's rows went to.
+static void chunk_dump_print(const basalt::prefill::ChunkDump& d) {
+    basalt::log::info("basalt prefill",
+                      "chunk dump p0=%lld T=%lld layer=%lld path=%s ring=%lld/%lld stream_all=%d peer_fp4=%d "
+                      "ram=%lld/%lld canon=%d T_fp4=%lld T_max=%lld planes=%d peer_now=%d acts=%d bf16=%d "
+                      "merge=%d p2p=%d native=%d fused=%d peer=%lld | lead %lld/%lld peer %lld/%lld band %lld "
+                      "cpu %lld/%lld stream %lld holds %lld/%lld band_all %lld | ids=%016llx split=%016llx",
+                      (long long) d.p0, (long long) d.T, (long long) d.layer, d.path, (long long) d.ring,
+                      (long long) d.ring_min, d.stream_all, d.peer_fp4, (long long) d.ram_num,
+                      (long long) d.ram_top, d.band_pin,
+                      (long long) d.T_fp4, (long long) d.T_max, d.fp4_planes, d.peer_now, d.acts_sent,
+                      d.rows_bf16, d.partial_merge, d.p2p, d.native_pack, d.fused_on, (long long) d.peer_dev,
+                      (long long) d.lead, (long long) d.lead_rows, (long long) d.peer, (long long) d.peer_rows,
+                      (long long) d.band, (long long) d.cpu, (long long) d.cpu_rows, (long long) d.streamed,
+                      (long long) d.lead_holds, (long long) d.peer_holds, (long long) d.band_all,
+                      (unsigned long long) d.ids, (unsigned long long) d.split);
+}
 
 // Either cudaMalloc (owned, freed with the object) or a bump allocation from a borrowed region; with no base and
 // no region it only counts, which is how `bytes_needed` sizes the region.
@@ -4392,6 +4415,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const basalt::kernels::cpu::ExpertLayout& lay0 = basalt::kernels::cpu::expert_layout();
         const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
+        // `--exp chunk_dump=1`: one line per layer of this chunk (see `chunk_dump_print`).  Read once per chunk, so
+        // the layers of one chunk all answer to the same setting and the flag cannot split a chunk halfway.
+        const bool chunk_dump = basalt::core::exp_flag("chunk_dump", 0.0) != 0.0;
         // the peer takes the rows of a chunk only up to its buffers' size; a streamed chunk only up
         // to T_fp4, and then on the FP4 kernels (PeerPrefill::T_fp4)
         PeerPrefill* const ppc =
@@ -4669,6 +4695,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             core::progress_at("reading the prompt (batched): layer", l, p0);   // a stall names layer and chunk
             const int64_t tl = l - LB;   // the timing markers are per stage layer
             m.tm.begin_layer(tl);
+            // This layer's `--exp chunk_dump` record, filled by the MoE block as it decides and printed at the
+            // layer's end.  Declared out here because the half loop is what it describes: the MoE block runs in one
+            // half alone, while the line stands for the layer.
+            ChunkDump cd;
+            cd.dump = chunk_dump ? 1 : 0;   // a layer that never reaches the MoE block still prints, path "unset"
+            cd.layer = l; cd.p0 = p0; cd.T = (int64_t) T; cd.K = K; cd.n_expert = m.g->n_expert;
             // Whether the partner reads this layer's blob for one of its experts out of the RAM tier: decided
             // for the whole chunk at its start, before the routing was known.  One test for the split, the
             // peer's group order and the ring walk, so they cannot disagree about who reads a blob.
@@ -5049,6 +5081,37 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     double cpu_ms = 0;
                     std::future<bool> cpu_fut;
                     int64_t rows_cpu = 0, n_cpu = 0, n_stream = 0;
+                    // the gates that picked this layer's path and share, while they are all in scope and none has
+                    // been acted on
+                    cd.ring = m.ring; cd.ring_min = stream_all_min();
+                    cd.stream_all = stream_all ? 1 : 0;
+                    cd.peer_fp4 = peer_fp4 ? 1 : 0;
+                    cd.peer_ram = peer_ram ? 1 : 0;
+                    cd.native_pack = lay.native ? 1 : 0;
+                    cd.fused_on = fused::enabled() ? 1 : 0;
+                    if (ppc != nullptr) {
+                        cd.peer_dev = ppc->dev;
+                        cd.band_pin = ppc->ram_canonical ? 1 : 0;
+                        cd.ram_num = ppc->ram_num; cd.ram_top = ppc->ram_top;
+                        cd.T_fp4 = ppc->T_fp4; cd.T_max = ppc->T_max;
+                        cd.rows_bf16 = ppc->rows_bf16 ? 1 : 0;
+                        cd.partial_merge = ppc->partial_merge ? 1 : 0;
+                        cd.p2p = ppc->p2p ? 1 : 0;
+                    }
+                    cd.path = basalt::prefill::chunk_kernel_name(
+                        basalt::prefill::chunk_kernel(use_mmq, fp4_l, fused_l, fused_nat));
+                    if (chunk_dump) {
+                        // the layer's tier and band membership, which no other line reports per layer: whether the
+                        // two cards hold what the chunk's walk assumed they do.  Cheap host lookups, both tables.
+                        int64_t holds_lead = 0, holds_peer = 0;
+                        for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                            if (m.host_res && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) ++holds_lead;
+                            if (ppc != nullptr && ppc->peer && ppc->peer->has(l, e)) ++holds_peer;
+                        }
+                        cd.lead_holds = holds_lead; cd.peer_holds = holds_peer;
+                        cd.band_all = (int64_t) (pseq_start.empty() ? 0 : pseq_start[(size_t) l + 1] -
+                                                                pseq_start[(size_t) l]);
+                    }
                     if (fused_l) {
                         if (static bool said = false; !said) {
                             said = true;
@@ -5064,6 +5127,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const size_t per = (size_t) std::max(1, m.ring / 3);
                         size_t k = seq_start[(size_t) l];
                         const size_t kend = seq_start[(size_t) l + 1];
+                        if (chunk_dump) {
+                            // the fused path divides nothing: every expert of the layer is computed here, the ones
+                            // the walk left out of the cards' tiers coming through the ring.  The routing stays on
+                            // the card - that is the path's point - so its fingerprint stands at the offset basis.
+                            cd.streamed = (int64_t) (kend - seq_start[(size_t) l]);
+                            cd.lead = m.g->n_expert;
+                            cd.lead_rows = T * K;
+                        }
                         for (int32_t e = 0; e < m.g->n_expert;) {
                             fused::Batch b;
                             b.e0 = e;
@@ -5115,6 +5186,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (fp4_l) {   // once per token: the gate/up product reads a row's token
                             fp4::quantize_tokens(m.mixed, T, N, N, fp.a4x, fp.gsx, m.cs);
                             fp4_planes = true;
+                            cd.fp4_planes = 1;
                             if (peer_fp4) cudaEventRecord(ppc->ev_planes, m.cs);   // the peer's plane copies wait this
                         }
                         // The layer's activations cross to the peer's card as soon as they exist, rather than after
@@ -5181,6 +5253,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             m.tm.pmark(tl, ChunkTiming::kPQuant, ps);
                             cudaSetDevice(prevd);
                             acts_sent = true;   // the peer's products below read what this copy wrote
+                            cd.acts_sent = 1;
                         }
                         // group the (token, k) pairs by expert on the host
                         // (the sync below also orders this layer's writes of slot/src/bounds after the previous
@@ -5346,6 +5419,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         m.tm.experts(T * K, rows_local, rows_peer, order, order_peer, m.cnt,
                                       use_mmq ? (int64_t) lay.blob_bytes(l) : 0, n_ram_peer);
+                        if (chunk_dump) {
+                            // the division as the walk fixed it, and the two fingerprints.  The routing's covers the
+                            // host's copy of the ids, which this path has already read and synced for; the split's
+                            // covers which card each expert went to, over the same id order the walk walked.
+                            cd.lead = (int64_t) order.size(); cd.lead_rows = rows_local;
+                            cd.peer = (int64_t) order_peer.size(); cd.peer_rows = rows_peer;
+                            cd.band = n_ram_peer; cd.cpu = n_cpu; cd.cpu_rows = rows_cpu; cd.streamed = n_stream;
+                            cd.ids = basalt::prefill::chunk_hash_ids(ids_h, T * K);
+                            cd.split = basalt::prefill::chunk_hash_split(
+                                on_peer.empty() ? nullptr : on_peer.data(),
+                                on_cpu.empty() ? nullptr : on_cpu.data(), m.g->n_expert);
+                        }
                         // CPU share: the pool runs the CPU's experts while this thread stages and runs the GPU's; their
                         // unweighted rows land in Dm's row order, so the combine weights them like any other row
                         if (rows_cpu > 0) {
@@ -5427,6 +5512,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         // multi-GPU: the peer's share, enqueued before the primary's own experts so both cards work at once
                         peer_now = use_mmq && !order_peer.empty();
+                        cd.peer_now = peer_now ? 1 : 0;
                         peer_lo = rows_local; peer_n = rows_peer;   // the combine reads them from this block
                         m.tm.mark(tl, ChunkTiming::kPeerEnq, m.cs);
                         // The partner's ring: entry k of `pseq` (this chunk's band experts, in id order like
@@ -6166,6 +6252,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     basalt::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
             }
             m.tm.mark(tl, ChunkTiming::kEnd, m.cs);
+            if (cd.dump) chunk_dump_print(cd);   // `--exp chunk_dump`: what this layer ran on, who served its rows
             m.tm.end_layer(tl);
         }
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts

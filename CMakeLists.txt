@@ -1141,6 +1141,11 @@ if(BUILD_TESTING)
   add_executable(peer_band_parity tests/prefill/peer_band_parity.cpp)
   target_include_directories(peer_band_parity PRIVATE include)
   basalt_cpu_test(NAME peer_band_parity COMMAND peer_band_parity)
+  # what `--exp chunk_dump` prints per layer of a prompt chunk: the kernel the layer ran on and the fingerprints of
+  # its routing and row split, which is how two boots of one build are told apart (basalt/prefill/chunk_dump.hpp)
+  add_executable(chunk_dump_parity tests/prefill/chunk_dump_parity.cpp)
+  target_include_directories(chunk_dump_parity PRIVATE include)
+  basalt_cpu_test(NAME chunk_dump_parity COMMAND chunk_dump_parity)
   # the emitted base of the differential quality gate: the row the emitter writes must decode back, through the
   # untouched llama.cpp reader, to the log-probs of the logits it was given (basalt/program/ppl_gate.hpp)
   add_executable(ppl_emit_parity_test tests/program/ppl_emit_parity_test.cpp)
