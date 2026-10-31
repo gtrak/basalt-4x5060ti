@@ -85,6 +85,49 @@ Layer anatomy (stage A, 153.2 ms): **whole** attention 54.4 on the lead (NOT spl
 see §4 correction) + lead-experts 77.8 + peer-wait 11.0. Stage B inverted (lead 77.1,
 peer 92.2). Leads' PCIe RX ~7.5 GB/s during prefill (tier fill + uploads + returns).
 
+## 2b. THE DECODE CAMPAIGN (kimi #7, the current phase — supersedes §6's topology sequence)
+
+**The owner's redirect**: optimize tp2 decode to the limit ("much faster, or know why we
+can't"), then decide TP=4 with more info. The slice/PP=2 characterization is COMPLETE and
+filed (RUN 25 final: the slice under PP=2 is structurally -8.5% measured three ways — the
+data dependency serializes the partner's arm onto the lead's critical path; unfixable by
+software; the machinery folds into sharding only). The pitch fix (3187f880) restored =2
+correctness; the greedy differential vs gate-off differs only as the FP32 reduce's reordering
+predicts (semantic validity, not bitwise).
+
+**The decode anatomy (measured)**: window 19.4 ms = run 17.3 (GPU-reach wait 13.7, which
+CONTAINS the CPU-pool 8.42 — the doorbell-gated AVX-2 miss-expert compute, not additive) +
+commit 0.3 + draft 1.8. The DRUMBEAT is ~36.5 ms: a ~17 ms GAP between windows (re-launch,
+sampling/draft-row ingest, doorbell arm, orchestration) that the profile line cannot see.
+Solo 78-80 t/s = the drumbeat at dl ~2.9, not the window arithmetic's ~134-150.
+
+**Kimi #7's lever ranking (expected gain)**:
+1. gap-term instrumentation + host slimming: +25-50 t/s solo (target 105-120); near-zero risk
+2. slots 2->4: x2.2-2.8 aggregate; per-slot latency +30-60%; KV budget fits ~4x131k
+3. drafter dl tail: DONE (the reseed is live; the collapse class recovered)
+4. GPU-reach sync (#1c SM-spin->host doorbell, #1a combine batching): ~2-4 ms/window CONCURRENT only
+5. prefill chunk tuning: concurrent decode 45-57 -> 60-70; trades prefill t/s
+6. miss-rate levers: +5-10 indirect
+Truth: the CPU-pool 8.42 is genuine miss-expert compute, NOT protocol; doorbell batching is
+structurally impossible (layer k's pool needs layer k's GPU routing ids).
+
+**THE TP=4 BAR (shelved)**: after levers 1-2, TP=4 must match ~125-135 t/s solo / ~250+
+aggregate at <=20 ms windows. Its decode adds 4-card lockstep coordination, the sharded MoE's
+cross-card combine every layer (~96 rounds/window vs the ~2 ms SM-push budget, zero margin;
+28 ms under tier traffic), and the residency tax on all four tiers. Verdict: the decode-first
+mandate effectively decides against TP=4 on this fabric unless a trigger fires.
+
+**THE MEASUREMENT DISCIPLINE (rules 2/11/12 applied)**: pre-announced bounce windows <=2/day;
+synthetic-only probes on experiment boots; power-limit + dl-histogram on every record (t/s
+comparable only at matched dl); token-identity kill-switch; the serving instance is the
+workers' inference endpoint — restoration priority absolute.
+
+**IN FLIGHT**: experiment zero (the gap term in the decode profile — b4e457e0's unit), then
+the boot that publishes the window-vs-drumbeat split. The owner's decision after levers 1-2:
+workload-value — halved decode latency + ~2,430-2,520 prefill (full sharding, which loses to
+the split's 3,750 on prefill at its own best case) vs doubled decode latency + 3,750, or the
+morph (split for prefill-heavy phases, tp2 for latency-sensitive ones).
+
 ## 3. Architecture: what "tp2" actually is
 
 TP=2/PP=2 in NAME only. Reality: **expert-parallel + pipeline-parallel** — stage A =
