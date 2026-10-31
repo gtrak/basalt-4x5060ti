@@ -2837,6 +2837,24 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(23) **THE FOLDING GATE IS BLOCKED BY A PRE-EXISTING NONDETERMINISM, NOT BY THE FOLD.**
+The band pin works exactly as designed (canonical set: **1,746 / 1,742 band on every
+arm**, the boot line naming the pin) — the (19) confound is GONE. But the self-check arm
+still cannot reproduce itself: **98.3-98.5% top-1** with the pin, and the CONTROL with
+the merge flag OFF, pinned identically, still only reaches **99.05%**. So the
+nondeterminism is in the ENGINE at an 8,192-token chunk, independent of partial-merge:
+same binary, same args (28.81 GiB resident, ring 48, adapt-swaps 0, pinned band) and two
+runs disagree on ~1% of scored positions. That is a floating-point reduction-order or
+scheduling-dependence in the large-chunk prefill path (MMQ/attention), not a fold defect
+and not a placement one.
+CONSEQUENCE: **no differential quality gate can operate at 8,192-token chunks until the
+engine is bit-reproducible there.** The 512-token differential remains valid and PASSES
+(KLD 6.49e-07, top-1 100%) — small chunks are reproducible. THE OWED WORK IS THEREFORE
+REPRIORITISED: (a) find and pin the nondeterminism (candidate: the MMQ group reduction
+order, or a `--benchmark`/tie-break knob in the GEMM path), (b) THEN the folding gate.
+The band pin is banked and correct; it is a necessary instrument that cannot be used
+until (a) lands. THE FLAG STILL SHIPS on the evidence in (18).
+
 (22) **WHY THE REBALANCE DID NOT HELP — AND TWO WRONG ANSWERS I GAVE FIRST, STRUCK.**
 WRONG #1 ("the read follows the expert so the win cancels"): FALSE — each card has its own
 x4 lane to host RAM, and the code says so: the peer reads band blobs "from host RAM over
