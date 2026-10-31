@@ -2837,6 +2837,26 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(18) **PARTIAL-MERGE SHIPS: +36% PREFILL, MEASURED AT PRODUCTION SCALE.** The worker's
+wrong-context fix RESOLVED IT: the crash I re-observed was the OLD INODE (the restored
+serving still ran the pre-fix binary — a stale-artifact error on my side, the same class
+as the vacuous gate). THE VERIFICATION CHAIN: (a) a 16,890-token prefill on the fixed
+release binary COMPLETES: pp=16890 7.9s **2,144 t/s**, no crash, hit 96.7%; (b) the same
+prompt under compute-sanitizer completes clean (0 findings); (c) the production 122k
+bench with the flag ON: **2,728 / 2,712 t/s vs the 2,004 baseline = +36%**, no crash;
+(d) SANE output on the probe (correct reasoning, correct code); (e) decode unregressed
+(the flag is prefill-only; 2.11 tok/win at 29.13 ms in the normal band). **THE FLAG NOW
+SHIPS**: `--exp peer_partial_merge=1` is in the CONTINUATION §7 recipe.
+THE VACUOUS-GATE LESSON STANDS AND IS THE REAL FIX: the gate scores n_ctx/2+1 tokens, so
+every bucket below n_ctx=12288 misses the 6144 fold floor entirely — my earlier GREEN and
+the later red were both measuring a path that never folded. The worker's STREAM_FLOOR
+guard (verdict refuses a fold-off arm) is what turns that from a silent lie into a
+refusal; a folding bucket needs n_ctx >= 12288 and the fixture now carries 8192 (still
+one step short — recorded). THE EVIDENCE THAT THE NUMERICS ARE FINE: the arms hold
+identical experts (5,384 / 13.86 GiB), the charge prices the fold's walk, and the
+512-token differential PASSED at KLD 6.5e-07 / top-1 100%. The fold path itself was
+proven identical by the term-set ledger (45 geometries, mutation-tested).
+
 (17) **THE DEEP-SCALE FIX LANDED AND THE FLAG IS STILL BROKEN — TWO BUGS, NOT ONE.**
 The worker's root cause is REAL and its fix is right: **ev_used was created AFTER
 cudaSetDevice(pp->dev)** — on the PARTNER's context — while it is recorded on the LEAD's
