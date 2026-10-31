@@ -2753,6 +2753,24 @@ wire (50.4 ms at its current share) scales with its rows and cancels the 1.63 us
 row-rate gain. The tp2 prefill is placement-optimal GIVEN the wire; the idle is
 wire-protected, the same class as the slice's dependency-protected idle. The prefill
 levers that remain: full sharding only (whose 4-rank hiding just measured 42.7%).
+(8) **THE GATE RAN — AND CAUGHT A REAL BUG. THE FLAG STAYS DARK.** The quality harness
+(kimi-gated design, 6 commits: --ppl-emit in PplGate, the emitted-base differential, the
+committed pre-tokenized bucketed fixture, tools/quality_gate.py; the instrument floor
+measured 7.33e-05 KLD at the real 248,320 vocab). THE THREE ARMS x 2 BUCKETS: the
+self-check validates perfectly (KLD p99 7.09-7.13e-05 = the floor, top-1 100% — the
+instrument is sound); the PPL delta passes (-0.14% < 0.5%); **the top-1 agreement FAILS:
+94.4% (512-bucket) / 95.7% (1024) vs the >= 99% bound**; dlogp max 1.42-2.36 nats. THE
+FP32 WIRE CONTROL (--peer-rows-fp32, the partial crossing FP32): **top-1 UNCHANGED at
+94.5%** — the divergence is NOT the BF16 rounding; a pure FP32 reassociation cannot flip
+5.5% of argmaxes or move a log-prob 1.67 nats. THE HYPOTHESIS: the fold's group/list
+machinery drops or mis-weights rows under the REAL routing — the class the synthetic
+parity test (clean grouped data) cannot see. THE DEBUG TASK (defined, next worker): a
+real-routing differential — dump the per-token row lists and the per-token sums under
+both paths at one real chunk (the slice hunt's chain/dump machinery applies), find the
+dropped/mis-weighted term, fix, re-gate. THE PREFILL SPEED IS REAL AND BANKED (+34%
+measured at BF16); the flag ships when the gate goes green. The serving: restored
+flag-off, SANE.
+
 (7) **PARTIAL-MERGE: MEASURED +34% — GATED-OWED (the morning's decision)**: boot D ran
 --exp peer_partial_merge=1 (build: 5 commits, diff-reviewed CLEAN — the fold kernel one
 thread per (token,dim), deterministic k-order, the zeroing race caught pre-emptively;
