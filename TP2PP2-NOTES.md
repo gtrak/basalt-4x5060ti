@@ -3450,3 +3450,40 @@ the key unset is unaffected either way.
 `ctest -L cpu` 71/72 (the failure is `expert_multi_test`, this host having no AVX-512 at all, no dependency on any
 file here); `cmake --build build --target prefill` clean; `tools/check_platform_boundary.sh` and
 `tools/check_stderr_logging.sh` ok. No GPU, no boot, no server touched.
+
+## RUN 28 — the band pin lands: `--exp peer_band_pin=N` fixes the share AND the membership (the folding gate's last confound)
+
+**The confound was the band's MEMBERSHIP, not its selection.** `PeerRamShare::taken(k, num)` is `k % kDen < num`,
+but `k` is the expert's RANK among its layer's band members, not its id. `in_ram_band` asked whether the LEAD's
+tier holds the expert and whether its host copy is page-locked, both of which follow the resident fill - so one
+member appearing or disappearing at a low id shifted every rank above it and the whole taken set moved with it.
+That is the 591 against 703 of (19), and pinning `num` alone would not have touched it: the gate's own placement
+check compares the printed `N/8 of M band experts` fact, so a run whose `M` differs stays VOID.
+
+**What the flag does.** `--exp peer_band_pin=N` (0 = off, refused unless a whole number of eighths in 0..8) makes
+one predicate, `in_ram_band(..., pinned)`, answer CANONICALLY for all three counters - `peer_ram_share`,
+`peer_link` and the streamed walk: every expert the PARTNER's tier leaves, whatever either card's fill holds. The
+share is then `N` itself, `take` is `peer_band_take(band, N)` (the count the rank walk actually picks, so the price
+is the price of what runs), and neither veto applies: the heavy-layer veto and `top`'s chunk-length veto are the
+price model's opinions, and the pin overrules them by design. `peer_band.hpp` holds the share's arithmetic; the
+engine's `taken` is a one-line call into it, so `tests/prefill/peer_band_parity.cpp` grades the counters the
+walk uses rather than a transcription (6 checks, `ctest -L cpu`).
+
+**The two sites that were review-only, and why they are the flag.** The streamed walk now tests band membership
+BEFORE the residency skip, so an expert the lead's tier holds is handed over like any other and its tier copy
+idles for the chunk; the row split routes a band expert to the partner whether or not the tier holds it, so the
+rows follow the blob instead of being computed on both cards. Unpinned, `in_ram_band` never names a resident
+expert, so the hoisted test is pure reads and both sites reduce to the code they ran before. A pinned layer also
+stays off the fused experts' path, which walks every expert of the layer and ignores the row split.
+
+**Its numbers are not production's.** That is the ruling's scope condition, and the docs say it in both places
+that could otherwise be quoted: `docs/precision/peer-band-pin.md` and the gate section of
+`moe-partial-merge.md`. A pinned boot grades the fold's ARITHMETIC under a canonical placement; its wall is not a
+throughput figure, a pinned `PASS` is not evidence about production's placement, and the flag never enters the
+serving recipe. Read the eighths to pin from an UNPINNED production boot's own `RAM rows` fact.
+
+**Checks run**: `ctest -L cpu` 72/73 (the failure is `expert_multi_test`, this host having no AVX-512 at all; it
+was failing before this change and touches no file here); `peer_band_parity` 6 checks OK;
+`tools/test_quality_gate.py` OK (45); `cmake --build build` clean, `prefill.cpp` compiling with only the two
+warnings it already had at HEAD; `tools/check_platform_boundary.sh` and `tools/check_stderr_logging.sh` ok. No
+GPU, no boot, no server touched - the walk and the row split are read, not run, until the gate boots.
