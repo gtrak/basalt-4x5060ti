@@ -1130,6 +1130,12 @@ if(BUILD_TESTING)
   add_executable(bf16_bits_test tests/kernels/bf16_bits_test.cpp)
   target_include_directories(bf16_bits_test PRIVATE include)
   basalt_cpu_test(NAME bf16_bits_test COMMAND bf16_bits_test)
+  # the PARTIAL MERGE's reduction order: a partner card's summed partial, joined to the lead's own chain, against
+  # the single-card combine (basalt/prefill/moe_part.hpp, the arithmetic prefill's combine and fold kernels call)
+  add_executable(moe_part_parity tests/kernels/moe_part_parity.cpp)
+  target_include_directories(moe_part_parity PRIVATE include)
+  target_link_libraries(moe_part_parity PRIVATE Threads::Threads)
+  basalt_cpu_test(NAME moe_part_parity COMMAND moe_part_parity)
 endif()
 
 add_library(kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
