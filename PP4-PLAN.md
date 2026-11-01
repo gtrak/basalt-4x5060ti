@@ -352,3 +352,42 @@ Acceptance sets it (67-76% per draft), so the work is on the drafter, not the ke
   against the serial 47.0% - no overlap, because the stage graphs are already
   launched up front and the dependency is in the data, not in the host loop
 - the split cut: swept constant 8,22,34, worth +15% over the even cut and no further
+
+## PIX PEERING MEASURED: 194 GB/s, and it reopens the expert tier
+
+I had concluded the idle cards could not serve as expert RAM, on the strength of the
+`pcie_frac` probe's 7.2 GB/s host-to-device figure. **That was the wrong number.** The
+box has PIX peering, so a peer copy never touches host memory:
+
+| path | bandwidth | 32 MiB takes |
+|---|---|---|
+| **P2P D2D copy (A->B)** | **194.0 GB/s** | **0.173 ms** |
+| host bounce (D2H + H2D) | 3.59 GB/s | 9.34 ms |
+| H2D only (host -> B) | 7.22 GB/s | 4.64 ms |
+
+P2P is **54x the host bounce and 27x H2D**. Against the decode budget:
+
+| fetch | per layer-window (10 experts) | vs the 0.44 ms expert GEMM |
+|---|---|---|
+| **P2P** | **0.136 ms** | 31% - affordable |
+| H2D | 3.66 ms | 8x over |
+| host bounce | 7.35 ms | 17x over |
+
+A remote-GPU expert tier is viable. It was never viable at 7.2 GB/s.
+
+### Why this is the missing piece
+
+The two-stage measurement is the reason it is needed. Cutting to 2 stages halves the
+hand-offs but gives each card 24 layers, and the caches collapse:
+
+| config | expert cache per card | CPU misses | window | t/s |
+|---|---|---|---|---|
+| 4-stage 8/14/12/14 | 2813-3974 slots | low | **26 ms** | **107-111** |
+| 2-stage 24/24 | **1358** + 2276 | **25.6 ms host** | 54 ms | 36-46 |
+
+So stages buy CACHE, not parallelism. A 2-stage split with the other two cards holding
+the experts the two compute cards cannot gives both: two hand-offs AND the capacity,
+with each miss costing 0.136 ms over P2P instead of 0.5 ms through the CPU pool.
+
+**This is the PP2EP2 shape from the tp2 branch, and the numbers that make it work were
+not available then.**
