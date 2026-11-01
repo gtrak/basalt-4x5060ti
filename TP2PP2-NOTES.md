@@ -2837,6 +2837,27 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(32) **THE FOLD IS CHECKED NOW, AND THE NONDETERMINISM DID NOT REPRODUCE — it is
+INTERMITTENT.** Fixed (31)'s ambiguity at the source: `router_dump`'s fill now recomputes
+every block word from the token words it just folded and prints the verdict
+(`fold=1`, or `fold-bad=lg|in|ids|w`), so a reader can no longer take the wrong line -
+96/96 layers report `fold=1` in the runs since, and the parity test pins it. THEN TWO
+FRESH BOOTS WITH `router_dump_all=1`: **no differing block and no differing token across
+all 96 layer-chunks** - i.e. the nondeterminism DID NOT REPRODUCE. It reproduced earlier
+today (the 8192 gate arms: 4.1e-02 mean / 1.14 max nats, and the chunk_dump layer-20 ids
+parting twice). SO THE DEFECT IS INTERMITTENT, not deterministic - which is consistent
+with a RACE and inconsistent with a pure arithmetic-order cause (an order difference under
+identical inputs would reproduce every time). THE HYPOTHESIS THAT NOW FITS BEST: the
+divergence needs a specific timing (a buffer read before a landing, or a stream ordering
+that only loses under load), so it shows on a busy box and hides on a quiet one. THE TESTS
+THAT MATTER NEXT: reproduce it ON PURPOSE by running the two boots UNDER LOAD (a
+concurrent prefill, or the decode serving running beside them) and confirm the fold/token
+diff appears; if load reproduces it and quiet does not, the cause is a race, and the
+existing instrument set (chunk_dump + router_dump with fold checking) will name the layer
+and token in one shot. THE HONEST STATE: an intermittent nondeterminism confirmed, its
+class narrowed to a race, the instrument now self-checking, and the reproduction recipe
+(load) named.
+
 (31) **PROGRESS AND ONE INSTRUMENT INCONSISTENCY — both recorded, neither trusted
 blindly.** `--exp router_dump_all=1,router_dump_p0=0` on two boots, 96 block lines and
 4096 token lines each:
