@@ -286,3 +286,15 @@ The CPU pool and the GPU round a streamed prompt expert differently (see the CPU
 0.07717, top-1 92.86% / 92.82%. The two ends differ by 0.0095 PPL, 0.0005 KLD and 0.04 points of top-1, inside the
 run-to-run size of this gate, so any share between them is bounded by that. `basalt-probe` may print a different share
 as a suggestion ([probe](../probe.md)); it never changes it on its own.
+
+## Prefill regimes (`--prefill-regimes`, A/B flag, off by default)
+
+A prompt's chunk boundaries decide the GEMM tiles it runs, so a different chunking rounds its K/V and its per-chunk
+expert accumulation differently and two chunkings can part company at a greedy near-tie. That is `--prefill`'s own
+effect; the flag only picks the chunk per read from the read's uncached token count (the small chunk below the big
+chunk's size, the big one at or above it) instead of one ceiling for every read. With it off nothing new runs: the
+request path calls `prompt_one_card_chunks` exactly as before, as `tests/program/multi_gpu_plan_test.cpp` checks.
+
+**Open quality note (the A/B has not been run).** With the flag on the small regime re-chunks short uncached reads, so
+the gate applies: `basalt-bench --quality` (PPL/KLD against the Q8_0 reference through the decode path) plus the
+greedy-identity check on a long cached prefix with a small uncached tail, both arms at one power limit, recorded here.
