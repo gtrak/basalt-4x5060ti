@@ -2294,7 +2294,22 @@ static void peer_layout(PeerPrefill& pp, int64_t Tp, int64_t tf, const MmqPlan& 
         }
     }
     if (pp.ram_rows) {   // the RAM band this card reads for itself: one blob slot per ring and span slot
-        pp.ring = PeerPrefill::kRing;
+        // `--exp peer_ring=N` widens the staging ring.  The band re-reads a slot as soon as it frees, so the ring's
+        // depth is what lets the copy engine stay ahead of the peer's compute: 48 slots are ample at the 1/8 share
+        // the price used to strike and starve at 8/8, where hundreds of experts stream per layer through the same
+        // 48 (TP2PP2-NOTES.md (22)).  Each slot is one whole blob, so the depth is a VRAM trade on the PARTNER card;
+        // reading the knob HERE, in the walk that both the tier's pricing and the allocation run, is what keeps the
+        // reserve and the allocation the same size.
+        {
+            const double ring_flag = core::exp_flag("peer_ring", 0.0);
+            const int ring_want = (int) ring_flag;
+            pp.ring = (ring_flag == (double) ring_want && ring_want >= PeerPrefill::kRing && ring_want <= RING_MAX)
+                          ? ring_want
+                          : PeerPrefill::kRing;
+        }
+        // `pp.ring` was set by `peer_layout`, which is the ONE place the `--exp peer_ring` knob is read: the
+        // allocation below and the tier's pricing walk must size the same slots, or a boot prices 48 and allocates
+        // more.
         pp.span = PeerPrefill::kSpan;
         const int slots = pp.ring + pp.span;
         pp.stage.assign((size_t) slots, nullptr);

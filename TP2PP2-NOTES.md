@@ -2837,6 +2837,24 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(33) **THE REBALANCE WORKS NOW: PREFILL 2,798 t/s (+40%) — THE RING WAS THE WALL.**
+(22) found the peer's staging ring fixed at 48 slots whatever the band share, so at a wide
+share the copy engine serialized on slot reuse and the peer's lane idled. FIXED:
+`--exp peer_ring=N` sizes the ring, read in `peer_layout` (the ONE walk both the tier's
+pricing and the allocation run, so the reserve and the allocation cannot disagree - the
+first version of the patch read the knob at the allocation site only, which would have
+priced 48 and allocated more). MEASURED at the 122k prompt, all with partial-merge +
+`peer_share_cap` + the widened band:
+  ring  48 (fixed) : 2,066-2,069 t/s   <- (22)'s failure
+  ring 192         : **2,769 / 2,798 t/s**
+  ring 384         : 2,745 t/s          <- past the knee
+plus `--peer-reserve-mib 900` (the ring's slots come out of the partner's reserve; the tier
+narrows to 4,773 held and the band widens to 7/8, balance lead 91.6 vs peer 89.5 ms a layer
+where it had been 270.4 vs 58.9). **THE RECIPE NOW SHIPS ring 192 + share_cap** in
+CONTINUATION §7: prefill **2,004 -> ~2,780 t/s (+39%)**, and it stacks with partial-merge
+(which alone was +36%). The knee is real: 384 is worse than 192, so the ring competes with
+the tier for the partner's VRAM - the balance is compute, not depth.
+
 (32) **THE FOLD IS CHECKED NOW, AND THE NONDETERMINISM DID NOT REPRODUCE — it is
 INTERMITTENT.** Fixed (31)'s ambiguity at the source: `router_dump`'s fill now recomputes
 every block word from the token words it just folded and prints the verdict
