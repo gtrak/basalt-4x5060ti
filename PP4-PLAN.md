@@ -192,3 +192,39 @@ Priced, not yet taken:
    room to raise it. This trades host RAM for coverage and is the cheapest untested
    knob.
 3. **Two windows in flight** (~1.8x ceiling on tp2pp2, needs `batch <= 0`).
+
+## The auto search's own best is ~9% WORSE than the hand cut (measured, and unexplained by its model)
+
+The exhaustive four-stage search now runs (15,180 cuts through `predict()`), and it
+selects K=12,26,37 - the same cut the greedy heuristic chose, so the model's optimum
+was already being found. Measured, that cut is worse than a hand cut:
+
+| cut | stages | decode t/s | window |
+|---|---|---|---|
+| auto (search's best) | 12/14/11/11 | **93.3 - 97.0** | 31.16 ms |
+| hand | 8/14/12/14 | **105.2 - 111.7** | ~26-28 ms |
+
+So `predict()` does not capture what decides this. The search believes its cut holds
+99.2% of the routed mass; the achieved caches are:
+
+| cut | stage caches held/needed | coverage |
+|---|---|---|
+| auto 12,26,37 | 3896/7168, 4008/5632, 3762/5632 | 54%, 71%, 67% |
+| hand 8,22,34 | 3896/7168, 3974/6144, 3319/7168 | 54%, 65%, 46% |
+
+**The auto cut has BETTER coverage at every stage and still measures worse.** That
+kills the simple "coverage is the lever" reading this page carried earlier: coverage
+is necessary but not sufficient, and the hand cut wins with strictly less of it.
+
+What the two cuts differ in, and what the model does not price:
+- **CUDA0 (12 layers auto vs 8 hand) holds NO expert cache at all** - it carries the
+  main session and KV - so its layers are pure serial latency on the head of the
+  chain, and `predict()` charges it the same `layer_ms` as a cache-carrying stage.
+- Wattage puts the wall at the LAST stage in both cuts (c3 71%/54 W against c0-c2 at
+  37-52%), so the term that binds is the tail of the chain, not the mean.
+
+**Status: the hand cut 8,22,34 is shipped; the search's model is known-incomplete.**
+Fixing `predict()` needs a per-stage cost that reflects serial position and the
+CUDA0-no-cache asymmetry. Not attempted yet - it needs its own measurement to
+validate, and the wrong fix would silently pick worse cuts than the heuristic it
+replaced.
