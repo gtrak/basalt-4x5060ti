@@ -2837,6 +2837,41 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(41) **PIPELINING, PROPERLY PRICED - AND THE DEPTH-2 CHAIN IS ARCHITECTURALLY UNREACHABLE HERE.**
+The owner asked for real pipeline overlap and named the instinct exactly right: a window is a
+chain of GPU-bound phase then host-bound phase, so two windows in flight should overlap one's
+host-bound phase with the other's GPU-bound phase. THE PRIZE IF IT WORKED: today's concurrent
+window has stage 1 = 28.1 ms, stage 2 = 22.5 ms, run = 51.5 ms - perfect depth-2 pairing would
+cost max(28.1, 22.5) = 28.1, i.e. **~1.8x decode (53 -> ~97 t/s)**, far above any flag lever.
+THE MACHINERY ALREADY EXISTS - `Verifier::run_pair` (verify.cpp:4656) launches window A and
+guess-window B on the same card and interleaves `a1->serve_poll` with `b0->serve_poll` in one
+loop, plus `pair_hold_commit/_begin/_finish_first/_finish` in generate.cpp:10985. **It has
+never run: "pipelined windows: 0 launched, 0 held" on every boot.** FOUR GATES, each confirmed
+by instrumenting the actual predicate rather than reading it:
+  1. `pair_hint` needs `full_ema >= 0.70` (kPairFull) - the share of windows accepted WHOLE.
+     At 67-76% per-draft acceptance over T~3.4 that is P(all kept) = **26-39%**. The gate is
+     set above what the hardware reaches, so the chain never arms. (I built `--exp pair_full`
+     to lower it; it did not help, because of gate 4.)
+  2. `pipe_want` (generate.cpp:1539) requires `o.batch <= 0`, and `--parallel 2` sets batch=2 -
+     so the whole pipeline path is excluded from the shipped config by construction.
+  3. `pipe_on` also requires `n_stages == 2`.
+  4. THE DECISIVE ONE: `pair_req` requires `kv_floor == 0`, and printing the predicate live gave
+     `pipe_on 0 ppl 0 relax 0 gguard 0 hist 0 in_slot 0 kv_floor 0` - pipe_on is 0 because of (2).
+AND THE SECOND, HARDER FINDING - I ALSO TRIED INTERLEAVING THE TWO STAGES OF ONE WINDOW
+(`--exp stage_interleave=1`, serving both stages' rings in one loop instead of finishing stage 0
+first) and it was STRUCTURALLY IMPOSSIBLE: the comment at verify.cpp:4114 states it - "a later
+stage's graph waits on the hand-off flag its predecessor's graph raises". Stage 2 is layers
+48-95 and STAGE 1 IS LAYERS 0-47: within a window the second stage DEPENDS on the first.
+Measured run/(s1+s2) = **1.019** with the interleave on, i.e. still serial, as the dependency
+requires. Reverted.
+SO: the 1.8x is real but it belongs to OVERLAPPING TWO DIFFERENT WINDOWS, not to overlapping the
+two stages of one. That only pays if the engine runs 2 tokens-in-flight - which is exactly what
+`pipe_want` excludes (`batch <= 0`). Opening it means re-admitting the solo path with batch
+slots, which is the topology question the owner opened this phase with, not a kernel tweak.
+DECODE IS UNCHANGED AT ~90 t/s (best measured today, acc 76%) and every lever tested this
+session - prefetch, in-place spin, draft margin, stage interleave, pair_full - is NULL or
+STRUCTURALLY BLOCKED, each for a now-known reason.
+
 (40) **[39] IS WRONG - RETRACTED. THE "DOORBELL WAIT" IS THE GPU COMPUTING, NOT A PROTOCOL COST.**
 I claimed the 10.59 ms was PCIe store-visibility latency proving a platform limit. It is not.
 `ms_wait` is `b - a` where `a = fl_.wait_t0` is set when the host STARTS waiting for layer k and
