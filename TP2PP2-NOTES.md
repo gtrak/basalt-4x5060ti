@@ -2837,6 +2837,24 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(35) **WHY 0/2 (leads) LOOK IDLER THAN 1/3 (peers) — and what it says is left.**
+Owner observation, explained: the per-layer line is `attn 51.6 -> router 5.1 ->
+peer-enqueue 2.0 -> lead-experts 2.1 -> peer-wait 47.7 -> merge 1.0` (112.2 ms). The LEAD
+runs attention (51.6) then **waits 47.7 while the PEER computes its expert share**, so
+each card is busy ~half the layer and idle the other half - the peers (1/3) carry the
+longer phase at the 7/8 band, which is why they average higher. THE PAIR IS SERIALIZED,
+not unbalanced: the dependency is lead-attention -> router -> split -> peer-experts ->
+merge, and the split cannot exist before the routing, which cannot exist before
+attention's output. THE ACTIVATIONS do go early (ev_act is recorded at the start of half 1,
+right after up_mix), so the peer's blocker is not the activations - it is the ROW SPLIT.
+THE ONLY REMAINING PREFILL LEVER IS THEREFORE INTER-LAYER SOFTWARE PIPELINING: overlap
+layer l's peer-expert phase with layer l+1's lead-attention, which needs the peer working
+one layer behind the lead and the merge deferred by a layer. That is a real architectural
+change (the buffers, the events and the correctness story all move), not a flag, and its
+payoff would be up to ~40% of the layer wall (the 47.7 ms wait) if it can be built without
+the dependency biting. EVERY CHEAPER PREFILL LEVER IS NOW SPENT: balance (done), ring
+(done), combine form (done), placement (done), slice (closed twice).
+
 (34) **THE ATTENTION SLICE IS CLOSED, TWICE OVER.** With the pair newly balanced the old
 slice idea deserved a retest, and the REAL per-layer line names the true cost (112.2 ms):
 `attn 51.6 + router 5.1 + quant 0.3 + peer-enqueue 2.0 + lead-experts 2.1 + peer-wait 47.7
