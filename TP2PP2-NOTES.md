@@ -2837,6 +2837,24 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(28) **CUBLAS ALGORITHM CHOICE IS NOT THE CAUSE — tried, and it made it worse.** The
+router's logits come from `Gemm::bf16` -> `cublasGemmEx(..., CUBLAS_COMPUTE_32F,
+CUBLAS_GEMM_DEFAULT)`, and cuBLAS is a known nondeterminism vector, so I built
+`--exp cublas_deterministic=1` (which must use `CUBLAS_COMPUTE_32F_PEDANTIC`; 
+`CUBLAS_GEMM_DETERMINISTIC` no longer exists in CUDA 13). RESULT: **the very FIRST layer
+now diverged** (band 31 vs 33, split words different at line 0) where it had agreed for 19
+layers before. So PEDANTIC changes the arithmetic (expected) but the run-to-run variance
+is not cuBLAS's algorithm selection — if anything the pedantic path varies MORE. REVERTED
+(gemm.cu restored, binary rebuilt). WHAT THIS LEAVES: the divergence is upstream of the
+router's selection (which is order-independent by construction — `route_kernel`'s
+explicit `(ob == best && oi < ex)` tie-break, and `router_top10`'s serial ascending sum)
+and not in cuBLAS's algo choice. The remaining candidates, now narrow: **the logits'
+INPUT** (`m.mixed_bf`, produced by the prefill chain earlier in the layer) differing, or a
+genuine race somewhere between the layers that the dump's host-side view cannot see. The
+dump caught where it starts (layer 20's router ids, split still equal) and the instrument
+is banked; the next step needs a device-side probe of the router's logits, not more
+host-side reasoning.
+
 (27) **THE DUMP NAMES IT: THE ROUTER PARTS AT LAYER 20, WITH THE SPLIT AND BAND STILL
 IDENTICAL.** Two identical boots, `--exp chunk_dump=1`, 96 lines each, diffed:
 **layers 0-19 are BIT-IDENTICAL** on every field (path fp4, ids, split, lead/peer rows,
