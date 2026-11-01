@@ -2837,6 +2837,20 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(34) **THE ATTENTION SLICE IS CLOSED, TWICE OVER.** With the pair newly balanced the old
+slice idea deserved a retest, and the REAL per-layer line names the true cost (112.2 ms):
+`attn 51.6 + router 5.1 + quant 0.3 + peer-enqueue 2.0 + lead-experts 2.1 + peer-wait 47.7
++ merge 1.0` - **peer-wait is 43% of the layer**. `--exp tp_prompt_attn=2` (PIPELINED,
+"no such wait") targets exactly that seam, so it was measured at the shipped config:
+**2,180 t/s vs 2,798, peer-wait 47.7 -> 69.5 ms**. RECONFIRMED with the balance closed:
+the pipelined slice loses for the same structural reason run 25 found - the partner's
+attention(l+1) consumes mixed_h(l+1) = the lead's MoE(l) output, so the publish cannot
+precede l's MoE. And the pricing says it would not help even if free: moving 25% of
+attention flips the imbalance (lead 78 / peer 103), because the pair is balanced and the
+slice only moves work onto the already-loaded card. The peer-wait is the serialization
+attention -> router -> split -> peer-experts -> merge, and the lead has nothing to fill it
+with (its own expert share is 2.1 ms).
+
 (33) **THE REBALANCE WORKS NOW: PREFILL 2,798 t/s (+40%) — THE RING WAS THE WALL.**
 (22) found the peer's staging ring fixed at 48 slots whatever the band share, so at a wide
 share the copy engine serialized on slot reuse and the peer's lane idled. FIXED:
