@@ -10187,6 +10187,19 @@ int main(int argc, char** argv) {
             struct TkStep { int n = 0; int32_t id[4] = {}; float p[4] = {}; };
             TkStep tk_prev[16];
             bool tk_valid = false;
+            // --exp draft_hist2=1: the draft head's rank-1 and rank-2 picks at the chain steps that feed the next
+            // window's rows 2 and 3 (step j makes drafts[j], which is window[j + 1]), snapshotted beside the draft
+            // call that made them and consumed once by that window's verdict
+            struct H2Step { int n = 0; int32_t id[2] = {}; float p[2] = {}; };
+            H2Step h2_prev[3];
+            bool h2_valid = false;
+            const bool h2_on = basalt::core::exp_flag("draft_hist2", 0) != 0;
+            auto snap_h2 = [&] {
+                h2_valid = false;
+                if (!h2_on) return;
+                for (int j = 0; j < 3; ++j) h2_prev[j].n = mtp.diag_top(j, 2, h2_prev[j].id, h2_prev[j].p);
+                h2_valid = h2_prev[0].n > 0;   // diag off or the kept logits empty: nothing to score
+            };
             if (tk_log != nullptr) { std::fprintf(tk_log, "R temp=%g S=%d\n", (double) req_temperature, S_mtp); std::fflush(tk_log); }
             while (!cancelled && produced_n < max_new && (!in_slot || solo_req)) {   // (a batch slot's first token comes from the batch window)
                 int T = 1;
@@ -10380,6 +10393,41 @@ int main(int argc, char** argv) {
                                 w += std::snprintf(b + w, sizeof b - (size_t) w, " +%d:%.0f%%", j + 1,
                                                    100.0 * (double) hit[j] / (double) hn);
                             basalt::log::info("basalt draft hist", "%s", b);
+                        }
+                    }
+                }
+                // --exp draft_hist2=1: the 2-wide-tree gate.  Window row i + 1 holds the chain's draft i and is kept
+                // when it equals outv[i]; of the windows whose row 2 (draft 1) missed, how many would the draft
+                // head's rank-2 pick at that step have saved?  Row 3 (draft 2) likewise.  The runner-up costs one
+                // extra verified row a window, so the tree is built only if this share is worth it.
+                {
+                    static const bool hist2_on = basalt::core::exp_flag("draft_hist2", 0) != 0;
+                    static long r2 = 0, m2 = 0, k2 = 0, r3 = 0, m3 = 0, k3 = 0, stale = 0;
+                    if (hist2_on && h2_valid && !from_sfx && !held_run && e0 == 0 && ppl == nullptr && !relax_on &&
+                        gguard == nullptr) {
+                        h2_valid = false;   // one-shot: the snapshot belongs to this window's chain only
+                        if (T >= 3 && a >= 1) {
+                            ++r2;
+                            if (a == 1) {
+                                if (h2_prev[1].n < 2 || h2_prev[1].id[0] != window[2]) ++stale;   // not this draft's logits
+                                else { ++m2; if (h2_prev[1].id[1] == outv[1]) ++k2; }
+                            }
+                        }
+                        if (T >= 4 && a >= 2) {
+                            ++r3;
+                            if (a == 2) {
+                                if (h2_prev[2].n < 2 || h2_prev[2].id[0] != window[3]) ++stale;
+                                else { ++m3; if (h2_prev[2].id[1] == outv[2]) ++k3; }
+                            }
+                        }
+                        if ((m2 + m3) % 50 == 0 && m2 + m3 > 0) {
+                            char b[448];
+                            std::snprintf(b, sizeof b,
+                                          "basalt draft hist2: pos2 reached %ld, primary missed %ld, runner-up hit %ld (%.0f%%); "
+                                          "pos3 reached %ld, primary missed %ld, runner-up hit %ld (%.0f%%); stale %ld",
+                                          r2, m2, k2, m2 > 0 ? 100.0 * (double) k2 / (double) m2 : 0.0,
+                                          r3, m3, k3, m3 > 0 ? 100.0 * (double) k3 / (double) m3 : 0.0, stale);
+                            basalt::log::info("basalt draft hist2", "%s", b);
                         }
                     }
                 }
@@ -10584,6 +10632,7 @@ int main(int argc, char** argv) {
                             }
                             tk_valid = true;
                         }
+                        if (drafted) snap_h2();
                     }
                     if (!after_ran) after_launch();
                     basalt::core::decode_events().stamp(0);
@@ -10669,6 +10718,7 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                snap_h2();
                 if (timed_round && !eos)
                     policy.observe(from_sfx, T, a, sfx_match,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
