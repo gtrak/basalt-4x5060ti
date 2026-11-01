@@ -243,36 +243,42 @@ a serial chain, not free capacity. This also retro-explains why `--parallel 2` b
 both slots into ONE window (S=2): batching is the engine's way of paying the serial
 chain once for two requests, and it beats running them independently.
 
-### W3 - GATE FAILED: acceptance decays too steeply for any draft-depth lever.
+### W3 - the gate was misread once, then measured properly: the draft floor is already tuned
 
-`--exp draft_hist=1` (added) counts, per window, how far the draft chain survived. Over
-1,450 windows on the shipped config (`--spec 8 --suffix-draft 8`):
+**First reading (wrong).** I reported "accepted 1.00" and "acceptance halves at every
+position, so depth is null by construction". Both were errors in my own instrument and
+my reading of it:
 
-```
-offered 1.92 drafts/window, accepted 1.00
+- the "accepted" figure printed `hit[0]/hn`, which is 100% by construction - the real
+  number is the sum of the conditional rates: **1.35 drafts accepted of 1.92 offered =
+  70%**, which matches the engine's own `acc=73-76%`;
+- the per-position figures were CUMULATIVE survival. Conditional acceptance is nearly
+  FLAT: **1->2 66%, 2->3 53%, 3->4 49%, 4->5 53%, 5->6 56%, 6->7 40%, 7->8 50%.**
+  Depth does keep paying, so "depth is dead" was backwards.
 
-chain reached:  +1 100%   +2 66%   +3 35%   +4 17%   +5 9%   +6 5%   +7 2%   +8 1%   +9 0%
-```
+**What actually limits the chain** is not the drafter's ability but the confidence
+floor `draft_keep(dprob, T-1, cum_adapt.th())` at generate.cpp:10188, from
+`DraftCumAdapt` (kDraftCumBase0 = 0.35, **scaled up by the RAM-served expert bytes** -
+a penalty designed for the tier architecture, which on a layer split has no cost behind
+it because the experts are VRAM-resident).
 
-The chain HALVES at each position. Only 17% of windows reach position 4 and 9% reach 5,
-so:
+**Measured both directions** with a new `--exp draft_cum_base=X`:
 
-- **deeper MTP chains are null by construction** - nothing survives to position 8
-- **more draft tokens per window are null** - position 4 already filters 83% of windows
-- **a larger `--spec` is null** - the chain never consumes the extra depth
+| base | offered | acceptance | decode t/s (all samples) | mean |
+|---|---|---|---|---|
+| 0.35 (default) | 1.92 | 73-76% | 107.7, 111.0, 108.5, 110.2, 105.5, 105.2, 111.7, 106.1 | **108.2** |
+| 0.20 | 2.36 | 66-70% | 109.7, 106.1, 107.3 | 107.7 |
+| **0.50** | - | 75-79% | 110.8, 110.5, 110.0, 110.0, 111.0, 106.7, 105.0 | **109.1** |
 
-This is exactly the gate W3 was meant to be: it costs one boot and it prevents a whole
-class of builds. It also reframes the drafter's cost - we PAY 2.29 ms to draft 1.92
-tokens and keep 1.00. The drafter is barely better than guessing one token.
+Lowering the floor does lengthen the chain (1.92 -> 2.36 offered) and acceptance falls
+exactly as far, so t/s is unchanged. Raising it is very slightly better on the mean but
+well inside the noise band. **The controller is already at its optimum**, which is a
+real result: the adaptive threshold was tuned correctly, and no draft-floor setting is
+worth shipping.
 
-The only drafter lever that survives is QUALITY AT POSITIONS 1-2, where 100% and 66% of
-the mass is. Anything that improves the first two predictions is worth measuring;
-anything that adds depth is not.
-
-What might improve positions 1-2, none of it yet tested: a tree/beam at depth 2 (two
-candidates for position 2 rather than one), the suffix drafter taking the window when
-its match is long (the policy already trades this on `margin`), or a better MTP chain
-temperature/reseed. Measure each against position-2 acceptance specifically.
+The one thing this leaves alive: **quality at positions 1-2** (66% and 53% conditional),
+which a tree/beam at depth 2 would attack - that is not a threshold, it is a different
+draft.
 
 ### W4 - Replace `predict()`'s objective. Gate: it must rank the measured cuts.
 

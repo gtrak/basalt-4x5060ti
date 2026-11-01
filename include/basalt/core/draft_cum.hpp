@@ -45,7 +45,13 @@ inline float draft_cum_scale() {
     const float t = (draft_cum_cpu_mb() - kLoMb) / (kHiMb - kLoMb);
     return 1.0f + (kMax - 1.0f) * (t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t);
 }
-inline float draft_cum_base() { return kDraftCumBase0 * draft_cum_scale(); }
+/// An explicit base for the draft chain's confidence floor (0: use the scaled default).  Set once at boot from
+/// `--exp draft_cum_base`.
+inline float& draft_cum_base_override() { static float v = 0.0f; return v; }
+inline float draft_cum_base() {
+    const float o = draft_cum_base_override();
+    return o > 0.0f ? o : kDraftCumBase0 * draft_cum_scale();
+}
 
 /// Per-request threshold.  The threshold falls from the base toward kLo as the
 /// request's drafts are accepted more often than the bin table predicts: when they run well, longer windows pay.  The

@@ -4951,6 +4951,13 @@ int main(int argc, char** argv) {
         const double total = (double) (b_vram + b_peer + b_ram + b_top + b_file);
         if (total <= 0.0) return;
         basalt::core::draft_cum_cpu_mb() = (float) ((double) (b_ram + b_top) / (double) (g.n_layers * g.n_expert) / 1e6);
+        // `--exp draft_cum_base=X`: the draft chain's confidence floor (default 0.35, scaled up by the RAM-served
+        // expert bytes).  The scale exists because an extra verified token costs the CPU tier more RAM reads - but
+        // when the experts are VRAM-RESIDENT (a layer split: pcie 0.0%) nothing is RAM-served per token and the
+        // scale is a penalty with no cost behind it.  It shows: the chain stops at ~1.9 drafts/window while
+        // conditional acceptance holds at 50-66% all the way to position 8, i.e. the floor is cutting it short.
+        if (const double ov = basalt::core::exp_flag("draft_cum_base", 0.0); ov > 0.0)
+            basalt::core::draft_cum_base_override() = (float) ov;
         constexpr double kGiB = 1073741824.0;
         auto pct = [&](uint64_t b) { return 100.0 * (double) b / total; };
         // RAM is the loaded copy (the bytes the loader reports); the top-up added after the load is shown beside it
