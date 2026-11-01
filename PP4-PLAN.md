@@ -353,41 +353,39 @@ Acceptance sets it (67-76% per draft), so the work is on the drafter, not the ke
   launched up front and the dependency is in the data, not in the host loop
 - the split cut: swept constant 8,22,34, worth +15% over the even cut and no further
 
-## PIX PEERING MEASURED: 194 GB/s, and it reopens the expert tier
+## P2P PEERING: 7.14 GB/s, and the fetch tier is dead (an earlier claim of 194 was my bug)
 
-I had concluded the idle cards could not serve as expert RAM, on the strength of the
-`pcie_frac` probe's 7.2 GB/s host-to-device figure. **That was the wrong number.** The
-box has PIX peering, so a peer copy never touches host memory:
+Two measurements were wrong before this one; recording both, because the second was
+published before it was caught.
 
-| path | bandwidth | 32 MiB takes |
+**Wrong #1:** a 32 MiB buffer for a bandwidth test. The card's L2 is 32 MiB, so the copy
+was cache-resident and reported 194 GB/s.
+
+**Wrong #2:** the retry used 1 GiB and still reported 192 GB/s, with the payload verified
+at head and tail. The bug was the allocation: `cudaSetDevice(a)` was current when BOTH
+buffers were allocated, so `db` lived on device A too and the "peer copy" was a
+same-device copy - local HBM, not PCIe.
+
+**Correct**, buffers on their own devices (`cudaPointerGetAttributes` confirms device 0
+and device 1), 256 MiB:
+
+| path | streaming | 2.64 MiB (one expert blob) |
 |---|---|---|
-| **P2P D2D copy (A->B)** | **194.0 GB/s** | **0.173 ms** |
-| host bounce (D2H + H2D) | 3.59 GB/s | 9.34 ms |
-| H2D only (host -> B) | 7.22 GB/s | 4.64 ms |
+| P2P D2D (A->B) | **7.14 GB/s** | **387 us** |
+| host bounce (D2H+H2D) | 3.59 GB/s | 781 us |
+| H2D only | 7.22 GB/s | 390 us |
 
-P2P is **54x the host bounce and 27x H2D**. Against the decode budget:
+**P2P is 7.14 GB/s - the PCIe 4.0 x4 rate, the same as H2D.** Its only advantage is
+skipping the second hop (2x the bounce's latency). There is no bandwidth headroom.
 
-| fetch | per layer-window (10 experts) | vs the 0.44 ms expert GEMM |
-|---|---|---|
-| **P2P** | **0.136 ms** | 31% - affordable |
-| H2D | 3.66 ms | 8x over |
-| host bounce | 7.35 ms | 17x over |
+### The budget, which settles it
 
-A remote-GPU expert tier is viable. It was never viable at 7.2 GB/s.
+The expert GEMM is 0.44 ms per layer. One fetched expert costs **0.387 ms over P2P =
+88% of the whole layer budget, for 1 of 10 experts**. And streaming a layer's 10 experts
+(26 MB) at 7.14 GB/s is 3.7 ms, 8x the budget; 1.24 GB per token at a 9 ms token time
+needs 138 GB/s, which the link does not have by 20x.
 
-### Why this is the missing piece
+**A fetch-based expert tier cannot work for decode on this fabric.** The latency point
+is the right one: only a RESIDENT expert has zero fetch latency, which is exactly why
+more stages win - they buy cache slots (3974 vs 1358), not parallelism.
 
-The two-stage measurement is the reason it is needed. Cutting to 2 stages halves the
-hand-offs but gives each card 24 layers, and the caches collapse:
-
-| config | expert cache per card | CPU misses | window | t/s |
-|---|---|---|---|---|
-| 4-stage 8/14/12/14 | 2813-3974 slots | low | **26 ms** | **107-111** |
-| 2-stage 24/24 | **1358** + 2276 | **25.6 ms host** | 54 ms | 36-46 |
-
-So stages buy CACHE, not parallelism. A 2-stage split with the other two cards holding
-the experts the two compute cards cannot gives both: two hand-offs AND the capacity,
-with each miss costing 0.136 ms over P2P instead of 0.5 ms through the CPU pool.
-
-**This is the PP2EP2 shape from the tp2 branch, and the numbers that make it work were
-not available then.**
