@@ -1229,6 +1229,12 @@ target_link_libraries(native_expert_parity PRIVATE kernels kernels_cpu artifact 
 add_executable(native_expert_bench tests/kernels/native_expert_bench.cpp)
 target_include_directories(native_expert_bench PRIVATE ${_gpu_include_directories})
 target_link_libraries(native_expert_bench PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})
+# Is the grouped expert GEMM bound by per-group SETUP or per-entry MATH?  Holds total entries
+# constant and varies the group count and M, which decides whether a persistent grouped kernel
+# has anything to win at the decode geometry.  A microbench, not a test: it prints.
+add_executable(grouped_setup_bench tests/kernels/grouped_setup_bench.cu)
+target_include_directories(grouped_setup_bench PRIVATE ${_gpu_include_directories})
+target_link_libraries(grouped_setup_bench PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})
 # DEC_MOE's kernels on real GGUF experts, bitwise vs the path they replace (--bench: timings)
 add_executable(dec_moe_parity tests/kernels/dec_moe_parity.cpp)
 target_include_directories(dec_moe_parity PRIVATE ${_gpu_include_directories})
