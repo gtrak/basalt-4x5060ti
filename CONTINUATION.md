@@ -68,6 +68,36 @@ Facts, measured numbers, decisions, and the gated roadmap. Interpretations are l
 - Hard constraints: never modify swap; KV fixed at 2 slots x 262144; minimal fork diff;
   flags over engine code; the production split tree `/home/gary/opt/basalt` untouched.
 
+## 2b. PP4 MEASURED ON TONIGHT'S BINARY (the branch had never taken one)
+
+Every decode-anatomy measurement in TP2PP2-NOTES.md was taken on tp2pp2. PP4 was quoted from
+the production tree's older record (3,750-3,868 prefill / 35.4-39.8 ms window). Re-measured on
+the tp2pp2 branch binary with `BASALT_FORCE_SPLIT=1` (**an env var, NOT a flag** - there is no
+`--layer-split` argument; `basalt-ctl` exports it), `--prefill 12288`, forced on over the price
+model's "expert tier" pick:
+
+| | PP4 (measured tonight) | tp2pp2 (shipped) |
+|---|---|---|
+| prefill, 122,288 fresh | **4,232 t/s** (28.9 s) | 2,780 t/s |
+| prefill, 62,186 fresh | 3,545 t/s | - |
+| decode | **87.2 - 94.7 t/s** (acc 71-74%) | ~90 t/s |
+| decode window | **27.5 - 28.5 ms** | 30.1 ms |
+| GPU-reach wait | **5.63 - 5.93 ms** | 10.59 ms |
+| per-layer host | 1.38 - 1.58 ms | 2.83 ms |
+| **expert PCIe** | **0.0%** (48.9 GiB resident) | 55.8% routed |
+| expert cache hit | 96 - 97% | 90% |
+| CPU experts | 0.86 ms (1.0-1.16 entries) | 1.24 ms |
+
+PP4 WINS BOTH AXES on today's binary. The record's 3,750-3,868 was conservative - the branch's
+accumulated fixes carry to the split path too. The `GPU-reach wait` is nearly HALF tp2pp2's, and
+that is the architecture: PP4 has no peer handshake and zero expert wire in decode.
+
+PER-CARD UTILIZATION UNDER DECODE (nvidia-smi sampled over a full stream): card0 35.4% / 47.8 W,
+card1 41.9% / 40.3 W, card2 53.3% / 45.2 W, **card3 72.2% / 58.0 W**. Strictly rising down the
+pipeline: the last stage owns the lm_head/final norm (and the sampler), so it is the busiest, and
+every earlier stage waits on its successor's hand-off. At 27.5 ms/window with 4 stages the duty
+cycle is uneven - cards 0-2 finish their 24 layers and idle while stage 3 pays the head.
+
 ## 2. Measured state (this box, tonight)
 
 | config | prefill (122,300 tok fresh) | decode |
