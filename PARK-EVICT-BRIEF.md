@@ -39,8 +39,17 @@ living in VRAM and be written **only when `make_room` actually evicts it**.
 
 Gate before building: **instrument the write volume per conversation switch and per
 eviction.** The number that decides this is bytes written per request, before and after.
-If today's writes are already small (because prefixes mostly hit), the change is not worth
-its risk and you should report that and stop.
+
+Measured context for the gate (so you are not guessing):
+- **prefix reuse works**: a live agentic session reused **145,855 of 147,135** tokens. So
+  conversations DO stay hot, which is what makes "never rewrite a resident conversation"
+  worth anything.
+- a session image at 262144 fp16 is **6.0 GiB** (3.09 GiB int8). Writing that on every
+  handoff is the cost this change removes.
+- the current serving config is `--parallel 1 --kv fp16`, so there is ONE slot and a
+  handoff happens on every new request that is not the live conversation.
+
+If today's writes are already small, report that and stop rather than build.
 
 ## Change 2: queue instead of decline
 
