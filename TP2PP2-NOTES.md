@@ -2837,6 +2837,29 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(38) **DECODE: TWO LEVERS TRIED, BOTH NULL — and what that proves about the wait.**
+(37) named the doorbell wait (10.59 ms of a 30.11 ms window) and hypothesised it was cold expert
+data. TESTED AND REFUTED: extended `CpuWarm` so the warm job faults in EVERY expert the
+predicted routing gives the CPU tier (it warmed exactly one blob before), on the theory that
+a page fault per miss was the wait. RESULT: wait 10.57/10.98/11.28 ms across three windows
+against a 10.59 baseline - WITHIN NOISE, reverted. The reason, visible afterwards:
+`resident_blob` returns blobs that are ALREADY RAM-resident, so there was no fault to save.
+So the wait is NOT data availability. THE PROTOCOL, MEASURED BY READING BOTH SIDES: the GPU
+spins on `*flag` (`wait_flag_ge_kernel`, 100 ns `__nanosleep` polls), the host spins on
+`*seq` (`verify.cpp:4278`), and `ms_wait` spans GPU-rings -> host-wakes -> pool-computes ->
+host-publishes -> GPU-proceeds. The cadence bench measured 42 us for a bare small-payload
+round trip at 4 ranks; the real cycle is 221 us a layer, so ~180 us of it is the CPU pool's
+compute and the publish, not the wire. THAT IS WHY PREFETCH COULD NOT HELP: the data was
+never the cost. THE ONE REMAINING LEVER is the one already named in (37) - move the CPU
+expert COMPUTE into the warm pool so a layer's misses are finished while the GPU runs the
+previous layer - and it needs the lockstep loop (`if (*seq < want) return 0;`) restructured
+into a one-layer-deep pipeline. That is the hottest code in the engine (the doorbell, the
+ring protocol, the peer window) and it is a real project, not a flag. NOT STARTED: it should
+not be attempted without an owner decision, because a mistake there breaks every decode
+window rather than one measurement.
+DECODE STANDS AT: 30.11 ms/window, 2.74 tok/window, **91 t/s** - prefill has moved +39%
+today, decode has not moved, and its anatomy is now fully priced.
+
 (37) **DECODE: THE DOORBELL WAIT IS 35% OF THE WINDOW — the anatomy, measured.** Current
 decode (30.11 ms/window, 2.74 tok/window = **91 t/s**):
   GPU compute (real work)        11.78 ms  39%
