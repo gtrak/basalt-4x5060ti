@@ -2837,6 +2837,27 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(39) **DECODE: THE WAIT IS PCIe STORE-VISIBILITY LATENCY — three nulls, and why.**
+Third lever tried: the host returned out of `serve_poll` every 1024 polls and the caller re-entered,
+paying the whole prologue (an `OnDevice` device query, the geometry, the session, `T`) for one
+`_mm_pause`. Rewrote it to spin in place for a bounded stretch (`--exp poll_spins`, old
+behaviour kept reachable for the A/B). RESULT: wait 10.94/11.05 ms against a 10.59 baseline -
+NO CHANGE, reverted. So the re-entry was not the cost either.
+THE THREE NULLS TOGETHER ARE THE ANSWER, and they agree: (1) prefetching every predicted CPU
+expert changed nothing, because the blobs are already RAM-resident - NOT data; (2) the CPU pool's
+compute is OUTSIDE `ms_wait` (`b` is taken before `pool(...)` runs) - NOT the pool; (3) in-place
+spinning changed nothing - NOT host scheduling. What is left is the one thing all three share:
+`ms_wait` = the interval from the GPU's store to the host's observation of it. The GPU publishes
+`((volatile int32_t*) out)[j] = tok` under `__threadfence_system()`; the host polls mapped host
+memory. **221 us a layer is what a system-scope store takes to become visible to a host poll on
+this platform**, and it is paid 48 times a window = 10.6 ms of a 30.1 ms window.
+CAN IT BE AVOIDED? Only by not needing the round trip per layer: either the host stops being the
+CPU tier's only executor (a device-side or peer-card CPU share), or the ring is made several
+layers deep so the host services k+2 while the GPU runs k (the pipelining project named in (37),
+which the nulls above now say is about ROUND TRIPS, not about work). **DECODE STANDS AT 91 t/s
+(30.11 ms/window: 11.78 compute + 10.59 doorbell + 2.83 host + 2.48 draft) and the doorbell is
+a platform latency, not a defect.**
+
 (38) **DECODE: TWO LEVERS TRIED, BOTH NULL — and what that proves about the wait.**
 (37) named the doorbell wait (10.59 ms of a 30.11 ms window) and hypothesised it was cold expert
 data. TESTED AND REFUTED: extended `CpuWarm` so the warm job faults in EVERY expert the
