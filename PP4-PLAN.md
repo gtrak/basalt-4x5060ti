@@ -76,3 +76,56 @@ card0 35.4% / 47.8 W, card1 41.9% / 40.3 W, card2 53.3% / 45.2 W, card3 72.2% / 
 
 Rising monotonically: each stage waits on its successor, and stage 3 carries the
 output head on top of its own 12 layers. This is the shape to attack.
+
+## The split cut: what moves decode (measured)
+
+The first lever, and the biggest one found so far. The cut points were reachable
+from nothing - the search always cut evenly - so the last stage carried its layers
+plus the output head while every earlier stage waited on it.
+
+**Decode t/s by cut (same prompt, same binary; two runs each):**
+
+| cut | stages | t/s | per-card util / watt |
+|---|---|---|---|
+| 12,24,36 (even) | 12/12/12/12 | 92.5 | 35/42/53/72% - 48/40/45/58 W |
+| 8,20,36 | 8/12/16/12 | 97.1 / 100.5 | - |
+| 8,20,40 | 8/12/20/8 | 77.1 / 80.5 | c2 73%/56 W saturated |
+| **8,22,34** | **8/14/12/14** | **111.7 / 106.1, then 105.6 / 105.2** | 22/39/57/87% - 50/51/54/71 W |
+| 8,20,32 | 8/12/12/16 | 109.2 / 104.8 | c3 88%/73 W |
+| 6,20,34 | 6/14/14/14 | 102.1 / 96.8 | - |
+| 8,24,34 | 8/16/10/14 | 99.3 / 93.6 | - |
+| 8,18,34 | 8/10/16/14 | 100.6 / 96.4 | - |
+
+**8,22,34 is the shipped cut: ~+15% decode over the even cut.**
+
+### Why it works: expert cache coverage, not layer count
+
+The driver is not how many layers a card runs but how many experts it can hold.
+A stage's cache is what is left of its VRAM after its dense weights, so MORE
+layers means FEWER experts resident, and a missed expert streams from RAM.
+
+| cut | card | layers | cache slots / needed | coverage |
+|---|---|---|---|---|
+| 8,20,36 | CUDA2 | 16 | 3485 / 8192 | **43%** |
+| 8,20,40 | CUDA2 | 20 | 2998 / 10240 | **29%** |
+| 8,22,34 | CUDA1 | 14 | 3896 / 7168 | 54% |
+| 8,22,34 | CUDA2 | 12 | 3974 / 6144 | **65%** |
+| 8,22,34 | CUDA3 | 14 | 3319 / 7168 | 46% |
+
+CUDA2 at 43% coverage measured 97-101 t/s; at 29% it collapsed to 77-80; at 65%
+it reached 106-112. **Coverage is the lever, and it is bought by taking layers
+AWAY from a card, not giving it more.**
+
+### Wattage as the compute proxy
+
+An idle stage waits on its successor and draws ~42 W; a working one 52-73 W. At
+the shipped cut the four cards draw 50/51/54/71 W - no card pinned at idle and
+none saturated. The bad cuts show the signature plainly: 8,20,40 put c2 at
+73%/56 W (saturated) while c0 sat at 17%/42 W (waiting).
+
+### The instrument that does not reach this path
+
+`--exp decode_profile=1` emits its per-stage line only in the single-slot solo
+window (`if (stages.size() > 0)` inside the `S == 1` branch). A `--parallel 2`
+boot never takes that path, so on PP4 the per-stage phases are not available from
+it; `basalt decode timing` (the aggregate) and the per-card wattage are.

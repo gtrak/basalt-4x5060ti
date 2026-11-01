@@ -63,7 +63,7 @@ basalt_args() {
     # earlier stage waits on it: measured at 8/12/16/12 the decode window runs
     # 97-100 t/s against 92.5 for 12/12/12/12, and the stage cards' wattage goes
     # 42/43/52/53 W rather than 35/42/53/72% of SM.
-    ARGS+=(--layer-split "${BASALT_LAYER_SPLIT:-8,20,36}")
+    ARGS+=(--layer-split "${BASALT_LAYER_SPLIT:-8,22,34}")
     ARGS+=(--prefill "${BASALT_PREFILL:-12288}")
     # Pinned RAM copy of the pin's plan: the experts no GPU holds PLUS the
     # stage cards' lent slots (the prompt path borrows 1342 slots per card at
