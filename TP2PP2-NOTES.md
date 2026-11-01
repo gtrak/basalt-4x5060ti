@@ -2837,6 +2837,23 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(30) **ANSWERED: THE ROUTER'S *INPUT* DIFFERS — the selection is innocent.** With
+`--exp router_dump=20,router_dump_p0=0` on two boots (same binary/args, both instruments
+on): the router's INPUT fingerprint is `in=9dbf75581117ed6c` vs `c1f1108176b7868d`, its
+logits differ, its ids differ - while **`sel 4096 differ -1` on BOTH**, i.e. the in-boot
+replay of the top-K over the logits agrees on all 4,096 tokens. So the determinism the
+kernel was built for holds; what moves underneath it is `m.mixed_bf`, the router's input.
+`chunk_dump` on the same pair agrees: layer 20 `ids` differ with `split` IDENTICAL
+(`f61ac2e036d8ce5d` both). THE ORIGIN IS UPSTREAM OF LAYER 20's ROUTER: layer 20's input
+is layer 19's output, so the true first divergence is earlier than the first place the
+routing can show it (a routing change needs a logit to cross a top-K boundary; the
+activations can part many layers before any argmax moves). NEXT INSTRUMENT USE:
+`--exp router_dump_all=1` (every layer of the chunk) on two boots - diff `in=` per layer
+and the FIRST layer whose input differs is the true origin, which the per-token
+`router tok ... in=<hash>` lines then name down to the token. THE INSTRUMENTS ARE BOTH
+BANKED AND PROVEN: `chunk_dump` (routing + split) and `router_dump` (input + logits +
+selection replay, with `bad=` counting non-finite logits and `gap=` the K/K+1 boundary).
+
 (29) **THE SEAM IS NARROWED, AND THE HUNT IS HANDED OFF.** Additional reading after (28),
 each checked and CLEARED or left open with the reason:
 - CLEARED: the routing-ahead guess path (`ahead_n` requires `!stream_all`, prefill.cpp:4633;
