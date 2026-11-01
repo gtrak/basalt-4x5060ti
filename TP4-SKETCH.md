@@ -73,6 +73,38 @@ reserve, the pair protocol generalized). The tier model re-walks with:
   rates re-measured at 4-way contention — the lead/peer asymmetry likely compresses
   as every card's SMs are equally busy).
 
+## 4b. THE DECODE GATE MEASURED (this session) - PASSED CLEAN, KILLED BY THE STRAGGLER
+
+The ledger above priced decode as "a wash, residency-bound", written when the 10.59 ms window term
+was believed to be wire. It is not: it is the GPU COMPUTING the layer, seen from the host end. That
+re-opened the decode half, so the cadence bench's decode mode was run at 4 ranks (all four cards
+free, serving down, parity PASS at 2.4e-07).
+
+  clean, SM push, cover 1.0 ms/round:  96 units, wire 5.01 ms TOTAL (0.052/round), HIDDEN 100.0%,
+                                       straggler spread 0.000, cadence inflation 1.00x
+  clean, copy-engine push:             HIDDEN 100.0%, spread 0.000, inflation 1.00x  (both engines agree)
+  clean at cover 0.5 / 0.25 ms:        HIDDEN 84.7% / 87.3%, spread <=0.001, inflation 1.00x
+  bandwidth floor (model):             0.006 ms/round, 0.57 ms/window against a 19.4 ms budget
+
+So THE DECODE WIRE IS EFFECTIVELY FREE AT 4 RANKS - 0.05 ms/round of a ~1 ms round, 2% of a window,
+landing far inside the budget. Gate (b) passes on the clean arm, and the natural design (generalize
+`kDmMaxX = 2` to 3 peers, zero collectives) is not wire-limited.
+
+AND THEN THE KILL: one card sustained 5 ms slow costs ALL FOUR 6.23 ms/round against 0.99 - every
+rank pays the max, fully exposed, 6.3x inflation. The knee is brutal and it is per ROUND, not per
+window:
+  jitter 0.05 ms/card:  hidden 30.7%,  all-4 at 1.035 ms/round (3.45 ms/window exposed)
+  jitter 0.20 ms/card:  hidden -301%,  all-4 at 1.207 ms/round (+19.6 ms/window)
+  jitter 1.00 ms/card:  hidden -999%,  all-4 at 2.040 ms/round (+100 ms/window)
+  jitter 5.00 ms/card:  hidden -999%,  all-4 at 6.227 ms/round (+508 ms/window)
+At the ~0.14 toll identified in the profile (+2.2 us/layer/rank => +0.21 ms/round), TP=4 decode still
+fits at ~0.55-0.65 ms/round = ~105 t/s, a WASH with tp2's ~105 ceiling. A 1 ms straggler takes it to
+~47 t/s. THE COUPLING IS PER-ROUND because each of the 96 rounds per window is its own rendezvous -
+cross-card jitter that tp2 absorbs in a serialized pair becomes a hard barrier cost at 4.
+
+**Gate (b): PASSED on wire, FAILED on straggler sensitivity for any jitter above ~0.05 ms/card.**
+The decode half does not rescue TP=4: best case a wash, realistic case worse.
+
 ## 5. The decision rule (mine, the morning)
 
 Build TP=4 iff ALL of: (a) the bench's partial-merge hidden fraction ≥ ~70% at
