@@ -98,3 +98,44 @@ is being examined, and hide what it was built to find. The classification and th
 (`ctest -L cpu`) grades. Unset - the default - allocates nothing, prints nothing, and the layer loop runs the code
 it ran before the flag existed.
 
+## When the router is the parting: `--exp router_dump=N`
+
+`chunk_dump` says WHICH LAYER parted. When that layer is the router's own decision, it cannot say on WHAT: the
+`ids` word is a fingerprint of the routing, so three different facts all print as one changed word - the
+projection's logits differed, the logits matched while the selection did not, or the token's own top-K boundary was
+a tie that the tie-break alone decided. Those bytes never leave the card, so answering needs a probe that does the
+one thing the dump above refuses to do: read the device.
+
+`--exp router_dump=N` copies four blocks of one model layer of one prompt chunk to the host - the BF16 activations
+the layer's router projection read (`in`), the FP32 logits it produced (`lg`), the expert ids it chose (`ids`) and
+their weights (`w`) - and prints one summary line of whole-block fingerprints plus one line per token. The copies
+are queued on the compute stream behind the router and read back at the sync the streamed walk already makes for
+the routing, so the probe adds no rendezvous of its own; they are issued ahead of the routing guess, which
+overwrites the same logits buffer with the NEXT layer's router, so what comes back is what this layer's `route`
+read and wrote. The probe then replays the top-K over the read-back logits with the kernel's own rule (descending
+logit, lower id on a tie) and reports the K/K+1 boundary:
+
+| field | what it settles |
+|---|---|
+| `lg=` differs between boots | the logits differed, so the projection or its input moved - check `in=` next |
+| `lg=` same, `in=` differs | the router's INPUT had already parted upstream of the projection |
+| `lg=` and `in=` both same, `ids=` differs | one set of numbers gave two routings: the selection, not the arithmetic |
+| `ties>0`, or `gap=` at its tightest | a token whose K-th and (K+1)-th largest logits are the SAME float: which expert holds the seat is decided by the tie-break and nothing else |
+| `disagree=` | the first token whose ids differ from this record's own replay of the selection - a disagreement **in one boot**, with no second boot to compare against |
+
+`disagree` is a lead and not a verdict: the kernel ranks the softmax probabilities and the replay ranks the logits,
+and `expf` is monotone without being strictly monotone in FP32, so two logits a few bits apart can give one
+probability and a genuine tie the replay cannot see. That is the boundary shape the field exists to notice.
+
+Three keys, because the probe is confined deliberately: `router_dump=N` names the MODEL layer (`-1`/absent is off,
+which is what lets layer 0 be named - the first layer is the control on every claim the probe makes),
+`router_dump_p0=V` names the chunk, and `router_dump_all=1` probes every layer of the chunk, which is the sweep
+that asks where it FIRST parts and pays a sync per layer. A layer that ran the fused path brings its own silence
+instead of nothing: the path keeps the routing on the card, so there is no readback sync to ride, and a dump that
+printed nothing there would be read as "the routers agreed".
+
+The arithmetic is `include/basalt/prefill/router_dump.hpp`, which the engine calls and
+`tests/prefill/router_dump_parity.cpp` (`ctest -L cpu`) grades against a sort, over random rows with deliberate
+ties and non-finite entries. Unset - the default - allocates nothing, copies nothing, prints nothing, and the layer
+loop runs the code it ran before the flag existed.
+

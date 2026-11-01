@@ -34,6 +34,7 @@
 #include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/prefill/peer_band.hpp"   // the RAM band's share, which the price and the stream count together
 #include "basalt/prefill/chunk_dump.hpp"   // `--exp chunk_dump`: the per-layer record of which path ran and who served it
+#include "basalt/prefill/router_dump.hpp"  // `--exp router_dump`: the router's own bytes at one layer, read back
 #include "basalt/ggml/ggml.h"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/platform/file.hpp"
@@ -137,6 +138,18 @@ static void chunk_dump_print(const basalt::prefill::ChunkDump& d) {
                       (long long) d.band, (long long) d.cpu, (long long) d.cpu_rows, (long long) d.streamed,
                       (long long) d.lead_holds, (long long) d.peer_holds, (long long) d.band_all,
                       (unsigned long long) d.ids, (unsigned long long) d.split);
+}
+
+/// The `--exp router_dump` lines for one probed (chunk, layer): one summary line of whole-block fingerprints and
+/// the boundary's facts, then one line per token of the read-back rows.  The text itself is built in
+/// `basalt/prefill/router_dump.hpp` - out here the engine only decides WHICH lines it owes - so the parity test
+/// grades the words two boots are actually diffed on, and a field that quietly stopped being printed fails a test
+/// instead of wasting a boot pair.  The token lines are the point: the summary says a block parted, the token lines
+/// say where, and `chunk_dump` only ever said WHICH LAYER.
+static void router_dump_print(const basalt::prefill::RouterDump& d) {
+    basalt::log::info("basalt prefill", "%s", basalt::prefill::router_dump_summary(d).c_str());
+    for (int64_t t = 0; t < d.T; ++t)
+        basalt::log::info("basalt prefill", "%s", basalt::prefill::router_dump_token(d, t).c_str());
 }
 
 // Either cudaMalloc (owned, freed with the object) or a bump allocation from a borrowed region; with no base and
@@ -1184,6 +1197,17 @@ struct Prefill::Impl {
     /// The router weights read back beside `ids_host` - only what the PARTIAL MERGE needs, for the weights of the
     /// rows the peer folds (the peer has no router of its own).  Empty while the flag is off.
     std::vector<float> w_host;
+    /// `--exp router_dump`'s four host blocks: the activations the layer's router projection read, its logits, the
+    /// routing and its weights, for ONE layer of ONE chunk.  Pinned so the copies that fill them are queued on the
+    /// compute stream rather than staging through the driver on the way to the readback sync the streamed walk
+    /// already pays, and grown to the widest chunk that asks for them.  Nothing is allocated while the flag is off.
+    /// `rd_off` says the staging would not pin: the probe says so once and stands down, because an observer that
+    /// takes a working boot down leaves the hunt with neither.
+    float *rd_logits = nullptr, *rd_w = nullptr;
+    int32_t* rd_ids = nullptr;
+    uint16_t* rd_in = nullptr;
+    int64_t rd_rows = 0;
+    bool rd_off = false;
     /// The peer's layer partial, as its copy left it: `T * N` BF16 bits, or FP32 on the FP32 row wire.  Sized
     /// with the chunk by `carve`, and only at all with `--exp peer_partial_merge` on.
     uint16_t* peer_part = nullptr;
@@ -1320,6 +1344,11 @@ void Prefill::release() {
     }
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
+    for (float* p : {impl_->rd_logits, impl_->rd_w})
+        if (p) cudaFreeHost(p);
+    if (impl_->rd_ids) cudaFreeHost(impl_->rd_ids);
+    if (impl_->rd_in) cudaFreeHost(impl_->rd_in);
+    impl_->rd_rows = 0;
     for (float* p : {impl_->cpu_x, impl_->cpu_rows})
         if (p) cudaFreeHost(p);
     if (impl_->cpu_s) cudaStreamDestroy(impl_->cpu_s);
@@ -4418,6 +4447,57 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // `--exp chunk_dump=1`: one line per layer of this chunk (see `chunk_dump_print`).  Read once per chunk, so
         // the layers of one chunk all answer to the same setting and the flag cannot split a chunk halfway.
         const bool chunk_dump = basalt::core::exp_flag("chunk_dump", 0.0) != 0.0;
+        // `--exp router_dump=N`: this chunk's router bytes at model layer N (see `router_dump_print`).  Read once
+        // per chunk beside `chunk_dump`, for the same reason: a chunk whose layers answered to different settings
+        // would compare two boots at rows that were never the same rows.  Said once per boot if the layer it names
+        // is outside this stage, because a probe that is silent because it can never fire is the instrument this
+        // hunt has been bitten by twice.
+        const basalt::prefill::RouterProbe rd = basalt::prefill::router_probe();
+        if (rd.armed() && !rd.all && (rd.layer < LB || rd.layer >= LE)) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                basalt::log::warn("basalt prefill",
+                                  "router dump: asked for layer %lld, this stage runs %lld..%lld; nothing will be "
+                                  "read back", (long long) rd.layer, (long long) LB, (long long) LE - 1);
+            }
+        }
+        // The probe's host blocks, grown to this chunk and kept - but only for a chunk it will actually print, so
+        // a probe named for one chunk of a long prompt does not pin ~59 MB through every other one.  Pinned so the
+        // four copies are QUEUED on the compute stream behind the router rather than staged synchronously by the
+        // driver: the readback happens at the sync the streamed walk already pays, so the probe adds no rendezvous
+        // to the layer it examines.  A staging block that would not pin is said once and the probe stands down.
+        const bool rd_here = rd.armed() && (rd.p0 < 0 || rd.p0 == p0) &&
+                             (rd.all || (rd.layer >= LB && rd.layer < LE));
+        bool rd_ok = !m.rd_off;
+        if (rd_ok && rd_here && m.rd_rows < T) {
+            for (float* p : {m.rd_logits, m.rd_w})
+                if (p) cudaFreeHost(p);
+            if (m.rd_ids) cudaFreeHost(m.rd_ids);
+            if (m.rd_in) cudaFreeHost(m.rd_in);
+            m.rd_logits = m.rd_w = nullptr;
+            m.rd_ids = nullptr;
+            m.rd_in = nullptr;
+            m.rd_rows = 0;
+            const int64_t rows = T;
+            rd_ok =
+                cudaHostAlloc((void**) &m.rd_logits, (size_t) rows * m.g->n_expert * sizeof(float),
+                              cudaHostAllocDefault) == cudaSuccess &&
+                cudaHostAlloc((void**) &m.rd_in, (size_t) rows * N * sizeof(uint16_t), cudaHostAllocDefault) ==
+                cudaSuccess &&
+                cudaHostAlloc((void**) &m.rd_ids, (size_t) rows * K * sizeof(int32_t), cudaHostAllocDefault) ==
+                cudaSuccess &&
+                cudaHostAlloc((void**) &m.rd_w, (size_t) rows * K * sizeof(float), cudaHostAllocDefault) ==
+                cudaSuccess;
+            if (rd_ok) {
+                m.rd_rows = rows;
+            } else {
+                cudaGetLastError();   // the failed alloc is the probe's news, not the run's first error
+                m.rd_off = true;
+                basalt::log::warn("basalt prefill",
+                                  "router dump: the readback would not pin %lld tokens; the probe is off", (long long) rows);
+            }
+        }
         // the peer takes the rows of a chunk only up to its buffers' size; a streamed chunk only up
         // to T_fp4, and then on the FP4 kernels (PeerPrefill::T_fp4)
         PeerPrefill* const ppc =
@@ -4699,6 +4779,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             // layer's end.  Declared out here because the half loop is what it describes: the MoE block runs in one
             // half alone, while the line stands for the layer.
             ChunkDump cd;
+            // Did the `--exp router_dump` copies of this layer's router bytes go out?  Declared out here, beside
+            // `cd`, because the layer end prints the probe's own silence: a layer that took the fused path never
+            // brings its routing to the host, and a dump that printed nothing there would read as a layer whose
+            // router agreed with itself.
+            bool rd_live = false;
             cd.dump = chunk_dump ? 1 : 0;   // a layer that never reaches the MoE block still prints, path "unset"
             cd.layer = l; cd.p0 = p0; cd.T = (int64_t) T; cd.K = K; cd.n_expert = m.g->n_expert;
             // Whether the partner reads this layer's blob for one of its experts out of the RAM tier: decided
@@ -5028,6 +5113,34 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
+                    // `--exp router_dump`: this layer's router products, on their way to the host.  Issued HERE, on
+                    // the compute stream and AHEAD of the routing guess below - which re-projects `logits` with the
+                    // NEXT layer's router - so stream order is what makes the bytes that come back the ones this
+                    // layer's `route` read and wrote, with no event and no sync of the probe's own.  They are read
+                    // after the readback sync the streamed walk already makes for the routing.  The four blocks are
+                    // the router's whole visible world: what the projection read, what it produced, and what the
+                    // selection made of it - which is the three-way split the hunt needs and `chunk_dump` cannot
+                    // make, because two of those three never leave the card.
+                    if (rd.takes(l, p0) && rd_ok) {
+                        cudaError_t e = cudaMemcpyAsync(m.rd_logits, m.logits, (size_t) T * m.g->n_expert * 4,
+                                                        cudaMemcpyDeviceToHost, m.cs);
+                        if (e == cudaSuccess)
+                            e = cudaMemcpyAsync(m.rd_in, m.mixed_bf, (size_t) T * N * 2, cudaMemcpyDeviceToHost, m.cs);
+                        if (e == cudaSuccess)
+                            e = cudaMemcpyAsync(m.rd_ids, m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
+                        if (e == cudaSuccess)
+                            e = cudaMemcpyAsync(m.rd_w, m.w, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
+                        if (e != cudaSuccess) {
+                            // an instrument is not the model: the line says the bytes did not come back and the
+                            // read is skipped, rather than printing fingerprints of a buffer nobody wrote
+                            cudaGetLastError();
+                            basalt::log::warn("basalt prefill",
+                                              "router dump: layer %lld's bytes would not come back: %s",
+                                              (long long) l, cudaGetErrorString(e));
+                        } else {
+                            rd_live = true;
+                        }
+                    }
                     if (m.hist_on) route_count(m.ids, T * K, m.hist + l * m.g->n_expert, (int) m.g->n_expert, m.cs);
                     if (ahead_n > 0 && l + 1 < LE) {   // the next layer's routing guessed (the logits are free again)
                         const core::LayerView vn(*m.wt, l + 1);
@@ -5304,6 +5417,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         core::progress_at("reading the prompt (batched): layer", l, p0);
                         m.tm.mark(tl, ChunkTiming::kQuant, m.cs);
                         m.tm.harvest();   // the layer before this one: the GPU has passed all of its markers
+                        if (rd_live) {
+                            // `--exp router_dump`: the copies the router left behind it have retired with this
+                            // sync, so the blocks hold what its selection read and wrote - after the timing marks
+                            // are taken, so the probe's own host walk cannot land inside the layer's own figures.
+                            // A path that never reaches this line prints its own silence at the layer's end.
+                            basalt::prefill::RouterDump rdd;
+                            rdd.layer = l;
+                            rdd.p0 = p0;
+                            rdd.T = T;
+                            rdd.K = K;
+                            rdd.n_expert = m.g->n_expert;
+                            rdd.n_embd = N;
+                            basalt::prefill::router_dump_collect(rdd, m.rd_logits, m.rd_in, m.rd_ids, m.rd_w);
+                            router_dump_print(rdd);
+                            rd_live = false;
+                        }
                         if (guess_for == l + 1) {   // the guessed rows per expert of the next layer
                             m.guess_rows.assign((size_t) m.g->n_expert, 0);
                             for (int64_t i = 0; i < T * K; ++i) {
@@ -6253,6 +6382,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             m.tm.mark(tl, ChunkTiming::kEnd, m.cs);
             if (cd.dump) chunk_dump_print(cd);   // `--exp chunk_dump`: what this layer ran on, who served its rows
+            if (rd_live) {
+                // The copies went out and nothing read them back: the layer took a path that keeps its routing on
+                // the card, which is the FUSED path's whole point, so there is no readback sync to ride and the
+                // bytes are already stale.  The probe says so rather than leaving the layer's absence to be read
+                // as "the routers agreed" - the failure mode that voided a gate once already.
+                basalt::log::warn("basalt prefill",
+                                  "router dump: layer %lld ran %s, which never brings its routing to the host; "
+                                  "nothing was read back", (long long) l, cd.path);
+                rd_live = false;
+            }
             m.tm.end_layer(tl);
         }
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts

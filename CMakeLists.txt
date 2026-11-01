@@ -1146,6 +1146,12 @@ if(BUILD_TESTING)
   add_executable(chunk_dump_parity tests/prefill/chunk_dump_parity.cpp)
   target_include_directories(chunk_dump_parity PRIVATE include)
   basalt_cpu_test(NAME chunk_dump_parity COMMAND chunk_dump_parity)
+  # what `--exp router_dump` prints for one layer of one prompt chunk: the router's own bytes read back - the
+  # activations its projection read, its logits, its routing - with the top-K and the K/K+1 boundary replayed
+  # over them, which is how a router that parted is told from a selection that did (basalt/prefill/router_dump.hpp)
+  add_executable(router_dump_parity tests/prefill/router_dump_parity.cpp)
+  target_include_directories(router_dump_parity PRIVATE include)
+  basalt_cpu_test(NAME router_dump_parity COMMAND router_dump_parity)
   # the emitted base of the differential quality gate: the row the emitter writes must decode back, through the
   # untouched llama.cpp reader, to the log-probs of the logits it was given (basalt/program/ppl_gate.hpp)
   add_executable(ppl_emit_parity_test tests/program/ppl_emit_parity_test.cpp)
