@@ -228,3 +228,49 @@ Fixing `predict()` needs a per-stage cost that reflects serial position and the
 CUDA0-no-cache asymmetry. Not attempted yet - it needs its own measurement to
 validate, and the wrong fix would silently pick worse cuts than the heuristic it
 replaced.
+
+## THE PER-LAYER INSTRUMENTATION, AND WHAT IT ACTUALLY SAYS
+
+`--profile` (a real flag, not an `--exp`) prints the decode window's per-layer GPU
+phases: 31 named terms per layer, split GDN vs QSA, and it printed ONLY stage 1 until
+this branch - under a layer split that is a quarter of the window. Now one line per
+stage, labelled with its card (`generate.cpp`).
+
+### The objective is the SUM, not the spread
+
+The four stages are **sequential**: stage 2 cannot start layer 8's work until stage 1
+hands over. So the window is the SUM of the stage times, and any placement rule that
+minimizes IMBALANCE (max/min) is optimizing the wrong thing. Measured, same prompt:
+
+| cut | c0 ms | c1 ms | c2 ms | c3 ms | **SUM** | t/s |
+|---|---|---|---|---|---|---|
+| **8,22,34** | 3.89 | 6.19 | 5.31 | 7.90 | **23.29** | **102-105** |
+| 12,25,38 | 6.51 | 5.95 | 5.99 | 6.24 | 24.69 | 87-89 |
+| 4,20,34 | 2.17 | 7.77 | 6.56 | 8.25 | 24.75 | 90-101 |
+
+The "balanced" cut (12,25,38) has the flattest spread of the three and is the
+WORST of them. The winner minimizes the sum.
+
+### Why CUDA0 is special and both models miss it
+
+CUDA0 carries the main session and KV and **holds no expert cache at all** - every
+expert its layers route is fetched. Its ms/layer is 0.486 at 8 layers and 0.54 at 12,
+so it degrades faster than the middle stages (0.442). Taking layers OFF c0 is not free
+either: at 4 layers the work moves to c1 (6.19 -> 7.77) and the sum grows. 8 is the
+measured optimum, and it was found by sweeping, not by a model.
+
+### The per-layer cost, at the shipped cut
+
+`VRAM hits` - the expert blob read inside a layer - is the dominant stamped term in
+every stage: 1.24 ms for a GDN layer against 0.41 for the shared expert. `waitA`,
+`waitB`, `waitCPU`, `PCIe grp` are all **0.00**: there is no inter-card stall to win
+at decode, and the 55.8%-PCIe figure from tp2pp2 has no counterpart here.
+
+### Both automatic models are wrong, for the same reason
+
+`predict()` (the boot search, exhaustive now) minimizes a predicted WINDOW that is a
+sum of per-stage `layer_ms` - but its `layer_ms` is uniform across stages, so it
+cannot see CUDA0's no-cache penalty or the tail's head cost. The measured-balance
+model fails identically: it minimizes spread where the objective is the sum.
+**Neither is a safe replacement for the sweep until the per-stage cost is measured
+per stage, not assumed uniform.**
