@@ -10686,8 +10686,18 @@ int main(int argc, char** argv) {
                                                              " ms/window for it)").c_str());
                 const std::string evr = basalt::core::decode_events().report();
                 if (!evr.empty()) basalt::log::raw("%s\n", evr.c_str());
-                const std::string pr = ver.profile_report();
-                if (!pr.empty()) basalt::log::raw("basalt decode GPU stages (ms/window):%s\n", pr.c_str());
+                // every stage's profile, not just the first: under a layer split each stage runs its own layers on
+                // its own card, and a report that names only CUDA0's is a quarter of the window.
+                for (size_t k = 0; k <= stages.size(); ++k) {
+                    basalt::core::Verifier& v = k == 0 ? ver : stages[k - 1]->ver;
+                    const std::string pr = v.profile_report();
+                    if (pr.empty()) continue;
+                    if (k == 0)
+                        basalt::log::raw("basalt decode GPU stages (ms/window):%s\n", pr.c_str());
+                    else
+                        basalt::log::raw("basalt decode GPU stages, stage %zu (CUDA%d) (ms/window):%s\n", k + 1,
+                                         stages[k - 1]->dev, pr.c_str());
+                }
             }
             if (!cancelled) {
                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
