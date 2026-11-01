@@ -454,6 +454,11 @@ void usage() {
                  "                       exceed 1.5 MiB, such as NVFP4), within\n"
                  "                       what the expert cache can lend (with --resident-experts the lent slots the\n"
                  "                       RAM copy backs, else 8192); auto:N (8192, 16384, 32768) sets the ceiling\n"
+                 "  --prefill-regimes LO,HI  opt-in: pick the chunk from the SHAPE of each read's uncached work.\n"
+                 "                       Uncached tokens >= HI read in chunks of at most HI (the auto ceiling,\n"
+                 "                       capped by what the expert caches can lend, as today); fewer read in chunks of\n"
+                 "                       at most LO, so a small uncached tail is not laid out for the big chunk.\n"
+                 "                       LO >= 256, HI >= LO; off by default (one ceiling for every read)\n"
                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
                  "  --dump-mixed PATH    write the post-attention residual (n_embd, f32)\n"
                  "  --stage-timing       per-stage KERNEL-COUNT shares.  NOT a time profile: an uncaptured\n"
@@ -1065,6 +1070,21 @@ int main(int argc, char** argv) {
             o.prefill_auto_fit = v == "auto";
             o.prefill_auto_max = o.prefill_auto_fit || want_max >= 32768 ? 32768 : want_max >= 16384 ? 16384 : 8192;
             o.prefill_chunk = o.prefill_auto ? o.prefill_auto_max : std::atoll(v.c_str());
+        }
+        else if (a == "--prefill-regimes") {
+            const std::string v = next("--prefill-regimes");
+            const size_t comma = v.find(',');
+            const int64_t lo = comma == std::string::npos ? -1 : std::atoll(v.substr(0, comma).c_str());
+            const int64_t hi = comma == std::string::npos ? -1 : std::atoll(v.substr(comma + 1).c_str());
+            if (lo < 256 || hi < lo) {
+                basalt::log::error("basalt generate",
+                                   "bad --prefill-regimes '%s' (expected LO,HI with LO >= 256 and HI >= LO, in tokens)",
+                                   v.c_str());
+                return 2;
+            }
+            o.prefill_regime_small = lo;
+            o.prefill_regime_large = hi;
+            o.prefill_regimes = true;
         }
         else if (a == "--vram-elastic") o.vram_elastic = true;
         else if (a == "--vram-segment-mib") o.vram_segment_mib = std::atoll(next("--vram-segment-mib"));
