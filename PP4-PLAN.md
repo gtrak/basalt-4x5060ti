@@ -154,3 +154,41 @@ hit, not a prefill - read `c` in `pp=NNN/NNNc` before quoting a rate.)
 
 Both axes are now ahead of tp2pp2 (2,780 prefill / ~90 decode) and of PP4's own
 starting point tonight (92.5 decode).
+
+## Flag sweep: three nulls, one crash, and the noise bound that makes them null
+
+Each run: full 1,800-token decode window twice, then a 62k prefill. Same boot, same cut.
+
+| run | decode t/s | prefill t/s | total W |
+|---|---|---|---|
+| base96 (`--adapt-swaps 96`) | 105.5 / 105.2 | 3,232 | 54.3 |
+| `--exp mtp_preswap=1` | 105.5 / 105.2 | 3,225 | 52.6 |
+| `--exp draft_reseed=1` | 101.5 / 108.9 | 3,225 | 53.0 |
+| **base96 again** | **111.7 / 106.1** | 3,243 | 53.7 |
+| `--exp host_ev=1` | **engine exits 1** | - | - |
+
+**A baseline compared against itself spans 105.2-111.7 t/s, about 3%.** Every flag's
+apparent effect is smaller than that, so all three are null - and `draft_reseed`'s
+101.5/108.9 straddles both ends of the baseline's own range, which is what noise
+looks like when you sample it twice.
+
+`--exp host_ev=1` is not null but BROKEN: it enables a decode event buffer
+(`decode_events().enable(4000)`, verify.cpp:1837) and the engine exits 1 with
+`copy_i32x3_from_mapped` failing during a long prompt read. A pre-existing defect in
+a diagnostic flag; not taken.
+
+**Method lesson, which cost time tonight:** a single 2-run sample cannot separate a
+3% flag effect from 3% machine noise. Any future flag A/B on this box needs either
+more runs or a paired design; a lone "105.5 vs 105.2" is not evidence.
+
+## Where the remaining headroom is
+
+Priced, not yet taken:
+
+1. **Expert cache coverage is the decode lever** (measured: 29% coverage -> 77 t/s,
+   65% -> 106-112). The exhaustive four-stage search now optimizes for it at boot.
+2. **`--peer-reserve-mib` / resident budget** could widen the caches directly: the
+   stages drew 9-10.5 GiB of cache each with 37 GiB of RAM budget, and the box has
+   room to raise it. This trades host RAM for coverage and is the cheapest untested
+   knob.
+3. **Two windows in flight** (~1.8x ceiling on tp2pp2, needs `batch <= 0`).
