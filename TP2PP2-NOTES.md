@@ -2837,6 +2837,27 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(40) **[39] IS WRONG - RETRACTED. THE "DOORBELL WAIT" IS THE GPU COMPUTING, NOT A PROTOCOL COST.**
+I claimed the 10.59 ms was PCIe store-visibility latency proving a platform limit. It is not.
+`ms_wait` is `b - a` where `a = fl_.wait_t0` is set when the host STARTS waiting for layer k and
+`b` is the moment the GPU rings for layer k - so the interval is "how long the GPU took to reach
+layer k", i.e. **the GPU running layer k's attention and router**. The tell was in my own table
+and I missed it: wait 10.59 against compute 11.78, nearly equal, because they are the same work
+seen from the two ends of the handshake. That is also why all three "fixes" were null - you
+cannot prefetch or spin in place or re-slice your way out of the GPU's arithmetic.
+THE HONEST DECODE MODEL: the layer is SERIAL by data dependency - GPU attention+router -> rings
+the host -> host computes layer k's CPU experts -> publishes -> GPU runs layer k's experts and
+layer k+1's attention -> rings again. The host cannot run ahead because layer k+1's routing does
+not exist until layer k's MoE lands. So the window is ~12 ms of GPU compute + ~2.5 ms draft +
+~3 ms host + the serial handshake the dependency forces, and the handshake is NOT removable with
+a flag. THE REAL DECODE HEADROOM, restated: (1) MORE TOKENS PER WINDOW - the window cost is
+nearly flat in T (39.9 ms at T=4 vs 63.4 at T=6.5 for 1.6x the tokens), so raising dl from 2.7
+toward 5 is close to a doubling at similar cost, and it is drafter ACCEPTANCE that sets it;
+(2) FEWER ROUND TRIPS - only if the CPU tier stops being the host's per-layer job (device-side
+or peer-card CPU share). Option (1) is the one worth attacking and it is what (13)'s
+"acceptance is the biggest variable" already pointed at: 64.0 t/s at acc 80% vs 46.8 at acc 71%
+on the same binary.
+
 (39) **DECODE: THE WAIT IS PCIe STORE-VISIBILITY LATENCY — three nulls, and why.**
 Third lever tried: the host returned out of `serve_poll` every 1024 polls and the caller re-entered,
 paying the whole prologue (an `OnDevice` device query, the geometry, the session, `T`) for one
