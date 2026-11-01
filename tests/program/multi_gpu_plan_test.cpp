@@ -336,6 +336,109 @@ int main() {
         const auto [c1, h1] = prompt_one_card_chunks(235161, 16640, true, kHead);
         CHECK(c1 < kHead && h1 == 0);
     }
+    // the regime policy's chunk plan: which regime a read's uncached shape falls in, and the list the prompt path runs
+    {
+        constexpr int64_t kHead = 16384;
+        auto path_chunks = [](int64_t n, int64_t T, int64_t head_set) {   // Prefill::run_impl's chunk_len
+            std::vector<int64_t> v;
+            const int64_t head = n > T ? std::min(head_set, T) : 0;
+            for (int64_t at = 0; T > 0 && at < n;) {
+                const int64_t t = std::min(at == 0 && head > 0 ? head : T, n - at);
+                v.push_back(t);
+                at += t;
+            }
+            return v;
+        };
+        auto grid_up = [](int64_t t) { return (t + 255) / 256 * 256; };
+        int cases = 0, bad = 0;
+        const std::vector<int64_t> smalls = {256, 1024, 2048, 4096, 8192, 16384};
+        const std::vector<int64_t> larges = {256, 1024, 4096, 8192, 12288, 16384, 32768};
+        const std::vector<int64_t> caps = {256, 1024, 4096, 8192, 12288, 16640, 32768};
+        for (int64_t sm : smalls)
+            for (int64_t lg : larges)
+                for (int64_t cap : caps)
+                    for (int64_t n : {(int64_t) 1, (int64_t) 255, (int64_t) 256, (int64_t) 511, (int64_t) 300, (int64_t) 2000,
+                                      (int64_t) 4096, (int64_t) 9000, (int64_t) 12287, (int64_t) 12288, (int64_t) 12289,
+                                      (int64_t) 32767, (int64_t) 32768, (int64_t) 38229, (int64_t) 60000,
+                                      (int64_t) 122308, (int64_t) 250000}) {
+                        for (bool head_ok : {true, false}) {
+                            const PromptChunkPlan p = prompt_chunk_plan(n, sm, lg, cap, head_ok, kHead);
+                            ++cases;
+                            const int64_t hi = std::max(std::max<int64_t>(256, sm), lg);
+                            const int64_t lo = std::max<int64_t>(256, sm);
+                            int64_t sum = 0;
+                            for (int64_t t : p.list) sum += t;
+                            // the list is what the prompt path runs, and covers the read exactly once
+                            if (p.list != path_chunks(n, p.chunk, p.head) || sum != n) ++bad;
+                            // the regime the shape fell in, and the ceiling each regime is capped by
+                            if (p.small != (n < hi)) ++bad;
+                            if (p.chunk > cap || p.chunk > grid_up(n)) ++bad;
+                            if (p.small && (p.chunk > lo || p.head != 0)) ++bad;
+                            if (!p.small && p.chunk > std::min(cap, hi)) ++bad;
+                            if (p.head >= p.chunk && !(p.head == 0 && p.chunk == 0)) ++bad;
+                            // a read never asks for a chunk the lend was not sized for: `cap` is that ceiling, and the
+                            // small regime's chunk also sits inside what the plain rule takes at the same ceiling
+                            const auto plain = prompt_one_card_chunks(n, cap, false, kHead);
+                            if (p.small && p.chunk > plain.first) ++bad;
+                            // the big regime is today's rule over the big chunk, unchanged
+                            if (!p.small) {
+                                const auto today = prompt_one_card_chunks(n, std::min(cap, hi), head_ok, kHead);
+                                if (p.chunk != today.first || p.head != today.second ||
+                                    p.list != prompt_chunk_list(n, today.first, today.second))
+                                    ++bad;
+                            }
+                        }
+                    }
+        CHECK(cases > 3000);
+        CHECK(bad == 0);
+        // the boundary is one big chunk: `large` tokens fill it, one short of it does not
+        {
+            const PromptChunkPlan at = prompt_chunk_plan(12288, 2048, 12288, 12288, true, kHead);
+            const PromptChunkPlan below = prompt_chunk_plan(12287, 2048, 12288, 12288, true, kHead);
+            CHECK(!at.small && at.head == 0 && at.chunk == 12288);
+            CHECK(below.small && below.head == 0 && below.chunk == 2048 && below.list.size() == 6 &&
+                  below.list.back() == 2047);
+        }
+        // the big regime is the plain rule over `large`, and the head chunk's rule is not monotone in the ceiling: with
+        // `large` under the head chunk and `cap` just above it the plain rule sizes its chunks over the part after a
+        // head chunk it then drops (because it is not shorter than them), while the big regime equalizes the whole read
+        // - bigger chunks, still inside `cap`, which is what the expert caches were sized to lend
+        {
+            const PromptChunkPlan big = prompt_chunk_plan(38229, 2048, 16384, 16640, true, kHead);
+            const auto plain = prompt_one_card_chunks(38229, 16640, true, kHead);
+            CHECK(!big.small && big.chunk == 12800 && big.head == 0);
+            CHECK(plain.second == 0 && plain.first == 11008 && big.chunk > plain.first && big.chunk <= 16640);
+        }
+        // the two shapes the policy is for: a long fresh prompt keeps the big chunks it has today, a cached prefix with
+        // a small uncached tail reads that tail in the small chunk
+        {
+            const PromptChunkPlan fresh = prompt_chunk_plan(122308, 2048, 12288, 12288, true, kHead);
+            const auto today = prompt_one_card_chunks(122308, 12288, true, kHead);
+            CHECK(!fresh.small && fresh.chunk == today.first && fresh.head == today.second && fresh.list.size() == 10);
+            const PromptChunkPlan mid = prompt_chunk_plan(38229, 2048, 12288, 12288, true, kHead);
+            const auto mid_today = prompt_one_card_chunks(38229, 12288, true, kHead);
+            CHECK(!mid.small && mid.chunk == mid_today.first && mid.head == mid_today.second && mid.list.size() == 4);
+            const PromptChunkPlan tail = prompt_chunk_plan(6000, 2048, 12288, 12288, true, kHead);
+            const PromptChunkPlan tiny = prompt_chunk_plan(300, 2048, 12288, 12288, true, kHead);
+            CHECK(tail.small && tail.chunk == 2048 && tail.list.size() == 3 && tail.list.back() == 1904);
+            CHECK(tiny.small && tiny.chunk == 512 && tiny.list.size() == 1 && tiny.list.front() == 300);
+            // a tail no longer than one small chunk reads in one chunk, exactly as it does today
+            const PromptChunkPlan one = prompt_chunk_plan(2000, 2048, 12288, 12288, true, kHead);
+            CHECK(one.small && one.chunk == 2048 && one.list.size() == 1 && one.list.front() == 2000);
+        }
+        // degenerate reads read nothing; a small chunk below the prompt path's minimum is raised to it, and a small
+        // chunk above the big chunk makes the two the same
+        {
+            CHECK(prompt_chunk_plan(0, 2048, 12288, 12288, true, kHead).list.empty());
+            CHECK(prompt_chunk_plan(-5, 2048, 12288, 12288, true, kHead).chunk == 0);
+            CHECK(prompt_chunk_plan(6000, 2048, 12288, 0, true, kHead).chunk == 0);
+            const PromptChunkPlan raised = prompt_chunk_plan(6000, 64, 12288, 12288, true, kHead);
+            CHECK(raised.small && raised.chunk == 256 && raised.list.size() == 24);
+            const PromptChunkPlan even = prompt_chunk_plan(6000, 16384, 4096, 12288, true, kHead);
+            const PromptChunkPlan same = prompt_chunk_plan(6000, 16384, 16384, 12288, true, kHead);
+            CHECK(even.small && even.chunk == same.chunk && even.chunk == 6144);
+        }
+    }
     if (g_fail) { std::printf("multi_gpu_plan_test: %d failures\n", g_fail); return 1; }
     std::printf("multi_gpu_plan_test: ok\n");
     return 0;

@@ -346,4 +346,22 @@ std::vector<int64_t> prompt_chunk_list(int64_t tokens, int64_t chunk, int64_t he
     return v;
 }
 
+PromptChunkPlan prompt_chunk_plan(int64_t tokens, int64_t small, int64_t large, int64_t cap, bool head_ok,
+                                  int64_t head_chunk) {
+    PromptChunkPlan p;
+    if (tokens <= 0 || cap <= 0) return p;
+    // the prompt path's smallest chunk, and a small chunk that never exceeds the big one
+    const int64_t lo = std::max<int64_t>(256, small);
+    const int64_t hi = std::max(lo, large);
+    // a read that does not fill one big chunk is the small regime: it is the handful-of-tokens case the policy is for
+    p.small = tokens < hi;
+    // `cap` governs both regimes: what the lend can fund is the ceiling, so a chunk the caches cannot fund is never asked for
+    const int64_t ceil = std::min(cap, p.small ? lo : hi);
+    const auto [want, head] = prompt_one_card_chunks(tokens, ceil, p.small ? false : head_ok, head_chunk);
+    p.chunk = want;
+    p.head = head;
+    p.list = prompt_chunk_list(tokens, want, head);
+    return p;
+}
+
 }  // namespace basalt::program
