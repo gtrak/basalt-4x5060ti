@@ -393,3 +393,59 @@ needs 138 GB/s, which the link does not have by 20x.
 is the right one: only a RESIDENT expert has zero fetch latency, which is exactly why
 more stages win - they buy cache slots (3974 vs 1358), not parallelism.
 
+
+## KIMI REVIEW: what it corrected, verified independently
+
+A reviewer pass over the branch's conclusions. Two of its findings are confirmed
+wrong in my text; two of its findings are wrong themselves and I checked.
+
+### Confirmed wrong: the utilization reading (and the causality)
+
+nvidia-smi counts an ACTIVE KERNEL, and each stage's graph is launched at window
+start with a device spin kernel (`wait_flag_ge`) waiting for its predecessor's
+hand-off flag. So a card that is merely WAITING reads as busy, and the busy
+fraction grows with launch order. The model predicts cumulative-spin fractions of
+15 / 38 / 59 / 89% for 8/14/12/14; measured is 19 / 38 / 53 / 79%. Near-perfect.
+
+**The real mean duty cycle is 22%** (23.29 ms of stage work / 4 cards / 26.3 ms),
+not the 47% this page quoted. And "each stage waits on its successor" was backwards:
+a stage waits on its PREDECESSOR. The monotone rise is an artifact of launch order,
+not a "shape to attack", and there is even less real parallelism than believed.
+
+The wattage readings are the honest signal, and they agree: c0 50 W rising to c3 71 W
+tracks real work density.
+
+### Confirmed wrong: the boot search is a coverage maximizer, not a window optimizer
+
+`layer_ms[i]` comes from SMs x GHz and the four cards are identical, so
+sum_i (le-lb)*layer_ms[i] is cut-invariant (~36.5 ms for every cut) and the ONLY
+term that varies in `predict()` is `miss_ms * (1 - held_mass)`. The "exhaustive
+15,180-cut search" therefore maximizes coverage and nothing else - it cannot
+represent serial position, the CUDA0 session asymmetry, or the head at the tail,
+because those terms do not exist in its objective. That is the mechanical
+explanation of "the auto cut has better coverage and still loses", which this page
+had recorded only as an anomaly.
+
+### Wrong in the review: the stamp terms do NOT overlap
+
+The review flagged a factor-2 gap ("terms sum ~1.5 ms against a 0.442 ms wall") and
+suspected double counting. Parsed properly from one boot, the GDN terms sum to 19.04
+ms and the QSA terms to 4.77 ms, totalling **23.81 ms against the instrument's own
+23.81** - exact. The terms are disjoint, `VRAM hits` is a real share, and the 0.442
+figure was a per-layer average of a different stage's window. No re-derivation
+needed, and the grouped-GEMM work is not blocked on this.
+
+### Wrong in the review: the prefill "regression"
+
+PP4-STATE compared 3,545 t/s (an early tp2pp2-branch boot) against 3,224 (this
+branch), which is not a regression but two different binaries and prompts. The
+like-for-like 122k number is 4,232 t/s on both. Prompt-cache contamination (`c` in
+`pp=NNN/NNNc`) is the trap; the 62k figures need one cold-cache rerun before anyone
+quotes them.
+
+### Corrected arithmetic
+
+"31% more tokens bought 19% better efficiency" - the efficiency gain is
+**1 - 9.01/10.72 = 16%**. And the window is NOT flat in T: it rises ~10% for +31%
+tokens, so the lever is **~2.5% window cost per extra token**, i.e. each +0.5
+tok/win of acceptance buys ~5%.
