@@ -2837,6 +2837,25 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(29) **THE SEAM IS NARROWED, AND THE HUNT IS HANDED OFF.** Additional reading after (28),
+each checked and CLEARED or left open with the reason:
+- CLEARED: the routing-ahead guess path (`ahead_n` requires `!stream_all`, prefill.cpp:4633;
+  this boot has stream_all=1, so the guessed-routing block at 5032 is inert).
+- CLEARED: `ev_planes`/`ev_act` ordering — `quantize_tokens` then `cudaEventRecord(ev_planes)
+  on m.cs` (5190), the peer waits that event (5212), and the comment's claim that nothing
+  between writes mixed/Xq/Hq holds.
+- STILL OPEN, and the only structural suspect left that fits "19 layers fine, then one
+  off": the ROUTER'S LOGITS OR THEIR INPUT. `m.logits` is written by `bf16_proj` (5029) and
+  immediately read by `route` on the same stream, so stream ordering protects it; the
+  question is whether `m.mixed_bf` (the projection's input, written by `up_mix` at 4781)
+  can differ between two boots. The host-side dump cannot see values, only ids and splits.
+**THE DEVICE-SIDE PROBE IS DISPATCHED** (worker c11b37c6): `--exp router_dump=1` to copy
+the router's logits and its input's per-token hashes at the chosen layer/chunk, so two
+boots discriminate LOGITS DIFFER (=> the projection or its input) from LOGITS MATCH WHILE
+IDS DIFFER (=> the selection, contradicting its apparent determinism, i.e. a race). That
+is the next datum and it needs one boot pair; no further host-side reasoning will settle
+it.
+
 (28) **CUBLAS ALGORITHM CHOICE IS NOT THE CAUSE — tried, and it made it worse.** The
 router's logits come from `Gemm::bf16` -> `cublasGemmEx(..., CUBLAS_COMPUTE_32F,
 CUBLAS_GEMM_DEFAULT)`, and cuBLAS is a known nondeterminism vector, so I built
