@@ -318,6 +318,48 @@ int main(int argc, char** argv) {
                         f.bytes / (med(us) * 1e3));
         }
         pool.set_active_workers(pool.workers());
+
+        // The pool cuts each expert's rows into pieces sized from the live worker count.  That is safe only because
+        // a piece owns OUTPUT rows (r0 = FF*part/parts), so no piece's sum is combined with another's - there is no
+        // cross-piece reduction to re-associate.  This holds that invariant to the bit: one expert, every worker
+        // count, identical rows.
+        {
+            cpu::NativeFmt df;
+            std::string derr;
+            if (!cpu::native_fmt(40, 40, NH, NFF, df, derr)) { std::printf("determinism: %s\n", derr.c_str()); return 0; }
+            const size_t dstride = (df.bytes + 4095) & ~size_t(4095);
+            std::vector<uint8_t> dmem(dstride * 4 + 4096);
+            uint8_t* dbase = (uint8_t*) (((uintptr_t) dmem.data() + 4095) & ~uintptr_t(4095));
+            std::vector<uint8_t> dpack(df.bytes);
+            fill(dpack, 40, ggml_type_size(GGML_TYPE_NVFP4), 4242);
+            for (int e = 0; e < 4; ++e) std::memcpy(dbase + dstride * e, dpack.data(), df.bytes);
+            std::vector<std::vector<uint8_t>> dact(NT, std::vector<uint8_t>(cpu::kNativeActBytes));
+            std::vector<std::vector<float>> dout(NT, std::vector<float>((size_t) NH));
+            cpu::ExpertJobMulti djob;
+            djob.nt = NT;
+            djob.blob = dbase;
+            for (int t = 0; t < NT; ++t) {
+                cpu::native_quant_act(df, xs[t].data(), dact[t].data());
+                djob.nact[t] = dact[t].data();
+                djob.out[t] = dout[t].data();
+            }
+            std::vector<float> ref;
+            bool ok = true;
+            int checked = 0;
+            for (int k = 1; k <= pool.workers(); k *= 2) {
+                pool.set_active_workers(k);
+                for (int t = 0; t < NT; ++t) std::fill(dout[t].begin(), dout[t].end(), 0.0f);
+                pool.run_split_multi_native(df, &djob, 1);
+                if (k == 1) ref = dout[0];
+                else for (size_t i = 0; i < ref.size(); ++i)
+                    if (std::memcmp(&ref[i], &dout[0][i], sizeof(float)) != 0) { ok = false; break; }
+                ++checked;
+            }
+            pool.set_active_workers(pool.workers());
+            std::printf("determinism: one NVFP4 expert at %d worker counts (1..%d): %s\n", checked, pool.workers(),
+                        ok ? "BIT-IDENTICAL" : "DIFFERS - a piece's sum depends on the worker count");
+            if (!ok) return 1;
+        }
     }
     return 0;
 }
