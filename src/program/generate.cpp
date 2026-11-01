@@ -7904,6 +7904,25 @@ int main(int argc, char** argv) {
                 sl.produced += k;
                 if (real) {   // the window's verdict on its drafts: the draft-length rule, the lookup history, the policy
                     const int a = k - 1, Tw = lens[sg];
+                    // --exp slot_hist=1: rows OFFERED against tokens KEPT, per slot.  Under two concurrent requests the
+                    // window's T is chosen once for the whole batch, so a slot whose chain came up short still costs
+                    // its rows.  Whether that is real (rows over-allocated across slots) or not is the question this
+                    // answers, and it decides between per-slot window depth and not batching mismatched chains.
+                    {
+                        static const bool sh = basalt::core::exp_flag("slot_hist", 0) != 0;
+                        static long n = 0, offer = 0, keep = 0, worst = 0;
+                        if (sh) {
+                            ++n;
+                            offer += Tw;
+                            keep += k;
+                            if (Tw - k > worst) worst = Tw - k;
+                            if (n % 100 == 0 && S > 1)
+                                basalt::log::info("basalt slot hist",
+                                                  "%ld slot-windows, S=%d, offered %.2f, kept %.2f, wasted %.2f (worst %ld)",
+                                                  n, (int) S, (double) offer / (double) n, (double) keep / (double) n,
+                                                  (double) (offer - keep) / (double) n, worst);
+                        }
+                    }
                     if (Tw > 1 && !sl.from_sfx) sl.cum.observe(sl.dprob, Tw - 1, a);
                     if (Tw > 1) sl.acc = 0.8 * sl.acc + 0.2 * ((double) a / (double) (Tw - 1));
                     sl.drafts_offered += Tw - 1;
