@@ -117,6 +117,9 @@ std::pair<int64_t, int64_t> prompt_one_card_chunks(int64_t tokens, int64_t cap, 
 /// min(head, chunk) when the part is longer than one chunk, then chunks of `chunk`, the last one what is left.
 std::vector<int64_t> prompt_chunk_list(int64_t tokens, int64_t chunk, int64_t head);
 
+/// A chunk list as text, runs of equal sizes collapsed: "12288 x9, 11716".  For the log line that reports a read's plan.
+std::string prompt_chunk_list_text(const std::vector<int64_t>& chunks);
+
 /// One read's chunk plan under the regime policy: which regime its shape fell in, the uniform chunk the prompt path's
 /// buffers are laid out for, the head chunk, and the chunks in the order the read runs them.
 struct PromptChunkPlan {

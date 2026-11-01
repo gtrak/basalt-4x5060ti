@@ -346,6 +346,19 @@ std::vector<int64_t> prompt_chunk_list(int64_t tokens, int64_t chunk, int64_t he
     return v;
 }
 
+std::string prompt_chunk_list_text(const std::vector<int64_t>& chunks) {
+    std::string s;
+    for (size_t i = 0; i < chunks.size();) {
+        size_t j = i;
+        while (j + 1 < chunks.size() && chunks[j + 1] == chunks[i]) ++j;
+        if (!s.empty()) s += ", ";
+        s += std::to_string(chunks[i]);
+        if (j > i) s += " x" + std::to_string(j - i + 1);
+        i = j + 1;
+    }
+    return s;
+}
+
 PromptChunkPlan prompt_chunk_plan(int64_t tokens, int64_t small, int64_t large, int64_t cap, bool head_ok,
                                   int64_t head_chunk) {
     PromptChunkPlan p;

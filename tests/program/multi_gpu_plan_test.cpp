@@ -439,6 +439,15 @@ int main() {
             CHECK(even.small && even.chunk == same.chunk && even.chunk == 6144);
         }
     }
+    // a chunk list as text: runs of equal sizes collapsed, the order the prompt path runs them
+    {
+        CHECK(prompt_chunk_list_text({}) == "");
+        CHECK(prompt_chunk_list_text({4096}) == "4096");
+        CHECK(prompt_chunk_list_text({4096, 4096, 4096}) == "4096 x3");
+        CHECK(prompt_chunk_list_text({16384, 12288, 12288, 11716}) == "16384, 12288 x2, 11716");
+        CHECK(prompt_chunk_list_text(prompt_chunk_list(122308, 12288, 0)) == "12288 x9, 11716");
+        CHECK(prompt_chunk_list_text(prompt_chunk_plan(6000, 2048, 12288, 12288, true, 16384).list) == "2048 x2, 1904");
+    }
     if (g_fail) { std::printf("multi_gpu_plan_test: %d failures\n", g_fail); return 1; }
     std::printf("multi_gpu_plan_test: ok\n");
     return 0;
