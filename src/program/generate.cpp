@@ -1168,6 +1168,11 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile-save-every")
             o.expert_profile_save_min = std::atof(next("--expert-profile-save-every"));
         else if (a == "--gpu-stages") o.gpu_stages = true;
+        // --layer-split K1,K2,..: the FIRST LAYER of each later stage ("8,20,34" for 4 stages of 8/12/14/14).  Without
+        // it the cut is even, which leaves the last stage carrying its layers PLUS the output head and every earlier
+        // stage waiting on it.  `auto` keeps the search.
+        else if (a == "--layer-split") { o.layer_split = next("--layer-split"); o.split_forced = true; }
+        else if (a == "--layer-split-forced") o.split_forced = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
         else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = o.resident_cpu_explicit = true;
@@ -1336,15 +1341,14 @@ int main(int argc, char** argv) {
         mm.peer_overhead = 5ull << 28;
         const basalt::program::MgPlan mp = basalt::program::plan_multi_gpu(chosen_cards, mm);
         basalt::log::info("basalt", "%s", mp.line.c_str());
-        // BASALT_FORCE_SPLIT: the price model picks the expert tier on this box, but the split keeps every expert
-        // where it is computed (pipeline parallel), which is what the prompt path needs.  Opt in to compare.
-        const char* force_split = std::getenv("BASALT_FORCE_SPLIT");
-        if ((mp.pick == basalt::program::Mechanism::LayerSplit || (force_split && *force_split == '1')) &&
-            o.peer_device >= 1) {
-            o.layer_split = "auto";
+        // --layer-split-forced (or an explicit --layer-split): the price model picks the expert tier on this box,
+        // but the split keeps every expert where it is computed (pipeline parallel), which is what the prompt path
+        // needs.
+        if ((mp.pick == basalt::program::Mechanism::LayerSplit || o.split_forced) && o.peer_device >= 1) {
+            if (o.layer_split.empty()) o.layer_split = "auto";   // an explicit --layer-split cut stands
             o.peer_devices.clear();
             o.peer_device = -1;
-            if (force_split && *force_split == '1' && mp.pick != basalt::program::Mechanism::LayerSplit)
+            if (o.split_forced && mp.pick != basalt::program::Mechanism::LayerSplit)
                 basalt::log::info("basalt", "layer split forced on (the price model picked %s)",
                                   basalt::program::mechanism_name(mp.pick));
         }
