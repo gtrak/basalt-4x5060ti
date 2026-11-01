@@ -2837,6 +2837,28 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(36) **THE PEER-WAIT IS FINE-GRAINED MOE WORK, NOT A DEFECT — the arithmetic.** The peer's
+own breakdown (per layer): `act 2.3 + quant 0.0 + comp 66.3 + rows 8.3 = 76.9 ms`, so it is
+COMPUTE-bound (copies are 10 ms of 77). Per group: **37 groups/layer, 1.79 ms each, 59 rows
+each = ~30 us a row** - against the lead's own `lead_row_us` of 2.2. A 14x gap that looked
+like an inefficiency until the shape was worked out: **this layer routes ~2,194 rows across
+512 experts = ~4 rows per expert**, so each group is ~14 experts x 4 rows, and
+`fp4::cut_pieces` already packs up to `kMaxExperts=16` experts per launch with the row cap
+at the chunk (8,192, never binding). The kernel's block is 64-token tiles x 2 = 128 rows, so
+a 59-row group fills ~46% of a block - but the groups cannot be made fuller: 2,194 rows a
+layer is 17 full blocks' worth in total, and they are scattered over 512 experts that each
+own ~4 of them. THE WORK IS SMALL-AND-SCATTERED BY THE MODEL'S OWN ROUTING at a prefill
+batch of 8,192/512, and the peer pays the per-launch and pipeline-fill cost on every slice.
+That is why the balance model (which prices rows at 1.09 us) under-predicts the peer's time
+by ~27x: the model prices a ROW, and the hardware charges a ROW PLUS A LAUNCH when rows per
+expert are this few. It also explains why moving MORE work to the peer never paid: every
+moved expert brings another small slice, not more rows per slice.
+IMPLICATION: the peer's cost would fall with a LARGER chunk (more rows per expert per
+launch) - which is the batch-size lever, not a code lever - or with a kernel that keeps
+several experts' slices in flight per SM (`__launch_bounds__(kThreads, 1)` pins one block
+per SM today). The second is a real kernel project; the first is a config question the
+owner has already bounded (prefill chunk is 8,192).
+
 (35) **WHY 0/2 (leads) LOOK IDLER THAN 1/3 (peers) — and what it says is left.**
 Owner observation, explained: the per-layer line is `attn 51.6 -> router 5.1 ->
 peer-enqueue 2.0 -> lead-experts 2.1 -> peer-wait 47.7 -> merge 1.0` (112.2 ms). The LEAD
