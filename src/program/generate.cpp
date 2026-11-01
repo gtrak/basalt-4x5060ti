@@ -4700,6 +4700,17 @@ int main(int argc, char** argv) {
     auto read_cap = [&]() -> int64_t {
         return o.prefill_auto_fit ? std::min<int64_t>(o.prefill_chunk, kMaxAutoChunk) : o.prefill_chunk;
     };
+    // One read's chunk plan: with --prefill-regimes the SHAPE of its uncached work picks between the small and the big
+    // chunk, without it one ceiling (`cap`, what the lend can fund) governs it exactly as today.  `head_ok` is whether
+    // this read may start with a head chunk of its own.  The split prices and the main card's loan ask it here, so a
+    // part is never planned two ways.
+    auto read_plan = [&](int64_t n_tok, int64_t cap, bool head_ok) -> basalt::program::PromptChunkPlan {
+        if (o.prefill_regimes)
+            return serve_loans::chunk_plan(n_tok, o.prefill_regime_small, o.prefill_regime_large, cap, head_ok,
+                                           o.prefill_auto_fit);
+        const auto [want, head] = serve_loans::one_card_chunks(n_tok, cap, head_ok, o.prefill_auto_fit);
+        return {false, want, head, serve_loans::chunk_list(n_tok, want, head)};
+    };
     // the cells before a prompt's end the draft layer attends to (all of them without a window: no split then)
     const int64_t draft_window = o.mtp.empty() ? 0 : o.mtp_window > 0 ? o.mtp_window + 64 : INT64_MAX / 4;
     constexpr int64_t kSplitRefCells = 131072;   // the longest prompt the start prices the split for
@@ -4742,7 +4753,8 @@ int main(int argc, char** argv) {
         const int64_t n_tok = b0 - a0;
         // two chunks or more, the draft layer's window within the last two the main card hands on (their final rows
         // come back for it in the hand-off buffers)
-        const auto [chunk, head] = serve_loans::one_card_chunks(n_tok, read_cap(), true, o.prefill_auto_fit);
+        const basalt::program::PromptChunkPlan pl = read_plan(n_tok, read_cap(), true);
+        const int64_t chunk = pl.chunk, head = pl.head;
         if (n_tok <= std::max(chunk, head)) return sp0;   // one chunk: read on the main card, no reason to give
         char why[160];
         // a slower tier card that computes its experts' rows of the routed-only chunks of a CUDA0 read: the split
@@ -9156,14 +9168,23 @@ int main(int argc, char** argv) {
                     }));
                     cap = std::min(cap, lc);
                 }
-                auto [want_full, head_tok] = serve_loans::one_card_chunks(tokens, cap, !beside && stages.empty(),
-                                                                       o.prefill_auto_fit);
                 // a chunk the read must have: a split read's, or the one the read this continues had (if it fits)
                 const int64_t fixed_chunk = chunk > 0 ? chunk : (resumed_chunk > 0 && resumed_chunk <= cap) ? resumed_chunk : 0;
-                if (fixed_chunk > 0) {
-                    want_full = fixed_chunk;
-                    head_tok = chunk > 0 ? head : 0;
-                }
+                // --prefill-regimes: the SHAPE of this read's uncached work picks the chunk.  A read that must keep a
+                // chunk keeps it, so a continued or split read never changes its chunking under way.
+                const basalt::program::PromptChunkPlan pl =
+                    fixed_chunk > 0 ? basalt::program::PromptChunkPlan{}
+                                    : read_plan(tokens, cap, !beside && stages.empty());
+                int64_t want_full = fixed_chunk > 0 ? fixed_chunk : pl.chunk;
+                int64_t head_tok = fixed_chunk > 0 ? (chunk > 0 ? head : 0) : pl.head;
+                if (o.prefill_regimes)   // the measurement: what the policy decided for this read, and from what
+                    basalt::log::info("basalt serve", "prompt regimes: %lld uncached (%lld reused of %lld), read %lld "
+                                                 "tokens in the %s regime, chunks of %lld, head %lld [%s]%s",
+                                      (long long) (n - resume), (long long) resume, (long long) n, (long long) tokens,
+                                      fixed_chunk > 0 ? "kept" : (pl.small ? "small" : "big"), (long long) want_full,
+                                      (long long) head_tok, basalt::program::prompt_chunk_list_text(
+                                      serve_loans::chunk_list(tokens, want_full, head_tok)).c_str(),
+                                      fixed_chunk > 0 ? " (a continued or split read keeps its chunk)" : "");
                 sp.set_head_chunk(head_tok);
                 const int64_t want = want_full;
                 if (want <= 0) {
@@ -11048,7 +11069,15 @@ int main(int argc, char** argv) {
             int64_t chunk = o.prefill_chunk;
             int64_t k = serve_loans::plan_lend(chunk, xcache, g, ss, o.prefill_auto, auto_ceiling,
                                                (int) kAutoLendPct);   // auto: the largest that fits; fixed: halved
-            const int64_t request_sized = serve_loans::request_chunk(n_batched, chunk);
+            // --prefill-regimes: the SHAPE of this prompt's uncached work picks the ceiling (one prompt, read from 0,
+            // so all of it is uncached); `request_chunk` still gives it this path's own chunking, and `chunk` stays
+            // inside what the lend funded, so a big chunk no cache can fund falls over to the smaller ones as before
+            const int64_t regime_cap =
+                !o.prefill_regimes
+                    ? chunk
+                    : std::min(chunk, n_batched >= o.prefill_regime_large ? o.prefill_regime_large
+                                                                          : o.prefill_regime_small);
+            const int64_t request_sized = serve_loans::request_chunk(n_batched, regime_cap);
             if (k > 0 && request_sized < chunk) {                     // no bigger than this prompt segment needs
                 chunk = request_sized;
                 k = serve_loans::lend_slots(xcache, g, ss, chunk);
@@ -11079,6 +11108,13 @@ int main(int argc, char** argv) {
         }
         if (borrow == nullptr)
             basalt::log::info("basalt generate", "prompt path allocates its own buffers (no cache slots to borrow)");
+        if (o.prefill_regimes)   // the measurement: what the policy decided for this prompt, and from what
+            basalt::log::info("basalt generate", "prompt regimes: %lld uncached, read in the %s regime, chunks of %lld, "
+                                                 "head 0 [%s]",
+                              (long long) n_batched,
+                              n_batched >= o.prefill_regime_large ? "big" : "small", (long long) o.prefill_chunk,
+                              basalt::program::prompt_chunk_list_text(
+                                  serve_loans::chunk_list(n_batched, o.prefill_chunk, 0)).c_str());
         if (!multi_gpu && o.batch <= 0 && !o.no_pool) { prefill.set_cpu_pool(&pool); prefill.set_cpu_share(o.prefill_cpu_share); }
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,

@@ -12,6 +12,7 @@
 #include "basalt/core/expert_cache.hpp"   // ExpertCache
 #include "basalt/core/layout.hpp"         // ModelGeometry
 #include "basalt/core/session.hpp"        // SessionState
+#include "basalt/program/multi_gpu_plan.hpp"   // PromptChunkPlan
 
 namespace basalt::program::serve {
 
@@ -31,6 +32,13 @@ std::pair<int64_t, int64_t> one_card_chunks(int64_t tokens, int64_t cap, bool he
 
 /// The sizes of the chunks the prompt path reads a part in, for a chunk and head chunk.
 std::vector<int64_t> chunk_list(int64_t tokens, int64_t chunk, int64_t head);
+
+/// One read's chunk plan under the regime policy (see `basalt::program::prompt_chunk_plan`): chunks of at most
+/// `large` when the read's `tokens` uncached tokens fill the big chunk, of at most `small` when they do not, never
+/// above `cap` (what the lend can fund).  `head_ok` and `auto_fit` are as in `one_card_chunks`; the small regime
+/// takes no head chunk either way, so a short read plans the same way from either side of a layer split.
+basalt::program::PromptChunkPlan chunk_plan(int64_t tokens, int64_t small, int64_t large, int64_t cap, bool head_ok,
+                                            bool auto_fit);
 
 /// The largest chunk the lend can fund (with `prefill_auto`, the largest on the 256-token grid under the caps),
 /// written to `chunk`; returns the slots it needs, 0 when nothing fits.
