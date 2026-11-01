@@ -2837,6 +2837,29 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(31) **PROGRESS AND ONE INSTRUMENT INCONSISTENCY — both recorded, neither trusted
+blindly.** `--exp router_dump_all=1,router_dump_p0=0` on two boots, 96 block lines and
+4096 token lines each:
+- **First layer whose BLOCK `in=` differs: layer 17** (aa0bac32d8f4b11b vs 5366cf0d473390a6).
+- **First layer with a differing PER-TOKEN input hash: layer 22, token 345** (3,751 of
+  4,096 tokens differ there).
+- **BUT layer 17's per-token input hashes are IDENTICAL on all 4,096 tokens**, while its
+  block hash differs — and the block hash is documented as a pure fold of the token hashes
+  in token order (router_dump.hpp:162-168). Those two facts cannot both be true, so ONE of
+  the two readings is wrong. Most likely the block line was printed for a different
+  readback than the token lines under it (or a second probe of the same layer overwrote one
+  set), which is an instrument bug in `router_dump`, NOT an engine finding. It must be
+  settled before layer 17 is called the origin.
+WHAT IS SOLID: the per-token evidence is self-consistent and says the first genuinely
+differing token input is **layer 22, token 345** - and the routing-level divergence the
+`chunk_dump` found first showed at layer 20, which is EARLIER than 22. So the token-level
+and routing-level instruments still disagree about the order, and until the block/token
+inconsistency is explained, treat both as provisional. THE NEXT STEP is small: make
+`router_dump` print the block hash computed FROM the token hashes it just folded (and
+assert it equals the printed block word), so a mismatch is impossible by construction;
+that is a ~5-line change plus a test, and it turns this from a puzzle into a checked
+invariant.
+
 (30) **ANSWERED: THE ROUTER'S *INPUT* DIFFERS — the selection is innocent.** With
 `--exp router_dump=20,router_dump_p0=0` on two boots (same binary/args, both instruments
 on): the router's INPUT fingerprint is `in=9dbf75581117ed6c` vs `c1f1108176b7868d`, its
