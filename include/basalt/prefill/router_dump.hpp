@@ -78,6 +78,11 @@ struct RouterDump {
     int64_t layer = -1, p0 = -1, T = 0, K = 0, n_expert = 0, n_embd = 0;
     // the block, as the card wrote it: the activations the projection read, its logits, the routing, its weights
     uint64_t lg = kFnvOffset, in = kFnvOffset, ids = kFnvOffset, w = kFnvOffset;
+    // The fold's own verdict (see the check at the end of `fill`): 1 when each block word equals a fresh fold of the
+    // token words under it, 0 when one does not, with `fold_bad` naming which (1 lg, 2 in, 4 ids, 8 w). A block
+    // word and the token words under it disagreed once while every token matched across two boots
+    // (TP2PP2-NOTES.md (31)); this field is what makes reading the wrong one impossible.
+    int fold_ok = 1, fold_bad = 0;
     // the boundary's facts, the near-tie question `chunk_dump` could only infer
     int64_t ties = 0;        // tokens whose K-th and (K+1)-th largest logits are the SAME float
     int64_t bad = 0;         // tokens whose row holds a logit that is not finite
@@ -183,6 +188,29 @@ inline void router_dump_collect(RouterDump& d, const float* logits, const uint16
             if (!same && d.disagree < 0) d.disagree = t;
         }
     }
+    // THE FOLD IS CHECKED, not assumed.  The summary prints one word per block and the token lines print one per
+    // token, and a reader diffs whichever is convenient - so the two must agree BY CONSTRUCTION, or a boot gets
+    // read off the wrong line.  They disagreed once (a block word that no token word under it explained, while
+    // every token matched between two boots: TP2PP2-NOTES.md (31)), which is exactly the ambiguity this removes.
+    // Recomputing the fold here and reporting the verdict costs one pass over T words and turns "these two lines
+    // cannot both be right" into a field the reader can trust.
+    {
+        uint64_t lg2 = kFnvOffset, in2 = kFnvOffset, ids2 = kFnvOffset, w2 = kFnvOffset;
+        for (int64_t t = 0; t < T; ++t) {
+            if (logits != nullptr) lg2 = chunk_hash(lg2, &d.lg_t[(size_t) t], sizeof(uint64_t));
+            if (in != nullptr) in2 = chunk_hash(in2, &d.in_t[(size_t) t], sizeof(uint64_t));
+            if (ids != nullptr) ids2 = chunk_hash(ids2, &d.ids_t[(size_t) t], sizeof(uint64_t));
+            if (w != nullptr) w2 = chunk_hash(w2, &d.w_t[(size_t) t], sizeof(uint64_t));
+        }
+        const bool ok = lg2 == d.lg && in2 == d.in && ids2 == d.ids && w2 == d.w;
+        d.fold_ok = ok ? 1 : 0;
+        if (!ok) {   // name the block that failed, so a log says WHICH word is untrustworthy
+            if (lg2 != d.lg) d.fold_bad |= 1;
+            if (in2 != d.in) d.fold_bad |= 2;
+            if (ids2 != d.ids) d.fold_bad |= 4;
+            if (w2 != d.w) d.fold_bad |= 8;
+        }
+    }
 }
 
 /// The summary line's text, minus its tag: built HERE rather than at the call site so the parity test grades the
@@ -192,12 +220,21 @@ inline std::string router_dump_summary(const RouterDump& d) {
     char buf[512];
     std::snprintf(buf, sizeof buf,
                   "router dump p0=%lld T=%lld layer=%lld K=%lld n_expert=%lld n_embd=%lld | lg=%016llx in=%016llx "
-                  "ids=%016llx w=%016llx | ties=%lld bad=%lld gap=%.9g at %lld | sel %lld differ %lld",
+                  "ids=%016llx w=%016llx | ties=%lld bad=%lld gap=%.9g at %lld | sel %lld differ %lld fold=%lld",
                   (long long) d.p0, (long long) d.T, (long long) d.layer, (long long) d.K, (long long) d.n_expert,
                   (long long) d.n_embd, (unsigned long long) d.lg, (unsigned long long) d.in,
                   (unsigned long long) d.ids, (unsigned long long) d.w, (long long) d.ties, (long long) d.bad,
-                  d.gap_min, (long long) d.gap_tok, (long long) d.sel_cmp, (long long) d.disagree);
-    return buf;
+                  d.gap_min, (long long) d.gap_tok, (long long) d.sel_cmp, (long long) d.disagree,
+                  (long long) d.fold_ok);
+    std::string out(buf);
+    if (d.fold_bad != 0) {   // which block word the token words do not explain
+        out += " fold-bad=";
+        if (d.fold_bad & 1) out += "lg ";
+        if (d.fold_bad & 2) out += "in ";
+        if (d.fold_bad & 4) out += "ids ";
+        if (d.fold_bad & 8) out += "w ";
+    }
+    return out;
 }
 
 /// One token's line. Every line names its own (chunk, layer, token), so a log other threads interleaved still reads.
