@@ -186,35 +186,38 @@ more runs or a paired design; a lone "105.5 vs 105.2" is not evidence.
 Ordered by expected gain / effort. A gate is a measurement that costs no GPU time or
 one boot, and it decides whether the build below it happens at all.
 
-### W1 - Account for the 3.0 ms unaccounted inter-window gap. Gate: gap breakdown.
+### W1 - DONE: the gap is the drafter, and part of it was a profiled-boot artifact.
 
-26.3 ms window against 23.29 ms of stage work leaves **3.0 ms (12%) unaccounted** by
-every instrument on this page. It contains the drafter, the next window's capture and
-launch, and the head/sampling tail. Measured at pp4, `draft GPU 2.23 ms` and
-`draft wait 1.54 ms` are candidates that overlap it.
+Unprofiled, the window is `25.87 ms = verify 22.96 + draft 2.29` - the residual is
+~0.6 ms, not 3.0. The 3.0 figure came from a `--profile` boot, where two host terms
+appear that are ZERO without it: `draft prof read 4.469` and `adapt thread 5.569`
+ms/window. Those are measurement overhead, not engine cost, and any number taken
+from a profiled boot must be checked against an unprofiled one.
 
-Gate: split the gap into (a) drafter, (b) capture/launch (`capture`, `ms_launch`), (c)
-head/sampling. The instrumentation is already on the branch (`6ce8b733`).
+What remains real: **the drafter is 2.29 ms = 8.9% of the window and is strictly
+serial**, because it consumes the window's rows. It could only hide under another
+slot's verify - which W2 now rules out.
 
-Then, if (b) is non-trivial: host-side capture/commit for stages 1-3 can run DURING the
-drafter on c0 - the draft only decides token CONTENTS, and `stage_inputs` is the only
-consumer - so there is no dependency to respect.
+### W2 - GATE FAILED: the slots contend, so the 22% duty cycle is not spare capacity.
 
-### W2 - Two windows in flight across the two slots. Gate: two-client measurement.
+Two concurrent decode requests against the shipped config:
 
-The only structural fix for the 22% duty cycle. `pipe_want` is gated
-(`generate.cpp:1441`: `split_devs.size() == 1 && batch <= 0`), so a `--parallel 2`
-boot never reaches it.
+| | per request | aggregate |
+|---|---|---|
+| solo | 107.7 - 111.0 t/s | ~110 |
+| two concurrent | **32.6 / 53.6 t/s** | **86 t/s** |
 
-Gate FIRST, zero code: serve two concurrent decode streams on the current build and
-record per-request t/s against solo. Each card is idle ~78% of the time, so if the two
-requests already interleave without slowing each other, that is the headroom the
-pipeline would harvest; if they contend, it measures what the pipeline must beat.
+Concurrency is a **22% aggregate regression** and each request drops to about a third
+of solo; the window stretches 26 -> 29.6 ms carrying both. The slots do not interleave,
+they contend - the second window shares the same four cards, the same hand-off chain
+and the same PCIe/SM budget.
 
-Build after a positive gate: extend `pipe_want` to a 4-stage chain - per-stage second
-window buffers (`kPairMibLater`, already priced in the reserve math), second-slot KV on
-each stage, and a host loop overlapping `run_end(stage i, window A)` with
-`run_serve(stage i, window B)`.
+So the pipeline is NOT built: its premise was that cards idle 78% of the time and a
+second window could fill that. The two-client measurement says the opposite - the
+machine is already near its aggregate limit, and the low duty per card is the shape of
+a serial chain, not free capacity. This also retro-explains why `--parallel 2` batches
+both slots into ONE window (S=2): batching is the engine's way of paying the serial
+chain once for two requests, and it beats running them independently.
 
 ### W3 - Drafter acceptance. Gate: acceptance-by-draft-position histogram.
 
