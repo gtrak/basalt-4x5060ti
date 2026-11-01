@@ -274,3 +274,39 @@ cannot see CUDA0's no-cache penalty or the tail's head cost. The measured-balanc
 model fails identically: it minimizes spread where the objective is the sum.
 **Neither is a safe replacement for the sweep until the per-stage cost is measured
 per stage, not assumed uniform.**
+
+## Can CUDA0 have an expert cache? Yes - it always had one, and it is not the lever
+
+The question is worth the answer because the code reads as if it did not: the staging
+loop is `for (auto& stp : stages)` and `stages` holds only the LATER stages, so CUDA0
+never appears in those log lines. But the main card's cache is opened separately and
+does exist:
+
+    basalt generate: expert cache 2813 slots, 7.24 GiB of VRAM; policy is ...
+
+**Measured: enlarging it does not help.** `--vram-reserve-mib` (default 700) is the
+knob. At 320 MiB every cache grew ~20% (CUDA0 2813 -> 3447 slots, 7.24 -> 8.88 GiB;
+total VRAM 37.3 -> 38.8 GiB, still 0.0 GiB on SSD), and decode was unchanged:
+
+| reserve | decode t/s (all samples) | mean |
+|---|---|---|
+| 700 MiB (default) | 108.5, 110.2, 105.5, 105.2, 111.7, 106.1, 102.7, 103.9 | **106.7** |
+| 320 MiB | 97.4, 112.4, 103.4, 107.2, 106.2, 109.9, 106.3 | **106.1** |
+
+The hit rate was already 97-98%, so there was no miss traffic to remove - the caches
+were sufficient, and a bigger one only serves more hits from VRAM (which is why the
+`VRAM hits` term went UP, 1.24 -> 1.61 ms: it counts hits served, not the cost of a
+miss).
+
+### The one thing this DID expose, and why it is not patched
+
+The boot search prices every stage at `layer_ms = 0.33 * (84.0*2.617)/(SMs*GHz)`, and
+the four cards report the same SMs and clock within 3%, so all four stages are charged
+the same per-layer cost (logged: 0.76/0.75/0.77/0.77). The measurement says
+0.486/0.442/0.442/0.564. Trying to correct it with per-stage factors made the search
+pick 12/30/47, which **broke the zero-spill contract** (8.1 GiB on SSD against the
+shipped cut's 0.0) - a worse outcome than the model it replaced. Reverted.
+
+So the honest position stands: the cut is a swept constant (8,22,34), the search's
+model is known-wrong, and a correct replacement needs the per-stage cost *measured at
+boot* rather than assumed - not a hand-tuned multiplier.
