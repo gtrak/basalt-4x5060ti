@@ -10353,6 +10353,29 @@ int main(int argc, char** argv) {
                 // the guess held when the window was accepted whole, its last pick is the next window's first token, and
                 // the request goes on past it
                 if (!from_sfx && e0 == 0 && !held_run) full_ema = 0.9 * full_ema + (a == T - 1 ? 0.1 : 0.0);
+                // --exp draft_hist=1: how far each window's draft chain actually survived.  A drafter change pays only
+                // if acceptance is still alive at the position it would add: if the chain rarely passes 2, deeper
+                // drafts are null by construction and must not be built; if it holds, extra depth converts directly.
+                // `a` is the last accepted index (T-1 = the whole window), `T` the rows offered.
+                {
+                    static const bool hist_on = basalt::core::exp_flag("draft_hist", 0) != 0;
+                    static long hn = 0, hit[18] = {}, off = 0;
+                    if (hist_on && !from_sfx) {
+                        ++hn;
+                        off += T - 1;
+                        for (int j = 0; j <= a && j < 18; ++j) ++hit[j];
+                        if (hn % 50 == 0) {
+                            char b[512];
+                            int w = std::snprintf(b, sizeof b,
+                                                  "basalt draft hist: %ld windows, offered %.2f, accepted %.2f; chain reached",
+                                                  hn, (double) off / (double) hn, (double) hit[0] / (double) hn);
+                            for (int j = 0; j < 9 && w < 430; ++j)
+                                w += std::snprintf(b + w, sizeof b - (size_t) w, " +%d:%.0f%%", j + 1,
+                                                   100.0 * (double) hit[j] / (double) hn);
+                            basalt::log::info("basalt draft hist", "%s", b);
+                        }
+                    }
+                }
                 bool hold = false;
                 if (paired) {
                     ++pair_runs;
