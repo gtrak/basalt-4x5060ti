@@ -310,3 +310,45 @@ shipped cut's 0.0) - a worse outcome than the model it replaced. Reverted.
 So the honest position stands: the cut is a swept constant (8,22,34), the search's
 model is known-wrong, and a correct replacement needs the per-stage cost *measured at
 boot* rather than assumed - not a hand-tuned multiplier.
+
+## The expert GEMM is the biggest term, and it is not a memory problem
+
+`VRAM hits` - 37% of the stamped GPU time, the largest single term - is stamp 19->20,
+which brackets `grouped(...)`: the NVFP4 grouped expert GEMM. It is NOT a VRAM read
+despite the name.
+
+The arithmetic that settles what bounds it:
+
+- one expert blob is 2.64 MiB (10.23 GiB / 3974 slots)
+- a layer-window serves ~48 hit entries over ~2.87 tokens
+- if each entry re-read its blob that is 128 MB per layer-window, 1.74 GB per stage
+- the staged expert term measures 0.80 ms -> **2,181 GB/s effective**, against a
+  448 GB/s HBM peak
+
+**So the weights are already resident and streaming from L2/VRAM. There is no memory
+work to remove.** Measured 40-61 W of 180 W per card: not power-bound either. What is
+left is arithmetic intensity: at M = 3 tokens the GEMM cannot fill the tensor cores.
+
+### The one lever the data supports: more tokens per window
+
+taken from the engine's own decode-timing line over 60 window-samples:
+
+| tokens/window | ms/window | ms/token | t/s |
+|---|---|---|---|
+| 2.19 | 23.47 | 10.72 | 93 |
+| 2.21 | 22.78 | 10.31 | 97 |
+| 2.66 | 25.00 | 9.40 | 106 |
+| 2.73 | 25.14 | 9.21 | 109 |
+| **2.87** | 25.85 | **9.01** | **111** |
+
+More tokens per window costs sub-linearly: 31% more tokens bought 19% better
+ms/token. That is the M=3 GEMM amortizing, and it is the only measured lever left.
+Acceptance sets it (67-76% per draft), so the work is on the drafter, not the kernels.
+
+### What was tried and is now closed
+
+- card-0 expert cache: exists already; enlarging it is neutral (106.1 vs 106.7 t/s)
+- interleaving the stages' host serve (`--exp nstage_pipe`): 45.3% mean card util
+  against the serial 47.0% - no overlap, because the stage graphs are already
+  launched up front and the dependency is in the data, not in the host loop
+- the split cut: swept constant 8,22,34, worth +15% over the even cut and no further
