@@ -2837,6 +2837,28 @@ grade — read the decode-timing window line (tok/window + ms/window) instead, o
 adapt-swaps 96->384 result stands (it was a 3-run A/B at 1800 tokens, matching this
 rule); the l2warm_force regression stands (a 3x window-time change, not acceptance).
 
+(37) **DECODE: THE DOORBELL WAIT IS 35% OF THE WINDOW — the anatomy, measured.** Current
+decode (30.11 ms/window, 2.74 tok/window = **91 t/s**):
+  GPU compute (real work)        11.78 ms  39%
+  **doorbell wait (48 x 221 us)  10.59 ms  35%**
+  host per-layer                  2.83 ms   9%
+  draft                           2.48 ms   8%
+HALVING the wait gives ~110 t/s; removing it ~140. IT IS FIXED COST, not per-miss latency:
+across 12 windows the wait ran 8.2-11.9 ms while CPU entries ranged 0.28-7.27 - a window
+with 0.28 entries still paid 8.71 ms, so it is the ROUND TRIP, not the work (48 layers x
+221 us of host<->GPU turnaround). THE MECHANISM: the host loop is strictly LOCKSTEP -
+`if (*seq < want) return 0;` (verify.cpp:4278) waits for the GPU to reach layer l, then
+services l's misses, then lets it proceed. `CpuWarm` already predicts the NEXT layer's
+ROUTING in an idle pool thread (warm_logits + warm_select, verify.cpp:194-275) and warms
+the blob's cache lines - but it deliberately does NOT compute the expert results ("so a
+read the doorbell cuts short has warmed the start of the computation"). So the miss SET is
+known a layer early and its bytes are pre-faulted; only the ARITHMETIC is still inline.
+THE LEVER, therefore: move the CPU expert COMPUTE into the warm pool as well, so layer l+1's
+miss results are finished while the GPU runs layer l, and the doorbell only has to hand over
+a result that already exists. That is what `warm_pool_->idle_start(&warm_job, &w)` is shaped
+for - it runs the job today with `blob = nullptr` (routing only). Every other decode term is
+already small: host 2.83, draft 2.48, stage 0.06.
+
 (36) **THE PEER-WAIT IS FINE-GRAINED MOE WORK, NOT A DEFECT — the arithmetic.** The peer's
 own breakdown (per layer): `act 2.3 + quant 0.0 + comp 66.3 + rows 8.3 = 76.9 ms`, so it is
 COMPUTE-bound (copies are 10 ms of 77). Per group: **37 groups/layer, 1.79 ms each, 59 rows
