@@ -40,7 +40,7 @@ basalt_args() {
   # tok/s; with it, 77/115/82 (conv/struct/prose). Never leave this at 0.
   ARGS+=(--gpu 0,1,2,3)
   # ---- architecture: pipeline parallel (layer split) vs expert tier ------
-  # BASALT_FORCE_SPLIT=1 puts the layers on the cards (each stage keeps its own
+  # --layer-split-forced puts the layers on the cards (each stage keeps its own
   # experts, so nothing streams on the prompt path). Measured at a 12288-token
   # chunk: prefill 2354 vs 1611 t/s (+46%) and experts 48.9 GiB in VRAM vs 8.6,
   # at a decode cost of 167.8 vs 181.8. Prefill is the interactive bottleneck,
@@ -58,7 +58,12 @@ basalt_args() {
   # prompt pays the per-chunk cost few times. Chunk overhead scales with prompt
   # length, the cold-cache ramp does not. BASALT_PREFILL overrides.
   if [ "${BASALT_SPLIT:-1}" = "1" ]; then
-    export BASALT_FORCE_SPLIT=1
+    # The cut points are the first layer of each later stage. The even cut leaves
+    # the last stage carrying the output head on top of its layers, and every
+    # earlier stage waits on it: measured at 8/12/16/12 the decode window runs
+    # 97-100 t/s against 92.5 for 12/12/12/12, and the stage cards' wattage goes
+    # 42/43/52/53 W rather than 35/42/53/72% of SM.
+    ARGS+=(--layer-split "${BASALT_LAYER_SPLIT:-8,20,36}")
     ARGS+=(--prefill "${BASALT_PREFILL:-12288}")
     # Pinned RAM copy of the pin's plan: the experts no GPU holds PLUS the
     # stage cards' lent slots (the prompt path borrows 1342 slots per card at
@@ -70,7 +75,6 @@ basalt_args() {
     # the largest safe value. Free RAM or lower BASALT_RESIDENT_GIB then.
     ARGS+=(--resident-budget-gib "${BASALT_RESIDENT_GIB:-37}")
   else
-    unset BASALT_FORCE_SPLIT          # must be cleared: a stale export forces the split
     ARGS+=(--prefill "${BASALT_PREFILL:-32768}")
     # the tier architecture has a smaller complement (~10.5 GiB: the tiers hold 44 GiB), but the
     # budget must STILL apply — without it the engine auto-sizes from MemAvailable and spills to
@@ -215,7 +219,7 @@ cmd_run() {
   basalt_args
   # --serve stays resident and takes requests on stdin; the Python server owns
   # it and is the process to run in the foreground.
-  exec env BASALT_FORCE_SPLIT="${BASALT_FORCE_SPLIT:-}" "${BIN}" serve --model "${MODEL}" \
+  exec "${BIN}" serve --model "${MODEL}" \
     --host 0.0.0.0 --port "${HOST_PORT}" --alias "${ALIAS}" \
     "${ARGS[@]}"
 }
@@ -223,7 +227,7 @@ cmd_run() {
 cmd_start() {
   guard_host_memory
   basalt_args
-  nohup env BASALT_FORCE_SPLIT="${BASALT_FORCE_SPLIT:-}" "${BIN}" serve --model "${MODEL}" \
+  nohup "${BIN}" serve --model "${MODEL}" \
     --host 0.0.0.0 --port "${HOST_PORT}" --alias "${ALIAS}" \
     "${ARGS[@]}" >> "${LOGFILE}" 2>&1 &
   echo $! > "${PIDFILE}"
