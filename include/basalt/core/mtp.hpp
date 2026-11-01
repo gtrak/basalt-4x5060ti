@@ -150,8 +150,8 @@ public:
     /// sequence, in one pass.  The copy runs on the drafter's stream: `idle` before the rows' buffer is reused.
     bool defer_rows(int id, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
     bool flush(int id, std::string& err);
-    /// Diagnostic (gate spec_log): the top-k tokens and softmax probabilities of the last draft's step j, from the
-    /// draft head's logits kept per step.  Returns the count written (0 when the diagnostic is off).
+    /// Diagnostic (`spec_log`, `draft_hist2`): the top-k tokens and softmax probabilities of the last draft's step j,
+    /// from the draft head's logits kept per step.  Returns the count written (0 when the diagnostic is off).
     int diag_top(int j, int k, int32_t* ids, float* probs) const;
     /// Called once by the next draft() right after its graphs are launched (the host's own work in their shadow).
     void set_launch_hook(std::function<void()> fn) { launch_hook_ = std::move(fn); }

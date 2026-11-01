@@ -552,6 +552,16 @@ void draft_head_hint(int64_t n_tokens, uint64_t bytes) {
 }
 }  // namespace
 
+namespace {
+// Whether the draft head keeps its per-chain-step logits on the host (`diag_`) and its row -> token map
+// (`diag_map_`) for `diag_top`.  `spec_log` writes the distributions to FILE.tk, `draft_hist2` scores the
+// runner-up's would-be acceptance at a draft position.  Keeping them costs the fused argmax fast paths, so
+// both gates are explicit.
+bool diag_wanted() {
+    return exp_flag("spec_log", 0) != 0 || exp_flag("draft_hist2", 0) != 0;
+}
+}  // namespace
+
 bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err) {
     const OnDevice on_device(device_);
     wt_ = &wt;
@@ -641,7 +651,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 basalt::log::info("basalt mtp", "draft head over %lld tokens (%.1f MiB)", (long long) n_dvocab_,
                              (double) (n_dvocab_ * row_bytes) / 1048576.0);
             }
-            if (exp_flag("spec_log", 0) != 0) diag_map_ = map;
+            if (diag_wanted()) diag_map_ = map;
             n_tier1_ = n_base + n_xcap_;
             if (head->type() == 13 || head->type() == 14) {   // the 2-bit copy of the leading rows: a fraction of the bytes
                 const size_t pb = basalt::kernels::q5k_proxy_bytes(n_tier1_);
@@ -677,7 +687,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             }
         }
     }
-    if (diag_ == nullptr && exp_flag("spec_log", 0) != 0) {
+    if (diag_ == nullptr && diag_wanted()) {
         diag_stride_ = dvocab_ != nullptr ? n_dvocab_ : n_vocab_;
         if (cudaHostAlloc((void**) &diag_, (size_t) max_t_ * (size_t) diag_stride_ * sizeof(float), cudaHostAllocDefault) != cudaSuccess)
             diag_ = nullptr;
