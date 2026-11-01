@@ -311,23 +311,27 @@ So the honest position stands: the cut is a swept constant (8,22,34), the search
 model is known-wrong, and a correct replacement needs the per-stage cost *measured at
 boot* rather than assumed - not a hand-tuned multiplier.
 
-## The expert GEMM is the biggest term, and it is not a memory problem
+## The expert GEMM is the biggest term: what bounds it
 
 `VRAM hits` - 37% of the stamped GPU time, the largest single term - is stamp 19->20,
-which brackets `grouped(...)`: the NVFP4 grouped expert GEMM. It is NOT a VRAM read
+which brackets `grouped(...)`: the NVFP4 grouped expert GEMM. It is not a VRAM read
 despite the name.
 
-The arithmetic that settles what bounds it:
+**An earlier draft of this page claimed it runs at 2,181 GB/s effective and is
+therefore cache-resident. That arithmetic was wrong**: `VRAM hits` counts ENTRIES
+(token x expert pairs), not blobs. A window's 48.3 entries are served by ~16.8 unique
+experts (48.3 / 2.87 tokens), so the bytes touched are 44 MiB per layer-window, not
+128 MiB.
 
-- one expert blob is 2.64 MiB (10.23 GiB / 3974 slots)
-- a layer-window serves ~48 hit entries over ~2.87 tokens
-- if each entry re-read its blob that is 128 MB per layer-window, 1.74 GB per stage
-- the staged expert term measures 0.80 ms -> **2,181 GB/s effective**, against a
-  448 GB/s HBM peak
+Corrected: a 14-layer stage reads ~623 MiB of expert weights in ~8.8 ms of GEMM, which
+is **71 GB/s, or 16% of the 448 GB/s HBM peak**. That is low enough that bandwidth is
+not the binding constraint - but the margin is 6x, not 20x, and part of that traffic is
+HBM (16.8 blobs = 44 MiB against a 32 MiB L2).
 
-**So the weights are already resident and streaming from L2/VRAM. There is no memory
-work to remove.** Measured 40-61 W of 180 W per card: not power-bound either. What is
-left is arithmetic intensity: at M = 3 tokens the GEMM cannot fill the tensor cores.
+So the surviving statement is weaker and still useful: **the expert GEMM is not
+bandwidth-starved**, and at 40-61 W of 180 W it is not power-bound either. What remains
+plausible is arithmetic intensity at M ~= 3 tokens, which the tokens-per-window data
+below supports directly.
 
 ### The one lever the data supports: more tokens per window
 
