@@ -181,6 +181,30 @@ a diagnostic flag; not taken.
 3% flag effect from 3% machine noise. Any future flag A/B on this box needs either
 more runs or a paired design; a lone "105.5 vs 105.2" is not evidence.
 
+## WORK LIST STATUS (W1-W3 measured tonight)
+
+| item | gate result | verdict |
+|---|---|---|
+| **W1** the 3 ms gap | answered: it was mostly a `--profile` artifact (`draft prof read` 4.47 + `adapt thread` 5.57 ms are ZERO without the flag). Unprofiled the window is verify 22.96 + draft 2.29, residual ~0.6 ms | **closed** - nothing to reclaim; the serial tail is the drafter |
+| **W2** two windows in flight | **FAILED**: two concurrent requests = 32.6/53.6 t/s = **86 t/s aggregate against ~110 solo** (-22%), each at a third of solo, window 26 -> 29.6 ms | **not built** - the slots contend, so the 22% per-card duty is a serial chain's shape, NOT spare capacity |
+| **W3** drafter acceptance | **FAILED**: chain halves at every position (+1 100%, +2 66%, +3 35%, +4 17%, +5 9%, +8 1%); offered 1.92, accepted 1.00 | **depth levers dead by construction**; only positions 1-2 are worth work |
+| W4 the search objective | not started | needs the 9-cut dataset as its gate |
+| W5 reconcile search vs hand cut | mechanism known (coverage maximizer) | doc only |
+| W6 housekeeping | not started | noise band, host_ev crash, 62k cold rerun |
+
+**Three gates, three answers, and none of them was the answer I expected.** That is the
+point of gating: each cost one boot or one curl pair and each closed a build that would
+have taken a night and returned nothing.
+
+### What is left that is actually alive
+
+- **positions 1-2 of the draft chain** (a tree/beam at depth 2, the suffix policy's
+  margin, MTP reseed) - the only drafter surface with mass
+- **W4**, the search objective, for robustness rather than speed
+- the grouped GEMM's ~800 launch-group fixed costs per window (P2, report-only until W1
+  showed what is serial - and W1 showed the GEMM is inside the 22.96 ms verify, so it is
+  now eligible)
+
 ## THE WORK LIST (review-ordered; each has a gate measurement before any build)
 
 Ordered by expected gain / effort. A gate is a measurement that costs no GPU time or
