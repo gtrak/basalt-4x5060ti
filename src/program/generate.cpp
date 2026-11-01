@@ -2094,6 +2094,22 @@ int main(int argc, char** argv) {
         } else if (ns == 3) {
             for (int64_t k1 = 2; k1 + 1 < L; ++k1)
                 for (int64_t k2 = k1 + 1; k2 < L; ++k2) { at[0] = k1; at[1] = k2; consider(); }
+        } else if (ns == 4) {
+            // Exhaustive.  The greedy balance below cuts by layer TIME alone and never looks at what the cut does to
+            // the expert caches - and on four cards the cache is the term that decides decode: a stage's cache is
+            // whatever its dense weights leave over, so giving a card MORE layers means FEWER resident experts and
+            // every miss streams from RAM.  Measured on this box, cuts that this search would have to consider ran
+            // 77 to 112 t/s, a 45% spread, with the best one (8/14/12/14) holding 65% of the routed mass on the
+            // worst-cached card against 29% for the worst.  `predict` already prices this (held_mass, miss_ms), so
+            // the only thing missing was the search over the cuts.  15,180 cuts x the profile is a second of boot.
+            for (int64_t k1 = 2; k1 + 2 < L; ++k1)
+                for (int64_t k2 = k1 + 1; k2 + 1 < L; ++k2)
+                    for (int64_t k3 = k2 + 1; k3 < L; ++k3) {
+                        at[0] = k1;
+                        at[1] = k2;
+                        at[2] = k3;
+                        consider();
+                    }
         } else {
             double total = 0;
             for (const double c : layer_ms) total += 1.0 / c;
