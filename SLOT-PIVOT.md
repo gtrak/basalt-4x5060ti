@@ -92,3 +92,26 @@ The pivot IS worth it under one different reading: **drop slot 2 and spend the f
 3 GiB on a longer single context** - i.e. keep 1 slot but raise `--max-context` beyond
 262144 on the same KV budget. That is a product capability gain rather than a speed one,
 and it is the only direction where the freed memory is not worth less than 1%.
+
+## OWNER DECISION (recorded before measuring): single sequence + fp16 KV
+
+The owner's call: **drop to one sequence and use fp16 KV, accepting the projected
+performance drop, because fp16 wins on quality.**
+
+The arithmetic behind it, for the record:
+
+- **The VRAM is a wash, not a gain.** One 262144-token fp16 sequence is 6.00 GiB; two
+  int8 sequences are also 6.00 GiB. So this is not "free memory for more sequences" -
+  it is a straight swap, and "more sequences offloaded" cannot also come from this budget.
+- **The speed argument is strong on its own.** One sequence runs 102-110 t/s; two run
+  32-60 each at 89-97 aggregate. A single sequence nearly doubles per-user speed for
+  ~10% of aggregate.
+- **fp16 costs time at long context**, and it is stage c3 that pays it: at 262144 the KV
+  read per token doubles from 2.40 to 4.79 ms on c3, and the stages are serial, so that
+  is roughly +9% window (~102 -> ~93 t/s). At 32768 it is 0.60 ms (2% of the window); at
+  8192, 0.15 ms (0.5%).
+
+So the shape to implement is: **one sequence, fp16 KV**, with the cost understood to
+fall on long-context turns. Still owed before shipping: the actual spent penalty at the
+workload's real context lengths (projected, not measured), and a quality check on the
+fp16 path per the repo's gate rule.
