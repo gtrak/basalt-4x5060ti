@@ -181,17 +181,97 @@ a diagnostic flag; not taken.
 3% flag effect from 3% machine noise. Any future flag A/B on this box needs either
 more runs or a paired design; a lone "105.5 vs 105.2" is not evidence.
 
-## Where the remaining headroom is
+## THE WORK LIST (review-ordered; each has a gate measurement before any build)
 
-Priced, not yet taken:
+Ordered by expected gain / effort. A gate is a measurement that costs no GPU time or
+one boot, and it decides whether the build below it happens at all.
 
-1. **Expert cache coverage is the decode lever** (measured: 29% coverage -> 77 t/s,
-   65% -> 106-112). The exhaustive four-stage search now optimizes for it at boot.
-2. **`--peer-reserve-mib` / resident budget** could widen the caches directly: the
-   stages drew 9-10.5 GiB of cache each with 37 GiB of RAM budget, and the box has
-   room to raise it. This trades host RAM for coverage and is the cheapest untested
-   knob.
-3. **Two windows in flight** (~1.8x ceiling on tp2pp2, needs `batch <= 0`).
+### W1 - Account for the 3.0 ms unaccounted inter-window gap. Gate: gap breakdown.
+
+26.3 ms window against 23.29 ms of stage work leaves **3.0 ms (12%) unaccounted** by
+every instrument on this page. It contains the drafter, the next window's capture and
+launch, and the head/sampling tail. Measured at pp4, `draft GPU 2.23 ms` and
+`draft wait 1.54 ms` are candidates that overlap it.
+
+Gate: split the gap into (a) drafter, (b) capture/launch (`capture`, `ms_launch`), (c)
+head/sampling. The instrumentation is already on the branch (`6ce8b733`).
+
+Then, if (b) is non-trivial: host-side capture/commit for stages 1-3 can run DURING the
+drafter on c0 - the draft only decides token CONTENTS, and `stage_inputs` is the only
+consumer - so there is no dependency to respect.
+
+### W2 - Two windows in flight across the two slots. Gate: two-client measurement.
+
+The only structural fix for the 22% duty cycle. `pipe_want` is gated
+(`generate.cpp:1441`: `split_devs.size() == 1 && batch <= 0`), so a `--parallel 2`
+boot never reaches it.
+
+Gate FIRST, zero code: serve two concurrent decode streams on the current build and
+record per-request t/s against solo. Each card is idle ~78% of the time, so if the two
+requests already interleave without slowing each other, that is the headroom the
+pipeline would harvest; if they contend, it measures what the pipeline must beat.
+
+Build after a positive gate: extend `pipe_want` to a 4-stage chain - per-stage second
+window buffers (`kPairMibLater`, already priced in the reserve math), second-slot KV on
+each stage, and a host loop overlapping `run_end(stage i, window A)` with
+`run_serve(stage i, window B)`.
+
+### W3 - Drafter acceptance. Gate: acceptance-by-draft-position histogram.
+
+Each +0.5 tokens/window buys ~5% (the window costs ~2.5% more per extra token). But
+which drafter change pays depends on the SHAPE of acceptance, so measure before
+building: log the accepted-length distribution and per-position acceptance for
+`--spec 8 --suffix-draft 8` on real traffic. If acceptance decays steeply after
+position 2-3, more draft depth is null by construction and must not be built. If it is
+flat, deeper drafts convert directly.
+
+### W4 - Replace `predict()`'s objective. Gate: it must rank the measured cuts.
+
+`layer_ms` is cut-invariant on identical cards, so the search has exactly one degree of
+freedom (coverage) and cannot see serial position, CUDA0's no-cache asymmetry, or the
+head at the tail. Do NOT patch it with multipliers again - that experiment picked a cut
+that spilled 8.1 GiB to SSD.
+
+Gate, and it costs no GPU time: the replacement must (a) rank 8,22,34 first among the
+nine cuts already swept, and (b) reproduce the measured badness of 12,25,38, before it
+is allowed to choose a boot placement.
+
+### W5 - Resolve why the auto search and the hand cut disagree, now that the mechanism is known.
+
+Not a build. `predict()` maximizes coverage; coverage was measured NOT sufficient (the
+auto cut holds more mass at every stage and loses). Record that the shipped cut is a
+swept constant with a known-wrong automatic alternative, so nobody re-investigates it
+as a mystery.
+
+### W6 - Housekeeping that otherwise keeps costing sessions.
+
+- `--exp host_ev=1` crashes (`copy_i32x3_from_mapped`). Fix the mapped-copy path or
+  delete the flag - no half-broken diagnostics.
+- Retire single-sample A/B: the noise band is 105.2-111.7 t/s against itself, which
+  already invalidated three "effects" tonight. Use paired interleaved runs, >= 5.
+- The 62k prefill figures need one cold-cache rerun (read `c` in `pp=NNN/NNNc`); the
+  122k like-for-like number is 4,232 t/s.
+- 8,22,34 (111.7/106.1/105.6/105.2) and 8,20,32 (109.2/104.8) are WITHIN the noise
+  band - do not over-fit cut folklore.
+
+### P2 (report-only) - the grouped GEMM's fixed costs.
+
+~16 groups per layer x 48 layers is ~800 launch-group fixed costs per window against
+only 22% duty. A persistent or fused grouped kernel could buy that back. Report-only
+until W1 shows what is actually serial in the window.
+
+### Explicitly NOT on the list, per evidence
+
+- anything moving expert WEIGHTS at decode (P2P is 7.14 GB/s; one blob is 387 us
+  against a 0.44 ms layer budget)
+- layer-parity or any intra-window cross-card trick (the layer chain is a data
+  dependency)
+- interleaving the stages' HOST serve loop (`nstage_pipe` null: the graphs are already
+  launched up front, so the dependency is in the data)
+- bigger expert caches (`--vram-reserve-mib 320` null)
+- prefill chunk size (already swept; 12,288 wins on both prompt sizes)
+- activation movement is NOT ruled out by the weights argument (3 tokens x 2560 x 4 B
+  is ~4 us a hop); it was the max-of-4 straggler that killed TP=4, which is separate
 
 ## The auto search's own best is ~9% WORSE than the hand cut (measured, and unexplained by its model)
 
