@@ -59,3 +59,45 @@ still owed.
 `--max-context` defaults to **4096**. A sweep script that omits it silently boots a
 4096-token model, and the first long prompt fails with "prompt exceeds the context
 window" - which reads like an fp16 limitation but is not.
+
+## The layer rebalance for fp16: 8,20,34
+
+fp16 changes what the cut optimizes, because KV is allocated per card and only for that
+card's QSA layers - measured **1.7 GiB per card at 8/22/34, 2.2 on c3**, against
+**0.250 GiB per QSA layer at 262144**. So a cut's KV cost follows its QSA COUNT, not its
+layer count, and the layers are 3,7,11,...,47.
+
+Swept on fp16 (5 decode samples each, 122k fresh prompt for prefill):
+
+| cut | layers | QSA | decode | 122k prefill |
+|---|---|---|---|---|
+| 8,22,34 (previous) | 8/14/12/14 | 2/3/3/4 | 107.7 | 3,656 |
+| **8,20,34 (shipped)** | **8/12/14/14** | **2/3/3/4** | **107.6 - 111.6** | **3,654 - 3,656** |
+| 10,22,34 | 10/12/12/14 | 2/3/3/4 | 107.4 | 3,669 |
+| 8,20,32 | 8/12/12/16 | 2/3/3/4 | 108.7 | 3,269 |
+| 12,24,36 | 12/12/12/12 | 3/3/3/3 | 96.8 | **3,955** |
+| 12,26,38 | 12/14/12/10 | 3/3/3/3 | 97.3 | 3,952 |
+
+**QSA-balanced cuts (3/3/3/3) buy +8% prefill for -10% decode.** 8,20,34 is the best
+decode-side cut and holds the same prefill as 8/22/34, so it ships.
+
+The rebalance is smaller than int8's was because fp16 doubles the KV the balance has to
+pay for: the even cut equalizes KV (0.75 GiB each) but gives every card the same LAYER
+count, which is what decode's expert cache wants to be uneven.
+
+## Prefill is now 3,65x, not 4,97x - and that is fp16's price
+
+Measured on the same 122,308-token fresh prompt:
+
+| | 122k prefill |
+|---|---|
+| int8, --parallel 1 | **4,972** |
+| int8, --parallel 2 | 4,141 |
+| **fp16, --parallel 1 (shipped)** | **3,656** |
+
+**fp16 costs 26% of long-prompt prefill.** Decode pays nothing measurable, because a
+2.76-token window touches almost no KV; prefill writes and reads the whole thing, and at
+122k that is 1.5 GiB int8 against 3.0 GiB fp16 of KV traffic on the critical path.
+
+Also note: **--parallel 1 is 20% FASTER than --parallel 2 on prefill** (4,972 vs 4,141).
+The "4,232 peak" this branch was quoting was the two-slot number; one slot beats it.
