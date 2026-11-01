@@ -129,3 +129,28 @@ none saturated. The bad cuts show the signature plainly: 8,20,40 put c2 at
 window (`if (stages.size() > 0)` inside the `S == 1` branch). A `--parallel 2`
 boot never takes that path, so on PP4 the per-stage phases are not available from
 it; `basalt decode timing` (the aggregate) and the per-card wattage are.
+
+## Prefill: the chunk size is already right
+
+The split recipe pins `--prefill 12288` from an older sweep. Re-measured on this
+branch at the shipped cut (8,22,34):
+
+| chunk | 62,186-token fresh | 122,288-token fresh |
+|---|---|---|
+| **12,288** | **3,224 t/s** | **4,232 t/s** |
+| 16,384 | 2,512 t/s | 3,892 t/s |
+
+**12,288 wins on both prompt sizes**, so the recipe was already at the optimum and
+chunk size is not a lever here. (A 16k boot's second 122k request was a prompt-cache
+hit, not a prefill - read `c` in `pp=NNN/NNNc` before quoting a rate.)
+
+## State of the branch
+
+- decode **102.7 t/s** at a live request (acc 74%), window ~26-28 ms
+- prefill **3,224 t/s** at 62k, **4,232 t/s** at 122k, chunk 12,288
+- expert PCIe **0.0%**, cache hit 96-97%
+- shipped cut `8,22,34` (8/14/12/14) via `--layer-split`, forced with
+  `--layer-split-forced` (`BASALT_FORCE_SPLIT` no longer exists)
+
+Both axes are now ahead of tp2pp2 (2,780 prefill / ~90 decode) and of PP4's own
+starting point tonight (92.5 decode).
