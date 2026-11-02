@@ -154,14 +154,15 @@ bool Request::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t head) 
         }));
         cap = std::min(cap, lc);
     }
-    auto [want_full, head_tok] = serve_loans::one_card_chunks(tokens, cap, !beside && runtime_.stages.empty(),
-                                                           runtime_.o.prefill_auto_fit);
     // a chunk the read must have: a split read's, or the one the read this continues had (if it fits)
     const int64_t fixed_chunk = chunk > 0 ? chunk : (resumed_chunk > 0 && resumed_chunk <= cap) ? resumed_chunk : 0;
-    if (fixed_chunk > 0) {
-        want_full = fixed_chunk;
-        head_tok = chunk > 0 ? head : 0;
-    }
+    // --prefill-regimes: the SHAPE of this read's uncached work picks the chunk.  A read that must keep a chunk keeps
+    // it, so a continued or split read never changes its chunking under way.
+    const basalt::program::PromptChunkPlan pl =
+        fixed_chunk > 0 ? basalt::program::PromptChunkPlan{}
+                        : runtime_.read_plan(tokens, cap, !beside && runtime_.stages.empty());
+    int64_t want_full = fixed_chunk > 0 ? fixed_chunk : pl.chunk;
+    int64_t head_tok = fixed_chunk > 0 ? (chunk > 0 ? head : 0) : pl.head;
     runtime_.sp.set_head_chunk(head_tok);
     const int64_t want = want_full;
     if (want <= 0) {

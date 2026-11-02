@@ -12,6 +12,10 @@
 
 namespace basalt::program::serve {
 
+namespace {
+constexpr int64_t kHeadChunk = 16384;   // the first chunk of a prompt above the chunk cap
+}  // namespace
+
 int64_t cache_slots_for(const basalt::core::ExpertCache& xc, uint64_t need) {
     if (xc.slot_offsets() != nullptr) {   // sized slots: from the end until they hold `need`
         int64_t k = 0;
@@ -37,12 +41,16 @@ int64_t request_chunk(int64_t tokens, int64_t max_chunk) {
 }
 
 std::pair<int64_t, int64_t> one_card_chunks(int64_t tokens, int64_t cap, bool head_ok, bool auto_fit) {
-    constexpr int64_t kHeadChunk = 16384;   // the first chunk of a prompt above the chunk cap
     return basalt::program::prompt_one_card_chunks(tokens, cap, head_ok && auto_fit, kHeadChunk);
 }
 
 std::vector<int64_t> chunk_list(int64_t tokens, int64_t chunk, int64_t head) {
     return basalt::program::prompt_chunk_list(tokens, chunk, head);
+}
+
+basalt::program::PromptChunkPlan chunk_plan(int64_t tokens, int64_t small, int64_t large, int64_t cap, bool head_ok,
+                                            bool auto_fit) {
+    return basalt::program::prompt_chunk_plan(tokens, small, large, cap, head_ok && auto_fit, kHeadChunk);
 }
 
 int64_t plan_lend(int64_t& chunk, const basalt::core::ExpertCache& xc, const basalt::core::ModelGeometry& g,

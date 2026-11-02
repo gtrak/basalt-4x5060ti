@@ -139,6 +139,7 @@ struct Context {
     uint64_t* ram_floor_bytes = nullptr;
     std::vector<std::unique_ptr<PromptStage>>* pstages = nullptr;
     std::function<int64_t()> read_cap;
+    std::function<basalt::program::PromptChunkPlan(int64_t, int64_t, bool)> read_plan;
     const int64_t* kSplitRefCells = nullptr;
     int64_t* split_hand_rows = nullptr;
     int64_t* split_peer_rows = nullptr;

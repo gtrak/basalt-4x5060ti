@@ -96,6 +96,7 @@ struct Context {
     uint64_t& ram_floor_bytes;
     std::vector<std::unique_ptr<engine_local::PromptStage>>& pstages;
     std::function<int64_t()> read_cap;
+    std::function<basalt::program::PromptChunkPlan(int64_t, int64_t, bool)> read_plan;
     const int64_t& kSplitRefCells;
     int64_t& split_hand_rows;
     int64_t& split_peer_rows;

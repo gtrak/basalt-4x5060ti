@@ -102,6 +102,21 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
             o.prefill_auto_max = o.prefill_auto_fit || want_max >= 32768 ? 32768 : want_max >= 16384 ? 16384 : 8192;
             o.prefill_chunk = o.prefill_auto ? o.prefill_auto_max : std::atoll(v.c_str());
         }
+        else if (a == "--prefill-regimes") {
+            const std::string v = next("--prefill-regimes");
+            const size_t comma = v.find(',');
+            const int64_t lo = comma == std::string::npos ? -1 : std::atoll(v.substr(0, comma).c_str());
+            const int64_t hi = comma == std::string::npos ? -1 : std::atoll(v.substr(comma + 1).c_str());
+            if (lo < 256 || hi < lo) {
+                basalt::log::error("basalt generate",
+                                   "bad --prefill-regimes '%s' (expected LO,HI with LO >= 256 and HI >= LO, in tokens)",
+                                   v.c_str());
+                return 2;
+            }
+            o.prefill_regime_small = lo;
+            o.prefill_regime_large = hi;
+            o.prefill_regimes = true;
+        }
         else if (a == "--vram-elastic") o.vram_elastic = true;
         else if (a == "--vram-segment-mib") o.vram_segment_mib = std::atoll(next("--vram-segment-mib"));
         else if (a == "--prefill-until") o.prefill_until = std::atoll(next("--prefill-until"));

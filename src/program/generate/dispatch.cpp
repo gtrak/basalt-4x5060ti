@@ -68,6 +68,7 @@ int dispatch(Context& context) {
     auto& ram_floor_bytes = *context.ram_floor_bytes;
     auto& pstages = *context.pstages;
     auto& read_cap = context.read_cap;
+    auto& read_plan = context.read_plan;
     auto& kSplitRefCells = *context.kSplitRefCells;
     auto& split_hand_rows = *context.split_hand_rows;
     auto& split_peer_rows = *context.split_peer_rows;
@@ -191,6 +192,7 @@ int dispatch(Context& context) {
             .ram_floor_bytes = ram_floor_bytes,
             .pstages = pstages,
             .read_cap = read_cap,
+            .read_plan = read_plan,
             .kSplitRefCells = kSplitRefCells,
             .split_hand_rows = split_hand_rows,
             .split_peer_rows = split_peer_rows,

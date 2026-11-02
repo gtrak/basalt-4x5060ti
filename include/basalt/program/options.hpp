@@ -132,6 +132,13 @@ struct Options {
     /// `auto:32768` lets it go further, never past the context
     int64_t prefill_auto_max = 8192;
     bool prefill_auto_fit = false;   // a bare `auto`: the ceiling is what the lend can fund (see auto_ceiling)
+    /// `--prefill-regimes LO,HI` (off by default): the two chunk sizes the regime policy picks between.  A read whose
+    /// uncached tokens fill `HI` reads them in chunks of at most `HI` - today's rule, still inside what the expert
+    /// caches can lend; a shorter one reads itself in chunks of at most `LO`.  See prompt_chunk_plan and
+    /// docs/precision/features.md.
+    bool prefill_regimes = false;
+    int64_t prefill_regime_small = 0;   ///< LO: the small chunk
+    int64_t prefill_regime_large = 0;   ///< HI: the big chunk, and the boundary between the two regimes
     /// Validation: batch only positions [0, P) and run the rest of the prompt through the token path (teacher-forced),
     /// so the logits of positions >= P - which depend on the batched state - can be scored against the oracle at many
     /// positions.  0 = the whole prompt but the last position.

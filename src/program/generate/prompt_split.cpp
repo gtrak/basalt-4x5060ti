@@ -74,6 +74,17 @@ int prompt_split(Context& context) {
     auto read_cap = [&]() -> int64_t {
         return o.prefill_auto_fit ? std::min<int64_t>(o.prefill_chunk, kMaxAutoChunk) : o.prefill_chunk;
     };
+    // One read's chunk plan: with --prefill-regimes the SHAPE of its uncached work picks between the small and the big
+    // chunk, without it one ceiling (`cap`, what the lend can fund) governs it exactly as today.  `head_ok` is whether
+    // this read may start with a head chunk of its own.  The split prices and the main card's loan ask it here, so a
+    // part is never planned two ways.
+    auto read_plan = [&](int64_t n_tok, int64_t cap, bool head_ok) -> basalt::program::PromptChunkPlan {
+        if (o.prefill_regimes)
+            return serve_loans::chunk_plan(n_tok, o.prefill_regime_small, o.prefill_regime_large, cap, head_ok,
+                                           o.prefill_auto_fit);
+        const auto [want, head] = serve_loans::one_card_chunks(n_tok, cap, head_ok, o.prefill_auto_fit);
+        return {false, want, head, serve_loans::chunk_list(n_tok, want, head)};
+    };
     // the cells before a prompt's end the draft layer attends to (all of them without a window: no split then)
     const int64_t draft_window = o.mtp.empty() ? 0 : o.mtp_window > 0 ? o.mtp_window + 64 : INT64_MAX / 4;
     constexpr int64_t kSplitRefCells = 131072;   // the longest prompt the start prices the split for
@@ -116,7 +127,8 @@ int prompt_split(Context& context) {
         const int64_t n_tok = b0 - a0;
         // two chunks or more, the draft layer's window within the last two the main card hands on (their final rows
         // come back for it in the hand-off buffers)
-        const auto [chunk, head] = serve_loans::one_card_chunks(n_tok, read_cap(), true, o.prefill_auto_fit);
+        const basalt::program::PromptChunkPlan pl = read_plan(n_tok, read_cap(), true);
+        const int64_t chunk = pl.chunk, head = pl.head;
         if (n_tok <= std::max(chunk, head)) return sp0;   // one chunk: read on the main card, no reason to give
         char why[160];
         // a slower tier card that computes its experts' rows of the routed-only chunks of a CUDA0 read: the split
@@ -320,6 +332,7 @@ int prompt_split(Context& context) {
 
     context.pstages = &pstages;
     context.read_cap = read_cap;
+    context.read_plan = read_plan;
     context.kSplitRefCells = &kSplitRefCells;
     context.split_hand_rows = &split_hand_rows;
     context.split_peer_rows = &split_peer_rows;

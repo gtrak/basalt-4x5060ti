@@ -117,4 +117,24 @@ std::pair<int64_t, int64_t> prompt_one_card_chunks(int64_t tokens, int64_t cap, 
 /// min(head, chunk) when the part is longer than one chunk, then chunks of `chunk`, the last one what is left.
 std::vector<int64_t> prompt_chunk_list(int64_t tokens, int64_t chunk, int64_t head);
 
+/// One read's chunk plan under the regime policy: which regime its shape fell in, the uniform chunk the prompt path's
+/// buffers are laid out for, the head chunk, and the chunks in the order the read runs them.
+struct PromptChunkPlan {
+    bool small = false;          ///< the small regime: the read does not fill one big chunk
+    int64_t chunk = 0;           ///< the uniform chunk (0: nothing to read)
+    int64_t head = 0;            ///< the first chunk's length (0: none)
+    std::vector<int64_t> list;   ///< the chunk sizes, in the order the read runs them
+};
+
+/// The chunk plan for one read of `tokens` uncached tokens, from the SHAPE of that work: a read that fills the big
+/// chunk (`tokens` >= `large`) reads it in chunks of at most `large`, one that does not reads itself in chunks of at
+/// most `small`, so a handful of tokens is not read in the big chunk's layout.  `cap` is the ceiling the expert caches
+/// can lend (the operator's chunk is inside it): neither chunk exceeds `cap`, so a big chunk no cache can fund falls
+/// over to the smaller ones exactly as it does without the policy, and the small one is by construction fundable
+/// whenever the big one is.  `head_ok` and `head_chunk` are as in `prompt_one_card_chunks`; the small regime never
+/// takes a head chunk, so a short read plans the same way from either side of a layer split.  The 256-token grid, the
+/// equal chunking and the head rule are `prompt_one_card_chunks`' unchanged.
+PromptChunkPlan prompt_chunk_plan(int64_t tokens, int64_t small, int64_t large, int64_t cap, bool head_ok,
+                                  int64_t head_chunk);
+
 }  // namespace basalt::program

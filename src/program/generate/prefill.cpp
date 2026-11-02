@@ -40,7 +40,15 @@ int prefill(Context& context) {
             int64_t chunk = o.prefill_chunk;
             int64_t k = serve_loans::plan_lend(chunk, xcache, g, ss, o.prefill_auto, auto_ceiling,
                                                (int) auto_lend_pct);   // auto: the largest that fits; fixed: halved
-            const int64_t request_sized = serve_loans::request_chunk(n_batched, chunk);
+            // --prefill-regimes: the SHAPE of this prompt's uncached work picks the ceiling (one prompt, read from 0,
+            // so all of it is uncached); `request_chunk` still gives it this path's own chunking, and `chunk` stays
+            // inside what the lend funded, so a big chunk no cache can fund falls over to the smaller ones as before
+            const int64_t regime_cap =
+                !o.prefill_regimes
+                    ? chunk
+                    : std::min(chunk, n_batched >= o.prefill_regime_large ? o.prefill_regime_large
+                                                                          : o.prefill_regime_small);
+            const int64_t request_sized = serve_loans::request_chunk(n_batched, regime_cap);
             if (k > 0 && request_sized < chunk) {                     // no bigger than this prompt segment needs
                 chunk = request_sized;
                 k = serve_loans::lend_slots(xcache, g, ss, chunk);
